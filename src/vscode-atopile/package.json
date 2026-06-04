@@ -101,7 +101,7 @@
                     "description": "Enable the AI chat panel in the atopile sidebar",
                     "scope": "resource",
                     "type": "boolean",
-                    "default": false
+                    "default": true
                 }
             }
         },

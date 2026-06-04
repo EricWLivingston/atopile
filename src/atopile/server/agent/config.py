@@ -86,11 +86,14 @@ class AgentConfig:
             _parse_fixed_skill_token_budgets,
         )
 
-        # Load .env from the project root (if present) so API keys are available
+        # Load .env from the project root (if present) so API keys are available.
+        # The backend is launched with cwd set to the opened project root (see the
+        # VS Code extension's backendServer spawn), so search from the working
+        # directory upward rather than from this source file's location.
         try:
-            from dotenv import load_dotenv
+            from dotenv import find_dotenv, load_dotenv
 
-            load_dotenv()
+            load_dotenv(find_dotenv(usecwd=True))
         except ImportError:
             pass
 

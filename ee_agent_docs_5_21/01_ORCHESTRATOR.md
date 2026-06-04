@@ -11,7 +11,7 @@
 - **Turn lifecycle.** `run_turn(...)` accepts a user message, threads it through tool-call loops, returns an `AgentTurnResult`.
 - **Planning.** The model uses managed tools (`checklist_create`, `checklist_update`, `checklist_add_items`) which the runner intercepts and stores as `_TurnState.checklist`. The skill bundle (`agent`, `ato`, `planning`) instructs the model on when and how to use these.
 - **Continuation.** The runner checks the checklist between turns and emits nudges if the model abandoned work mid-task or didn't acknowledge a pending user message.
-- **Tool dispatch.** `ToolRegistry.execute(...)` routes calls. Atopile's ~40 tools plus our 4 (`rag_search`, `pyspice_run`, `pinmux_check`, `ipc_check`) all live in the same registry.
+- **Tool dispatch.** `ToolRegistry.execute(...)` routes calls. Atopile's ~40 tools plus our 3 (`rag_search`, `pyspice_run`, `ipc_check`) all live in the same registry.
 - **Circuit breaker.** Identical tool failures trigger a non-retryable error after N attempts.
 - **Context management.** Progressive tool-output shrinking on context overflow; client-side compaction (Anthropic) or server-side compaction (OpenAI) when shrinking exhausts.
 - **Observability.** Progress callbacks, trace callbacks, message log, activity summary.
@@ -46,7 +46,7 @@ Without a separate orchestrator, the agent's behavior is driven by:
 | Part selection | skill `ato/SKILL.md` §4 + tools `parts_search`, `parts_install`, `packages_search` | Atopile's picker resolves passives; agent picks ICs |
 | Schematic | skill `ato/SKILL.md` + tools `project_read_file`, `project_edit_file`, `build_run` | Model emits `.ato`, builds, fixes errors |
 | Simulation | skill `ee-agent/SKILL.md` + tool `pyspice_run` | Optional; model runs analyses where physics matters |
-| Verification | skill `ee-agent/SKILL.md` + tools `ipc_check`, `pinmux_check`, `design_diagnostics` | Model runs checks before declaring "done" |
+| Verification | skill `ee-agent/SKILL.md` + tools `ipc_check`, `design_diagnostics` | Model runs checks before declaring "done" |
 | BOM | tool `report_bom` | Returns structured data; model reads and reasons. No separate enrichment in v1. |
 
 This is intentionally not a state machine. The model reasons about what to do next; the skills tell it the rough order; the checklist tracks progress.

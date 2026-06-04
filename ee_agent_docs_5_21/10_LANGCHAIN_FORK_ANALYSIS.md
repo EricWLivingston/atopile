@@ -112,7 +112,7 @@ These are the same artifacts we'd lift in any fork strategy. The question is jus
 - atopile's `AgentRunner` is wrapped as a single `CompiledSubAgent` called `schematic-workflow`.
 - deepagents calls this sub-agent for any schematic-related work; atopile's runner does all schematic emission, building, fixing, etc. internally.
 - Other sub-agents (`requirements-agent`, `topology-agent`, `parts-overlay-agent`, `bom-agent`, `verification-meta`) are deepagents-native dict sub-agents that call LangChain-wrapped atopile tools directly when needed.
-- RAG, Octopart, PySpice, IPC, thermal, pinmux — all LangChain tools available to the appropriate sub-agents.
+- RAG, Octopart, PySpice, IPC, thermal — all LangChain tools available to the appropriate sub-agents.
 - atopile's `OpenAIProvider` runs unmodified inside its own sub-agent.
 - LangGraph state machines for verification (where we want explicit ordering of checks).
 
@@ -174,7 +174,7 @@ The deepagents orchestrator now sees `schematic-workflow` as one of its sub-agen
 **LoC accounting.**
 - New: ~600 LoC for the integration shim, sub-agent wrappers for our non-atopile work, LangGraph wrapping
 - Modified in atopile: ~50 LoC (config defaults so we can pass our session config in; possibly a `flush_history()` method for clean restarts)
-- New tools added to atopile registry: 6 (RAG, Octopart, PySpice, IPC, thermal, pinmux) — same as Option C
+- New tools added to atopile registry: 5 (RAG, Octopart, PySpice, IPC, thermal) — same as Option C
 - Atopile skill modifications: minimal — maybe add an "ee-agent" skill that explains the wider context, but the existing skills are untouched
 
 **Total: ~1,500 LoC of new code (similar to Option C), zero rewriting of atopile internals, two agent loops running in series.**
@@ -182,7 +182,7 @@ The deepagents orchestrator now sees `schematic-workflow` as one of its sub-agen
 **What you get.**
 - **Atopile's runner runs unmodified.** All the runner logic (checklist, nudges, circuit breaker, compaction) stays intact for the schematic work.
 - **deepagents handles cross-domain orchestration.** Requirements → topology → schematic → parts overlay → BOM enrichment → verification. The schematic step is "delegate to atopile and trust it".
-- **LangGraph state machines for the deterministic verification flow** — `ato_check → design_diagnostics → erc → drc → sim_check → bom_check → ipc_check → thermal_check → pinmux_check → summary` — these aren't atopile's job anyway.
+- **LangGraph state machines for the deterministic verification flow** — `ato_check → design_diagnostics → erc → drc → sim_check → bom_check → ipc_check → thermal_check → summary` — these aren't atopile's job anyway.
 - **Custom tools are deepagents-native** for cross-domain work and atopile-native for atopile work. No double-registration.
 - **OpenAI everywhere** — both layers use OpenAI (atopile's runner via `OpenAIProvider`, deepagents via `ChatOpenAI`). Per the constraint of the question.
 
@@ -260,8 +260,7 @@ ee-agent-fork/                          # fork of atopile/atopile
 │   │   ├── octopart_overlay.py
 │   │   ├── pyspice_runner.py
 │   │   ├── ipc_check.py
-│   │   ├── thermal_check.py
-│   │   └── pinmux_check.py
+│   │   └── thermal_check.py
 │   └── tool_definitions_ee.py          # NEW — schemas for our tools
 └── src/ee_agent/                       # NEW — our deepagents layer
     ├── orchestrator.py                 # deepagents create_deep_agent wiring

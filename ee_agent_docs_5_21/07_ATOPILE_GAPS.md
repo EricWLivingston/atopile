@@ -111,7 +111,7 @@ The classification matrix:
 
 ---
 
-### 2.6 No firmware / pinmux co-design
+### 2.6 No firmware / pin-capability co-design
 
 **Status.** A `STM32G474` package wrapper exposes pins like `pwm_a[0..2]` and `can.tx/rx`. The schematic agent can choose which physical MCU pin each interface maps to. But there's no validation that those mappings are valid (e.g. PA8 must be on a TIM1-CH1-capable pin, not just any pin).
 
@@ -121,7 +121,7 @@ The classification matrix:
 
 **Proposed PR.** Add `has_pin_capabilities` trait that maps physical pins to capability sets `{TIM, USART, SPI, CAN, ADC, ...}`. Compiler checks assignments against capability set.
 
-**Our work.** `pinmux_check` node in `verification-workflow` runs vendor STM32CubeMX-style pin validation externally. Slower than upstream solution but functional.
+**Our work.** Not implemented in v1. This gap is handled by the upstream PR path above; downstream tooling for this capability is deferred.
 
 **Estimated effort.** Upstream: 6+ weeks (data ingestion for all MCU families is the long tail). Downstream: 2 weeks per MCU family.
 
@@ -244,7 +244,7 @@ The agent should annotate `.ato` modules with "per AN-1234 §3, 100µF bulk cap 
 ### 4.3 Pin-mux / capability validation
 
 - **Upstream (proposed):** `has_pin_capabilities` trait + compiler check.
-- **Downstream:** `pinmux_check` node that validates via vendor-specific rules.
+- **Downstream:** Deferred; no downstream tool planned for v1.
 
 ### 4.4 Provenance / lockfile
 
@@ -267,7 +267,7 @@ If we have bandwidth to upstream a few of these, in order of best ROI for us *an
 Hold off on:
 - **§2.3** — multi-distributor picker. Big legal review. We can do this entirely downstream.
 - **§2.5** — thermal. Touches the solver. High-risk PR.
-- **§2.6, §2.10** — pinmux, cross-domain coordination. Need design discussion in atopile's Discord before any code.
+- **§2.6, §2.10** — pin-mux capability validation, cross-domain coordination. Need design discussion in atopile's Discord before any code.
 
 ---
 

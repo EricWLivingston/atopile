@@ -1,6 +1,6 @@
-# 13 · Project Implementation Plan (Option C — atopile fork + dual provider + 4 custom tools)
+# 13 · Project Implementation Plan (Option C — atopile fork + dual provider + 3 custom tools)
 
-> **Purpose.** Concrete build order for the EE agent given the Option C decision (see `09_HARNESS_ANALYSIS.md`): fork atopile, support both `OpenAIProvider` and a new `AnthropicProvider`, register four custom tools (`rag_search`, `pyspice_run`, `pinmux_check`, `ipc_check`) into atopile's `ToolRegistry`. No deepagents, no LangGraph workflows, no separate sub-agents. Atopile's runner is the orchestrator.
+> **Purpose.** Concrete build order for the EE agent given the Option C decision (see `09_HARNESS_ANALYSIS.md`): fork atopile, support both `OpenAIProvider` and a new `AnthropicProvider`, register three custom tools (`rag_search`, `pyspice_run`, `ipc_check`) into atopile's `ToolRegistry`. No deepagents, no LangGraph workflows, no separate sub-agents. Atopile's runner is the orchestrator.
 
 ---
 
@@ -23,11 +23,10 @@ We work in vertical slices. Each milestone produces something testable end-to-en
 | 3 | Tool registration plumbing | `_ee` module, one stub tool registered, agent calls it through the runner | <$5 |
 | 4 | `rag_search` + corpora | 6 corpora ingested (10 datasheets + standards + textbook excerpts + atopile examples + atopile docs), tool returns cited chunks, 30-question eval ≥80% recall@5 | <$30 |
 | 5 | `pyspice_run` | DC + transient analyses on a coin-cell blinky netlist, results returned to agent | <$10 |
-| 6 | `pinmux_check` | Validates STM32G4 (or nRF52) pin assignments; flags 5 known-bad mappings | <$15 |
-| 7 | `ipc_check` | IPC-2221 trace-width + clearance, IPC-2152 current capacity; findings cited to clauses | <$20 |
-| 8 | End-to-end real design + eval suite | First real design (coin-cell BLE sensor or similar) completes with all 4 tools used + frozen eval gate | <$100 |
+| 6 | `ipc_check` | IPC-2221 trace-width + clearance, IPC-2152 current capacity; findings cited to clauses | <$20 |
+| 7 | End-to-end real design + eval suite | First real design (coin-cell BLE sensor or similar) completes with all 3 tools used + frozen eval gate | <$100 |
 
-**Total to first real design: <$200 in LLM credits.**
+**Total to first real design: <$185 in LLM credits.**
 
 ---
 
@@ -102,7 +101,7 @@ Skeleton for the four new tools. Get one stub registered and callable through th
 # src/atopile/server/agent/_ee/__init__.py
 """EE-agent additions: custom tools registered into atopile's ToolRegistry."""
 from . import tools_stub  # noqa: F401  — import triggers registration
-# (future: from . import tools_rag, tools_pyspice, tools_pinmux, tools_ipc)
+# (future: from . import tools_rag, tools_pyspice, tools_ipc)
 ```
 
 Then `src/atopile/server/agent/tools.py` (or a similar import hub) gets one line: `from . import _ee  # noqa` near the bottom so registration happens on package load.
@@ -197,48 +196,7 @@ For large time series, store results to disk under `build/<target>/sim/<run_id>.
 
 ---
 
-### Milestone 6 — `pinmux_check` (1 week)
-
-See `04_VERIFICATION.md` for the full spec.
-
-**Scope for v1:** one MCU family — pick one of STM32G4 or nRF52840 based on test-design needs. Vendor pinmux tables are the long tail; we add families one at a time.
-
-**Files created:**
-
-- `src/atopile/server/agent/_ee/tools_pinmux.py` — tool implementation
-- `src/atopile/server/agent/_ee/data/pinmux_stm32g4.yaml` (or `pinmux_nrf52840.yaml`) — capability table
-- Schema in `tool_definitions_ee.py`
-- `tests/ee/test_pinmux_check_tool.py` — 5 known-good designs, 5 known-bad
-
-**Signature:**
-```python
-pinmux_check(project_path: str, mcu_designator: str) -> dict
-```
-
-Returns:
-```python
-{
-    "success": True,
-    "mcu": {"designator": "U1", "part_family": "STM32G4", "package": "LQFP48"},
-    "findings": [
-        {
-            "severity": "blocker",
-            "designator": "U1",
-            "pin": "PA8",
-            "signal": "TIM1_CH1",
-            "interface": "pwm_a[0]",
-            "rationale": "Pin PA8 is assigned to pwm_a[0] but only supports TIM1_CH1, not the TIM3 capability declared.",
-            "citation": {"vendor": "ST", "doc": "DS12288 rev 5", "table": "Pin definitions", "page": 56}
-        }
-    ]
-}
-```
-
-**Done.** Tool catches the 5 known-bad mappings, passes the 5 known-good. Citations point to vendor pinmux docs ingested into `app_notes` corpus.
-
----
-
-### Milestone 7 — `ipc_check` (1 week)
+### Milestone 6 — `ipc_check` (1 week)
 
 See `04_VERIFICATION.md` for the full spec.
 
@@ -281,9 +239,9 @@ Returns:
 
 ---
 
-### Milestone 8 — End-to-end real design + eval suite (1.5 weeks)
+### Milestone 7 — End-to-end real design + eval suite (1.5 weeks)
 
-A real design taken through the full workflow with all four tools used in some form.
+A real design taken through the full workflow with all three tools used in some form.
 
 Candidate test design: **coin-cell powered BLE sensor**
 - requirements: spec sheet captured in YAML
@@ -291,7 +249,7 @@ Candidate test design: **coin-cell powered BLE sensor**
 - schematic: emitted by atopile, built, picker resolves parts
 - citations: pulled from datasheets via `rag_search`
 - simulation: `pyspice_run` confirms LDO transient response stays in spec
-- verification: `pinmux_check` confirms BLE SoC pin assignments; `ipc_check` confirms trace widths
+- verification: `ipc_check` confirms trace widths
 
 **Files created:**
 
@@ -315,17 +273,16 @@ Eval metrics:
 ## 3. Critical path
 
 ```
-M1 ─► M2 ─► M3 ─► M4 ─► M8
+M1 ─► M2 ─► M3 ─► M4 ─► M7
               ├─► M5 ─┤
-              ├─► M6 ─┤
-              └─► M7 ─┘
+              └─► M6 ─┘
 ```
 
-M4–M7 are parallelizable. M2 is the long pole (must come before any tool work since tool tests must run on both providers). M3 is small but blocks M4–M7.
+M4–M6 are parallelizable. M2 is the long pole (must come before any tool work since tool tests must run on both providers). M3 is small but blocks M4–M6.
 
-**Wall-clock to M8 (first real design):**
-- One engineer: **6 weeks**
-- Two engineers in parallel from M4: **4 weeks**
+**Wall-clock to M7 (first real design):**
+- One engineer: **5 weeks**
+- Two engineers in parallel from M4: **3.5 weeks**
 
 ---
 
@@ -338,7 +295,6 @@ M4–M7 are parallelizable. M2 is the long pole (must come before any tool work 
 | Skills implicitly assume OpenAI output format quirks | Parity tests in M2 catch this. Tune system-prompt wrapping in the `AnthropicProvider` if needed. |
 | RAG quality plateaus under 80% recall@5 | Iterate on chunkers, run rerank A/B tests; this is a known long-tail of the RAG project |
 | `pyspice_run` ngspice doesn't converge on some real netlists | Add convergence helpers (initial guess, .ic statements); document known limits |
-| Pinmux tables are huge (one MCU family at a time) | Scope M6 to one family; treat subsequent families as separate deliverables |
 | IPC checks produce false-positive noise | Severity tiers (blocker/major/minor/info); start conservative; tune based on real designs |
 | Forking atopile means we own keeping it building on their release schedule | Rebase quarterly. Boundary is small (config + 1 file + tools), so merge conflicts should be rare. |
 
@@ -351,7 +307,7 @@ If you're a Claude Code session picking up this work:
 1. Read `00_ARCHITECTURE.md`, `09_HARNESS_ANALYSIS.md`, `11_ANTHROPIC_PROVIDER.md`.
 2. Run M1 setup (clone, deps, upstream tests green). 30 minutes.
 3. Move to M2 — implement `AnthropicProvider`. Use `OpenAIProvider` as the reference. ~1 week.
-4. M3 (tool plumbing) is small and unblocks M4–M7, which run in parallel.
+4. M3 (tool plumbing) is small and unblocks M4–M6, which run in parallel.
 
 When in doubt, prefer the smallest possible thing that proves the next milestone's contract.
 

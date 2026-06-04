@@ -1,6 +1,6 @@
 # EE Agent — Option C Passdown
 
-> **Purpose.** Track progress of EE agent docs and implementation under **Option C** from `09_HARNESS_ANALYSIS.md`: fork atopile, add `AnthropicProvider` next to `OpenAIProvider` (both supported, switchable via config), reuse atopile's harness as-is, and add four custom tools: **`rag_search`, `pyspice_run`, `pinmux_check`, `ipc_check`**. Out of scope: BOM tool, thermal tool, deepagents, LangGraph state machines.
+> **Purpose.** Track progress of EE agent docs and implementation under **Option C** from `09_HARNESS_ANALYSIS.md`: fork atopile, add `AnthropicProvider` next to `OpenAIProvider` (both supported, switchable via config), reuse atopile's harness as-is, and add three custom tools: **`rag_search`, `pyspice_run`, `ipc_check`**. Out of scope: BOM tool, thermal tool, deepagents, LangGraph state machines.
 
 ---
 
@@ -11,7 +11,7 @@
 - **Fork atopile, don't replace its harness.** Runner (`src/atopile/server/agent/runner.py`, 2,891 LoC) is ~81% provider-agnostic; we keep it. `LLMProvider` is already a `Protocol`, so swapping providers is the natural extension point.
 - **Dual provider support.** `AnthropicProvider` lives at `src/atopile/server/agent/_ee/provider_anthropic.py`. Switch via `EE_AGENT_PROVIDER=openai|anthropic` (default openai). Both must stay green in CI.
 - **Skills work as-shipped** — no changes to `.claude/skills/*/SKILL.md`.
-- **Four custom tools** register through the existing `_register_tool` decorator in `tools.py`, surfaced via `ToolRegistry()` in `routes/agent/utils.py`.
+- **Three custom tools** register through the existing `_register_tool` decorator in `tools.py`, surfaced via `ToolRegistry()` in `routes/agent/utils.py`.
 
 ### Doc set (`ee_agent_docs_5_21/`) — all written
 
@@ -21,7 +21,7 @@
 | `01_ORCHESTRATOR.md` | Runner IS orchestrator (short) |
 | `02_SIMULATION.md` | `pyspice_run` spec |
 | `03_LAYOUT.md` | Deprecation note |
-| `04_VERIFICATION.md` | `ipc_check` + `pinmux_check` |
+| `04_VERIFICATION.md` | `ipc_check` |
 | `05_RAG.md`, `RAG_IMPLEMENTATION_PLAN.md`, `INGESTION_*.md` | RAG corpus + pipeline |
 | `06_ATOPILE_INTEGRATION.md` | Fork mechanics (2 minimal upstream edits planned in M2) |
 | `07_ATOPILE_GAPS.md`, `09_HARNESS_ANALYSIS.md`, `10_LANGCHAIN_FORK_ANALYSIS.md` | Background analysis |
@@ -134,7 +134,7 @@ Default model: `claude-sonnet-4-6`. Defaults preserve OpenAI behavior, so M2 is 
    - Port remaining 11 invariants from upstream's `TestRunner`.
 6. **Wire `LoggingProvider`** (doc §4) into `routes/agent/utils.py` behind `EE_AGENT_LOG_PROVIDER=1` for Tier-2 transcript capture.
 7. **First captured transcript**: tiny "read main.ato" prompt against `OpenAIProvider`, drop into `tests/ee/transcripts/smoke/turn_001.json`, write replay test. Validates the round-trip before M4–M7 generate dozens.
-8. **Tools investigation** (deferred from this session): trace `ToolRegistry` + `_register_tool` to identify the exact files where the four custom tools (`rag_search`, `pyspice_run`, `pinmux_check`, `ipc_check`) get added.
+8. **Tools investigation** (deferred from this session): trace `ToolRegistry` + `_register_tool` to identify the exact files where the three custom tools (`rag_search`, `pyspice_run`, `ipc_check`) get added.
 9. **Open questions still pending**:
    - Keep singleton `AgentRunner` or move to per-request? (Default: keep.)
    - Git-track transcripts under `tests/ee/transcripts/`? (Default: yes.)

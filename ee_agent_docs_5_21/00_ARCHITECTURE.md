@@ -1,6 +1,6 @@
 # EE Design Agent — Architecture
 
-> **Stack:** Forked **atopile** harness (runner, tools, skills, build pipeline, picker, stdlib) + **dual LLM providers** (`OpenAIProvider` upstream + new `AnthropicProvider`) + four custom tools registered into atopile's `ToolRegistry`: **`rag_search`, `pyspice_run`, `pinmux_check`, `ipc_check`**. Custom RAG corpus is our differentiator.
+> **Stack:** Forked **atopile** harness (runner, tools, skills, build pipeline, picker, stdlib) + **dual LLM providers** (`OpenAIProvider` upstream + new `AnthropicProvider`) + three custom tools registered into atopile's `ToolRegistry`: **`rag_search`, `pyspice_run`, `ipc_check`**. Custom RAG corpus is our differentiator.
 >
 > **Models:** Claude Opus 4.7 or Claude Sonnet 4.6 (when running under `AnthropicProvider`); gpt-5.4 family (when running under `OpenAIProvider`). Config flag picks. Both supported in CI.
 
@@ -12,7 +12,7 @@ After deep exploration of atopile's source (see `14_HARNESS_ANALYSIS.md`), the a
 
 1. **Fork atopile.** ~13,269 LoC of production agent runner sits inside `src/atopile/server/agent/`. ~81% is provider-agnostic — checklist-driven planning, circuit breaker, context shrinking, message-log nudges, work-progress detection, skill loader, full observability. We don't rebuild any of this.
 2. **Add `AnthropicProvider` next to `OpenAIProvider`.** Both providers live in the fork. A config flag (`EE_AGENT_PROVIDER=openai|anthropic`) picks. Both must pass CI on every commit. See `16_ANTHROPIC_PROVIDER.md` for the implementation.
-3. **Add four custom tools to atopile's `ToolRegistry`.** No separate orchestrator, no separate sub-agents, no deepagents, no LangGraph state machines. The agent calls our tools just like it calls `parts_install` or `build_run`.
+3. **Add three custom tools to atopile's `ToolRegistry`.** No separate orchestrator, no separate sub-agents, no deepagents, no LangGraph state machines. The agent calls our tools just like it calls `parts_install` or `build_run`.
 4. **Custom RAG corpus** remains the project's differentiator. It feeds the `rag_search` tool, which the agent uses to ground designs in datasheets, app notes, standards, textbooks, and canonical `.ato` patterns.
 
 The previously-proposed layers (deepagents orchestrator, LangGraph workflows, separate sub-agents for requirements/topology/parts/BOM/verification) are **gone**. Atopile's runner handles all of this through its checklist mechanism and skill bundle.
@@ -42,16 +42,15 @@ Untouched. We don't modify these — we depend on them.
 
 ## 3. What we add (the fork's value)
 
-Four new files under `src/atopile/server/agent/_ee/`:
+Three new tool files under `src/atopile/server/agent/_ee/`:
 
 ```
 src/atopile/server/agent/_ee/
 ├── provider_anthropic.py        # AnthropicProvider class
 ├── tools_rag.py                 # rag_search tool body
 ├── tools_pyspice.py             # pyspice_run tool body
-├── tools_pinmux.py              # pinmux_check tool body
 ├── tools_ipc.py                 # ipc_check tool body
-└── tool_definitions_ee.py       # OpenAI-format schemas for the 4 tools above
+└── tool_definitions_ee.py       # OpenAI-format schemas for the 3 tools above
 ```
 
 Plus one configuration change in `src/atopile/server/agent/config.py` (provider selection flag), one registration hook in `src/atopile/server/agent/registry.py` (or a small `_ee/__init__.py` that registers via `_register_tool` decorators), and an optional skill addendum under `.claude/skills/ee-agent/SKILL.md`.
@@ -74,7 +73,7 @@ The agent calls into `ee_agent_rag.retriever` via the `rag_search` tool. RAG ing
 
 ---
 
-## 4. The four new tools
+## 4. The three new tools
 
 ### 4.1 `rag_search`
 
@@ -113,20 +112,7 @@ Returns `{success, results: list[{probe, time?, freq?, value}], errors[], durati
 
 See `05_simulation.md` for full spec.
 
-### 4.3 `pinmux_check`
-
-Validates MCU pin assignments against vendor pinmux capability tables. Catches firmware/HW co-design errors at design time (e.g., assigning `pwm_a[0]` to a pin that isn't TIM-capable on that STM32 part).
-
-**Signature:**
-```python
-pinmux_check(project_path: str, mcu_designator: str) -> dict
-```
-
-Returns `{success, findings: list[{severity, designator, pin, signal, rationale, citation}]}`.
-
-See `07_verification.md` for full spec.
-
-### 4.4 `ipc_check`
+### 4.3 `ipc_check`
 
 IPC compliance. Reads atopile's `report_variables` output (declared net currents, voltages) and the produced PCB, then queries `rag_search(corpus="standards")` to evaluate against IPC-2221 (trace widths), IPC-7351 (land patterns), IPC-2152 (current capacity), etc. Every finding cites a clause.
 
@@ -201,11 +187,10 @@ These can be added later. The architecture supports it — each is just another 
                      │  - checklist_* (managed)           │
                      │  - message_* (managed)             │
                      │                                    │
-                     │  EE-agent tools (4, new):          │
+                     │  EE-agent tools (3, new):          │
                      │  ┌──────────────────────────────┐  │
                      │  │ rag_search                   │  │
                      │  │ pyspice_run                  │  │
-                     │  │ pinmux_check                 │  │
                      │  │ ipc_check                    │  │
                      │  └──────────────────────────────┘  │
                      └─────────────┬──────────────────────┘
@@ -213,14 +198,14 @@ These can be added later. The architecture supports it — each is just another 
               ┌────────────────────┼────────────────────────┐
               ▼                    ▼                        ▼
       ┌──────────────┐    ┌────────────────┐    ┌─────────────────────┐
-      │ ee_agent_rag │    │ atopile build  │    │ Vendor pinmux data, │
-      │ Qdrant +     │    │ pipeline,      │    │ IPC standards in    │
-      │ Cohere +     │    │ KiCad bridge,  │    │ RAG corpus,         │
-      │ voyage-3     │    │ JLCPCB picker  │    │ PySpice/ngspice     │
+      │ ee_agent_rag │    │ atopile build  │    │ IPC standards in    │
+      │ Qdrant +     │    │ pipeline,      │    │ RAG corpus,         │
+      │ Cohere +     │    │ KiCad bridge,  │    │ PySpice/ngspice     │
+      │ voyage-3     │    │ JLCPCB picker  │    │                     │
       └──────────────┘    └────────────────┘    └─────────────────────┘
 ```
 
-The agent loop is *unchanged from upstream atopile*. The provider is config-selectable. The tool palette is upstream + 4.
+The agent loop is *unchanged from upstream atopile*. The provider is config-selectable. The tool palette is upstream + 3.
 
 ---
 
@@ -235,9 +220,8 @@ ee-agent-fork/                                # fork of atopile/atopile
 │   │   ├── provider_anthropic.py             # AnthropicProvider class
 │   │   ├── tools_rag.py                      # rag_search tool body
 │   │   ├── tools_pyspice.py                  # pyspice_run tool body
-│   │   ├── tools_pinmux.py                   # pinmux_check tool body
 │   │   ├── tools_ipc.py                      # ipc_check tool body
-│   │   └── tool_definitions_ee.py            # 4 OpenAI-format schemas
+│   │   └── tool_definitions_ee.py            # 3 OpenAI-format schemas
 │   ├── provider.py                           # MINIMAL EDIT — re-export AnthropicProvider
 │   ├── config.py                             # MINIMAL EDIT — provider selection flag
 │   └── (everything else upstream, untouched)
@@ -266,7 +250,6 @@ ee-agent-fork/                                # fork of atopile/atopile
         ├── test_provider_parity.py           # same prompt, both providers, equivalent behavior
         ├── test_rag_search_tool.py
         ├── test_pyspice_run_tool.py
-        ├── test_pinmux_check_tool.py
         └── test_ipc_check_tool.py
 ```
 
@@ -286,11 +269,10 @@ See `13_PROJECT_PLAN.md` for the 8-milestone plan. Headline order:
 3. **Tool registration plumbing** — `_ee` module skeleton, one stub tool registered and callable.
 4. **RAG corpus + `rag_search`** — ingest 10 datasheets + a standards doc + atopile examples; tool returns cited chunks.
 5. **`pyspice_run`** — runs DC + transient on a coin-cell blinky netlist.
-6. **`pinmux_check`** — validates one MCU family (STM32G4 or nRF52 to start).
-7. **`ipc_check`** — IPC-2221 trace-width + clearance checks with cited findings.
-8. **End-to-end design + eval suite** — first real design with all four tools used, regression-gated.
+6. **`ipc_check`** — IPC-2221 trace-width + clearance checks with cited findings.
+7. **End-to-end design + eval suite** — first real design with all three tools used, regression-gated.
 
-Estimated wall-clock: 6 weeks for one engineer.
+Estimated wall-clock: 5 weeks for one engineer.
 
 ---
 
@@ -301,7 +283,6 @@ Atopile already integrates a trace/progress callback system in the runner. We ho
 Per-tool metrics we care about:
 - `rag_search`: recall@5 on the eval set, citation completeness rate
 - `pyspice_run`: convergence rate, time per analysis
-- `pinmux_check`: false-positive rate, MCU-family coverage
 - `ipc_check`: clause-citation accuracy, severity calibration
 
 These get rolled up in CI against a frozen benchmark of designs (see `13_PROJECT_PLAN.md` milestone 8).
@@ -332,7 +313,7 @@ Expected cost to first real end-to-end design (M8 in `13_PROJECT_PLAN.md`): **<$
 | `00_orchestrator.md` | Short note: atopile's runner IS the orchestrator; no separate one |
 | `05_simulation.md` | `pyspice_run` tool spec |
 | `06_layout.md` | Deprecation note — atopile owns layout in v1 |
-| `07_verification.md` | `ipc_check` + `pinmux_check` tool specs + optional `run_verification` meta-tool |
+| `07_verification.md` | `ipc_check` tool spec + optional `run_verification` meta-tool |
 | `09_rag.md` | RAG retriever (shared resource, feeds `rag_search` tool) |
 | `11_ATOPILE_INTEGRATION.md` | Fork mechanics, tool registration, config flag |
 | `12_ATOPILE_GAPS.md` | Upstream contribution candidates |

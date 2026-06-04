@@ -1,6 +1,6 @@
 # 11 · Atopile Fork Mechanics
 
-> **Replaces the earlier "atopile integration" doc.** Under Option C we maintain a fork of atopile and add four custom tools + an `AnthropicProvider`. This doc covers the fork's structure, how we keep it building against upstream, how tools get registered, and how the provider flag is wired through.
+> **Replaces the earlier "atopile integration" doc.** Under Option C we maintain a fork of atopile and add three custom tools + an `AnthropicProvider`. This doc covers the fork's structure, how we keep it building against upstream, how tools get registered, and how the provider flag is wired through.
 
 ---
 
@@ -24,12 +24,8 @@ src/atopile/server/agent/_ee/
 ├── provider_anthropic.py        # AnthropicProvider class (see 11_ANTHROPIC_PROVIDER.md)
 ├── tools_rag.py                 # rag_search tool body
 ├── tools_pyspice.py             # pyspice_run tool body
-├── tools_pinmux.py              # pinmux_check tool body
 ├── tools_ipc.py                 # ipc_check tool body
-├── tool_definitions_ee.py       # OpenAI-format schemas for our 4 tools
-└── data/
-    ├── pinmux_stm32g4.yaml      # vendor pinmux capability tables
-    └── pinmux_nrf52840.yaml     # (one per supported MCU family)
+└── tool_definitions_ee.py       # OpenAI-format schemas for our 3 tools
 ```
 
 Tool implementations are thin — most actually live in the out-of-tree `ee_agent_rag` package (for `rag_search`) or in the modules above with helpers. The `_ee/__init__.py` imports them all, triggering registration via atopile's existing `_register_tool` decorator.
@@ -199,7 +195,7 @@ def get_ee_tool_definitions() -> list[dict]:
                 "additionalProperties": False,
             },
         },
-        # ... pyspice_run, pinmux_check, ipc_check ...
+        # ... pyspice_run, ipc_check ...
     ]
 ```
 
@@ -207,7 +203,7 @@ And in `_ee/__init__.py`:
 
 ```python
 """EE-agent tools — registered into atopile's ToolRegistry on import."""
-from . import tools_rag, tools_pyspice, tools_pinmux, tools_ipc  # noqa: F401
+from . import tools_rag, tools_pyspice, tools_ipc  # noqa: F401
 ```
 
 This needs to be imported once at runtime to trigger the decorators. The cleanest place is to add a single line near the bottom of upstream's `tools.py`:
@@ -247,7 +243,7 @@ About 6 lines of diff.
 
 ## 6. Skill addendum
 
-We add one new skill — `.claude/skills/ee-agent/SKILL.md` — covering when to use the four new tools. It's loaded by adding `"ee-agent"` to atopile's `fixed_skill_ids` config list:
+We add one new skill — `.claude/skills/ee-agent/SKILL.md` — covering when to use the three new tools. It's loaded by adding `"ee-agent"` to atopile's `fixed_skill_ids` config list:
 
 ```bash
 export ATOPILE_AGENT_FIXED_SKILL_IDS="agent,ato,planning,ee-agent"
@@ -256,7 +252,6 @@ export ATOPILE_AGENT_FIXED_SKILL_IDS="agent,ato,planning,ee-agent"
 The skill is ~300 lines of markdown covering:
 - When to call `rag_search` (and how to use citations)
 - When to call `pyspice_run`
-- When to call `pinmux_check`
 - When to call `ipc_check`
 - How to cite RAG findings in module docstrings and design rationale
 
@@ -375,7 +370,7 @@ ato serve
 ato chat
 ```
 
-The agent now runs with the chosen provider, has access to all 40+ upstream tools plus our 4 custom tools, and loads the EE-agent skill alongside atopile's bundle.
+The agent now runs with the chosen provider, has access to all 40+ upstream tools plus our 3 custom tools, and loads the EE-agent skill alongside atopile's bundle.
 
 ---
 

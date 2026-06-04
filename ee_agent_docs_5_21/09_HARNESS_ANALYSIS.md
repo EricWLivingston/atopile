@@ -188,7 +188,7 @@ Easy. Change defaults to Anthropic, gate on `ANTHROPIC_API_KEY`. Keep OpenAI fie
 
 ### Option B — Use atopile's harness as-is, add tools
 
-**What it is.** Run `ato mcp serve` (or atopile's FastAPI server). Connect to it from a thin client. Augment with extra MCP tools we contribute as a separate server (RAG, Octopart, PySpice, IPC, thermal, pinmux). atopile's own agent (OpenAI-backed) does all the orchestration.
+**What it is.** Run `ato mcp serve` (or atopile's FastAPI server). Connect to it from a thin client. Augment with extra MCP tools we contribute as a separate server (RAG, Octopart, PySpice, IPC, thermal). atopile's own agent (OpenAI-backed) does all the orchestration.
 
 **LoC budget.** ~500 LoC of new MCP server code for our custom tools + RAG corpus + integration. Almost zero harness work.
 
@@ -208,14 +208,14 @@ Easy. Change defaults to Anthropic, gate on `ANTHROPIC_API_KEY`. Keep OpenAI fie
 
 ### Option C — Fork atopile, swap to Anthropic, add tools (recommended)
 
-**What it is.** Fork the atopile repo. Add `AnthropicProvider` next to `OpenAIProvider`. Add a config flag to choose. Register our custom tools (RAG, Octopart, PySpice, IPC, thermal, pinmux) into atopile's `ToolRegistry`. Use atopile's harness as the agent loop. Run as a long-running session (the existing FastAPI server) or as a CLI command.
+**What it is.** Fork the atopile repo. Add `AnthropicProvider` next to `OpenAIProvider`. Add a config flag to choose. Register our custom tools (RAG, Octopart, PySpice, IPC, thermal) into atopile's `ToolRegistry`. Use atopile's harness as the agent loop. Run as a long-running session (the existing FastAPI server) or as a CLI command.
 
 **LoC budget.**
 - `AnthropicProvider`: ~400 LoC
 - Tool-def translator (OpenAI → Anthropic schema): ~30 LoC
 - Response normalizer (Anthropic → OpenAI-shape dict): ~150 LoC
 - Anthropic context compaction (no server-side equivalent): ~80 LoC
-- Custom tools registered into `ToolRegistry`: ~800 LoC (RAG search, Octopart overlay, PySpice runner, IPC checker, thermal derate, pinmux validator — these are tools we'd have to write either way)
+- Custom tools registered into `ToolRegistry`: ~700 LoC (RAG search, Octopart overlay, PySpice runner, IPC checker, thermal derate — these are tools we'd have to write either way)
 - Custom skill additions under `.claude/skills/ee-agent/` for cross-domain reasoning: ~300 LoC of markdown
 - Build/CI/test config: ~200 LoC
 
@@ -245,7 +245,7 @@ Worth being explicit:
 
 ### 4.1 No LangGraph state machines
 
-The original plan had deterministic LangGraph cycles for schematic (emit→build→fix→…) and verification (ato_check→design_diagnostics→erc→drc→sim_check→bom_check→ipc_check→thermal_check→pinmux_check→summary). Under Option C, these become agent-driven sequences — the LLM decides when to call `build_run`, when to call `design_diagnostics`, when to call our `rag_search`, when to declare done.
+The original plan had deterministic LangGraph cycles for schematic (emit→build→fix→…) and verification (ato_check→design_diagnostics→erc→drc→sim_check→bom_check→ipc_check→thermal_check→summary). Under Option C, these become agent-driven sequences — the LLM decides when to call `build_run`, when to call `design_diagnostics`, when to call our `rag_search`, when to declare done.
 
 In practice atopile already encodes most of this in skills. The `ato/SKILL.md` §5 (Troubleshooting) is the equivalent of our `fix_errors_node` prompt. The checklist mechanism encodes the sequencing. We lose:
 - Hard caps per node (e.g. "5 fix iterations max"). atopile uses `max_tool_loops: 240` per turn instead, which is per-turn not per-cycle.
@@ -293,7 +293,6 @@ ee-agent-fork/                          # fork of atopile/atopile
 │   │   ├── pyspice_runner.py           # simulation
 │   │   ├── ipc_check.py                # IPC compliance
 │   │   ├── thermal_check.py            # thermal derating
-│   │   ├── pinmux_check.py             # firmware/HW co-design
 │   │   └── verification_meta.py        # sequenced verification meta-tool
 │   └── tool_definitions_ee.py          # ← schemas for our tools, registered in registry
 ├── .claude/skills/
@@ -313,7 +312,7 @@ Implementation order (vs. the 14 milestones in `08_PROJECT_PLAN.md`, condensed):
 2. **AnthropicProvider stub.** Just enough to pass atopile's own test suite using a stub registry. (2 days)
 3. **AnthropicProvider full.** Tool-def translation, response normalization, retry logic, client-side compaction. Tests passing against real Anthropic API on a trivial design. (3 days)
 4. **RAG corpus + `rag_search` tool.** Existing plan in `RAG_IMPLEMENTATION_PLAN.md`. Register as an EE-agent tool. (2 weeks)
-5. **Custom tools.** Octopart, PySpice, IPC, thermal, pinmux. Each is a tool registered into atopile's `ToolRegistry`. (3 weeks parallelizable)
+5. **Custom tools.** Octopart, PySpice, IPC, thermal. Each is a tool registered into atopile's `ToolRegistry`. (3 weeks parallelizable)
 6. **EE-agent skill.** New `.claude/skills/ee-agent/SKILL.md` covering cross-domain reasoning, RAG citation contract, qualified-parts logic. (3 days)
 7. **First real design.** End-to-end test on a real design with citations. (1 week, iterative)
 8. **Eval suite.** Use atopile's test harness pattern; add EE-agent specific scenarios. (1 week)

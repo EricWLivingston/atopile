@@ -284,8 +284,7 @@ tests/ee/
 ├── test_provider_parity.py              # Tier 2 — same scripted transcript, both providers
 ├── test_rag_search_tool.py              # M4
 ├── test_pyspice_run_tool.py             # M5
-├── test_pinmux_check_tool.py            # M6
-├── test_ipc_check_tool.py               # M7
+├── test_ipc_check_tool.py               # M6
 ├── test_tool_definitions_snapshot.py    # Tier 2 — JSON-schema snapshot guard
 ├── replay/
 │   ├── _harness.py                      # generic transcript player (uses _ScriptedProvider)

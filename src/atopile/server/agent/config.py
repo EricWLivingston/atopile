@@ -38,6 +38,7 @@ _TRACE_DISABLE_VALUES = {"0", "false", "no", "off"}
 
 @dataclass
 class AgentConfig:
+    provider: str = "openai"  # "openai" | "anthropic"
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-5.4"
     summary_model: str = "gpt-4.1-nano"
@@ -97,13 +98,41 @@ class AgentConfig:
         except ImportError:
             pass
 
+        # Provider selection (EE addition). Default "openai" preserves upstream
+        # behavior; "anthropic" swaps credentials, endpoint, and model defaults.
+        provider = _env("EE_AGENT_PROVIDER", "openai").strip().lower()
+        if provider not in ("openai", "anthropic"):
+            raise RuntimeError(
+                f"Invalid EE_AGENT_PROVIDER={provider!r}. "
+                "Use 'openai' or 'anthropic'."
+            )
+
+        if provider == "anthropic":
+            api_key = os.getenv("ATOPILE_AGENT_ANTHROPIC_API_KEY") or os.getenv(
+                "ANTHROPIC_API_KEY"
+            )
+            # Empty base_url → the Anthropic SDK uses its own default endpoint
+            # (provider_anthropic does ``base_url=self._config.base_url or None``).
+            base_url = _env("EE_AGENT_ANTHROPIC_BASE_URL", "")
+            default_model = "claude-sonnet-4-6"
+            # Reuse the (known-valid) main model for summaries; override with
+            # ATOPILE_AGENT_SUMMARY_MODEL for a cheaper summarizer.
+            default_summary_model = "claude-sonnet-4-6"
+        else:
+            api_key = os.getenv("ATOPILE_AGENT_OPENAI_API_KEY") or os.getenv(
+                "OPENAI_API_KEY"
+            )
+            base_url = _env("ATOPILE_AGENT_BASE_URL", "https://api.openai.com/v1")
+            default_model = "gpt-5.4"
+            default_summary_model = "gpt-4.1-nano"
+
         fixed_skill_ids = ["agent", "ato", "planning"]
         return cls(
-            base_url=_env("ATOPILE_AGENT_BASE_URL", "https://api.openai.com/v1"),
-            model=_env("ATOPILE_AGENT_MODEL", "gpt-5.4"),
-            summary_model=_env("ATOPILE_AGENT_SUMMARY_MODEL", "gpt-4.1-nano"),
-            api_key=os.getenv("ATOPILE_AGENT_OPENAI_API_KEY")
-            or os.getenv("OPENAI_API_KEY"),
+            provider=provider,
+            base_url=base_url,
+            model=_env("ATOPILE_AGENT_MODEL", default_model),
+            summary_model=_env("ATOPILE_AGENT_SUMMARY_MODEL", default_summary_model),
+            api_key=api_key,
             timeout_s=_env_float("ATOPILE_AGENT_TIMEOUT_S", "120"),
             summary_timeout_s=_env_float(
                 "ATOPILE_AGENT_SUMMARY_TIMEOUT_S", "8", lo=1.0, hi=30.0

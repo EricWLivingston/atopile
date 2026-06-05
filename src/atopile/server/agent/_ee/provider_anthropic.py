@@ -13,8 +13,11 @@ Provider selection wiring (config flag + instantiation) lands separately.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
+import uuid
+from collections import OrderedDict
 from typing import Any
 
 from anthropic import (
@@ -39,6 +42,10 @@ _CONTEXT_LENGTH_PATTERNS = (
     "context length",
 )
 
+# How many recent conversation transcripts to retain in the in-memory store.
+# Each minted response_id maps to one full transcript; older ones are evicted.
+_MAX_TRANSCRIPTS = 64
+
 
 class AnthropicProvider:
     """Implements the LLMProvider protocol against the Anthropic Messages API."""
@@ -46,6 +53,12 @@ class AnthropicProvider:
     def __init__(self, config: AgentConfig) -> None:
         self._config = config
         self._client: AsyncAnthropic | None = None
+        # Anthropic's Messages API is stateless: there is no ``previous_response_id``.
+        # The runner, however, is built for OpenAI's stateful Responses API and only
+        # hands us the per-turn *delta* each call. We therefore keep the full
+        # conversation ourselves, keyed by the response_id we mint and return, so we
+        # can rebuild the complete transcript Anthropic requires on every request.
+        self._transcripts: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
 
     def _get_client(self) -> AsyncAnthropic:
         if self._client is None:
@@ -72,29 +85,94 @@ class AnthropicProvider:
         tools: list[dict[str, Any]],
         skill_state: dict[str, Any],
         project_path: Any,
-        previous_response_id: str | None = None,  # no Anthropic equivalent; ignored
+        previous_response_id: str | None = None,
     ) -> LLMResponse:
-        # 1) Translate OpenAI-format inputs → Anthropic-format inputs.
-        anthropic_messages = _convert_messages_openai_to_anthropic(messages)
+        # 1) Translate this turn's delta (OpenAI-format) → Anthropic-format.
+        delta = _convert_messages_openai_to_anthropic(messages)
+
+        # 2) Rebuild the full conversation. Anthropic keeps no server-side state,
+        #    so we reconstruct it from the transcript stored under the id we minted
+        #    on the previous call, then append this turn's delta.
+        conversation = self._rebuild_conversation(previous_response_id, delta)
+
         anthropic_tools = [_convert_tool_def(t) for t in tools]
         system_blocks = _build_system_with_caching(instructions, skill_state)
 
-        # 2) Build the request payload.
         payload: dict[str, Any] = {
             "model": self._config.model,
             "max_tokens": _ANTHROPIC_MAX_OUTPUT_TOKENS,
             "system": system_blocks,
-            "messages": anthropic_messages,
+            "messages": conversation,
             "tools": anthropic_tools,
         }
 
         # 3) Call the API with retries + context-overflow handling.
         response = await self._request_with_retries(payload)
 
-        # 4) Normalize Anthropic response → OpenAI-shape dict, then build the
+        # 4) Persist the assistant turn so the *next* delta's tool_result pairs with
+        #    a real preceding tool_use, and mint the id the runner hands back to us
+        #    as previous_response_id.
+        conversation.append(_assistant_message_from_response(response))
+        new_id = getattr(response, "id", None) or uuid.uuid4().hex
+        self._store_transcript(new_id, conversation)
+
+        # 5) Normalize Anthropic response → OpenAI-shape dict, then build the
         #    LLMResponse the runner expects (reusing atopile's own extractors).
         openai_shape = _normalize_to_openai_shape(response)
+        # Ensure LLMResponse.id matches our transcript key (covers the uuid
+        # fallback when Anthropic omits an id).
+        openai_shape["id"] = new_id
         return _build_llm_response(openai_shape)
+
+    # ── Conversation-state management (emulates previous_response_id) ──
+
+    def _rebuild_conversation(
+        self,
+        previous_response_id: str | None,
+        delta: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return the full Anthropic message list for this request.
+
+        Starts from the transcript stored under ``previous_response_id`` (a deep
+        copy so retries/shrinking never mutate the stored history), appends this
+        turn's ``delta``, and guarantees the result is a non-empty list whose final
+        message is a ``user`` turn (the API rejects anything else).
+        """
+        if previous_response_id is not None:
+            base = self._transcripts.get(previous_response_id)
+            if base is None:
+                # We minted ids but lost this one (process restart or LRU
+                # eviction). Raise a message containing "previous_response_id" so
+                # the route layer's chain-recovery (utils.is_chain_integrity_error)
+                # retries this turn from full local history with no prior id.
+                raise RuntimeError(
+                    "Anthropic conversation state for previous_response_id "
+                    f"{previous_response_id!r} was not found; cannot continue "
+                    "without re-sending full history."
+                )
+            conversation = copy.deepcopy(base)
+            self._transcripts.move_to_end(previous_response_id)  # LRU touch
+        else:
+            conversation = []
+
+        conversation.extend(delta)
+
+        # Empty deltas (commentary / silent-retry / closing calls) or a transcript
+        # that ends on an assistant turn need a user turn to elicit a response.
+        if not conversation or conversation[-1].get("role") != "user":
+            conversation.append(
+                {"role": "user", "content": [{"type": "text", "text": "Continue."}]}
+            )
+
+        return conversation
+
+    def _store_transcript(
+        self, response_id: str, conversation: list[dict[str, Any]]
+    ) -> None:
+        self._transcripts[response_id] = conversation
+        self._transcripts.move_to_end(response_id)
+        while len(self._transcripts) > _MAX_TRANSCRIPTS:
+            self._transcripts.popitem(last=False)
 
     # ── Retry + overflow handling (parallels OpenAIProvider) ──────────
 
@@ -219,6 +297,38 @@ class AnthropicProvider:
 # ─────────────────────────────────────────────────────────────────────
 #   Translation helpers
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _assistant_message_from_response(response: Any) -> dict[str, Any]:
+    """Rebuild a storable Anthropic ``assistant`` message from a response.
+
+    Captures ``text`` and ``tool_use`` blocks as plain dicts (so the stored
+    transcript serializes cleanly on the next request) and drops empty text and
+    internal ``thinking`` blocks. The ``tool_use`` blocks are what let the next
+    turn's ``tool_result`` delta pair correctly — fixing the orphaned-tool_result
+    400 that previously froze the agent right after the checklist.
+    """
+    content_blocks: list[dict[str, Any]] = []
+    for block in getattr(response, "content", []):
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            text = getattr(block, "text", "")
+            if text:
+                content_blocks.append({"type": "text", "text": text})
+        elif block_type == "tool_use":
+            content_blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                }
+            )
+    if not content_blocks:
+        # Anthropic always returns at least one block; guard so we never store an
+        # assistant message with empty content (the API rejects that on resend).
+        content_blocks.append({"type": "text", "text": " "})
+    return {"role": "assistant", "content": content_blocks}
 
 
 def _convert_tool_def(openai_def: dict[str, Any]) -> dict[str, Any]:

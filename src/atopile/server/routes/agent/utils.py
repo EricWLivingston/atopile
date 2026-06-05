@@ -16,6 +16,7 @@ from typing import Any
 from atopile.dataclasses import AgentEventRow, AppContext
 from atopile.server.agent import AgentRunner, mediator
 from atopile.server.agent.activity_summary import ActivitySummarizer
+from atopile.server.agent._ee.provider_anthropic import AnthropicProvider
 from atopile.server.agent.config import AgentConfig
 from atopile.server.agent.execution_context import AgentExecutionContext
 from atopile.server.agent.provider import OpenAIProvider
@@ -59,10 +60,19 @@ from .state import (
 _PROGRESS_DISABLE_VALUES = {"0", "false", "no", "off"}
 
 _agent_logs_db_initialized = False
+
+
+def _make_provider(config: AgentConfig):
+    """Select the LLM provider from config. Default OpenAI; EE adds Anthropic."""
+    if config.provider == "anthropic":
+        return AnthropicProvider(config=config)
+    return OpenAIProvider(config=config)
+
+
 _config = AgentConfig.from_env()
 orchestrator = AgentRunner(
     config=_config,
-    provider=OpenAIProvider(config=_config),
+    provider=_make_provider(_config),
     registry=ToolRegistry(),
 )
 activity_summarizer = ActivitySummarizer(config=_config)

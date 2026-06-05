@@ -57,6 +57,22 @@ Does not really make a lot of sense.
 """
 
 
+# EasyEDA's CloudFront edge returns a 403 HTML page (not JSON) for any request
+# whose User-Agent contains "easyeda2kicad", which makes the upstream library
+# crash with "Expecting value: line 1 column 1 (char 0)". Use a browser-like
+# User-Agent so the API keeps responding with JSON.
+_EASYEDA_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
+def _easyeda_api() -> EasyedaApi:
+    api = EasyedaApi()
+    api.headers["User-Agent"] = _EASYEDA_USER_AGENT
+    return api
+
+
 def _decode_easyeda_date(date: str | int | float) -> datetime:
     if isinstance(date, str):
         return datetime.fromisoformat(date)
@@ -343,7 +359,7 @@ class EasyEDAPart:
         assert self._pre_model is not None
         if lifecycle.easyeda2kicad.shall_refresh_model(self):
             logger.debug(f"Downloading model for {self.identifier}")
-            model = EasyedaApi().get_step_3d_model(uuid=self._pre_model.uuid)
+            model = _easyeda_api().get_step_3d_model(uuid=self._pre_model.uuid)
             # might happen sometimes, that even tho it's in the api, it's not available
             if model is None:
                 self.model = None
@@ -496,7 +512,7 @@ def get_raw(lcsc_id: str) -> EasyEDAAPIResponse:
         return lifecycle.easyeda_api.load(lcsc_id)
 
     logger.debug(f"Downloading API data {lcsc_id}")
-    api = EasyedaApi()
+    api = _easyeda_api()
     cad_data = api.get_cad_data_of_component(lcsc_id=lcsc_id)
     # API returned no data
     if not cad_data:

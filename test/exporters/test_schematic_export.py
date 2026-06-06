@@ -3,6 +3,7 @@
 
 """Tests for the KiCad connectivity-schematic emitter."""
 
+import re
 import shutil
 import subprocess
 from itertools import pairwise
@@ -17,6 +18,7 @@ from faebryk.exporters.schematic.kicad import schematic as S
 from faebryk.exporters.schematic.kicad.generic_symbol import (
     SymbolDef,
     build_generic_symbol,
+    build_wire_box,
 )
 from faebryk.exporters.schematic.kicad.real_symbol import build_real_symbol
 from faebryk.exporters.schematic.kicad.schematic import (
@@ -24,6 +26,7 @@ from faebryk.exporters.schematic.kicad.schematic import (
     PinIR,
     extract_components,
     render,
+    render_wired,
 )
 from faebryk.libs.kicad.fileformats import kicad
 from faebryk.libs.test.fileformats import SYMFILE
@@ -278,3 +281,120 @@ def test_extract_then_render_passes_erc(tmp_path: Path):
     report = (out / "erc.rpt").read_text() if (out / "erc.rpt").exists() else ""
     assert erc.returncode == 0 or "Found" in (erc.stdout + report)
     assert "unconnected" not in report.lower(), report
+
+
+# --------------------------------------------------------------------------------------
+# Wire (ladder) mode
+# --------------------------------------------------------------------------------------
+def test_build_wire_box():
+    sym = build_wire_box("atopile:WBOX_0_3", ["1", "2", "3"])
+    assert sym.is_fallback is True
+    assert set(sym.pin_xy) == {"1", "2", "3"}
+    ys = {y for _, y in sym.pin_xy.values()}
+    assert len(ys) == 1 and next(iter(ys)) < 0  # all pins on the bottom edge
+    xs = [sym.pin_xy[n][0] for n in ("1", "2", "3")]
+    assert xs == sorted(xs) and len(set(xs)) == 3  # unique, increasing lanes
+
+
+def _wired_components() -> list[ComponentIR]:
+    return [
+        ComponentIR("R1", "10k", [PinIR("1", "VCC"), PinIR("2", "GND")]),
+        ComponentIR("R2", "4k7", [PinIR("1", "VCC"), PinIR("2", "GND")]),
+        ComponentIR(
+            "U1",
+            "MCU",
+            [
+                PinIR("1", "VCC"),
+                PinIR("2", "GND"),
+                PinIR("3", "SDA"),
+                PinIR("4", "SCL"),
+            ],
+        ),
+        ComponentIR("R3", "1k", [PinIR("1", "SDA"), PinIR("2", "SCL")]),
+    ]
+
+
+def test_render_wired_summary_and_reparse(tmp_path: Path):
+    comps = _wired_components()
+    doc, summary = render_wired(comps, {"VCC", "GND", "SDA", "SCL"})
+
+    # VCC{R1.1,R2.1,U1.1}, GND{R1.2,R2.2,U1.2}, SDA{U1.3,R3.1}, SCL{U1.4,R3.2}
+    assert summary.trunks == 4  # all four nets have >=2 pins
+    # interior junctions: 3-pin nets (VCC, GND) have 1 each; 2-pin nets have 0
+    assert summary.junctions == 2
+    path = tmp_path / "wired.kicad_sch"
+    path.write_text(doc, encoding="utf-8")
+    assert kicad.loads(kicad.schematic.SchematicFile, path).kicad_sch is not None
+
+
+def _expected_nets(comps: list[ComponentIR]) -> dict[str, set[str]]:
+    nets: dict[str, set[str]] = {}
+    for c in comps:
+        for p in c.pins:
+            if p.net is not None:
+                nets.setdefault(p.net, set()).add(f"{c.ref}.{p.number}")
+    return nets
+
+
+def _kicad_netlist_membership(path: Path, out: Path) -> dict[str, set[str]]:
+    """Run kicad-cli netlist export and return {net_name: {"REF.PIN", ...}}."""
+    netfile = out / "net.net"
+    subprocess.run(
+        [_KICAD_CLI, "sch", "export", "netlist", "--format", "kicadsexpr",
+         "-o", str(netfile), str(path)],
+        capture_output=True,
+        text=True,
+    )
+    text = netfile.read_text()
+    nets_blob = text[text.index("(nets"):]
+    membership: dict[str, set[str]] = {}
+    for block in re.split(r"\(net\b", nets_blob)[1:]:
+        name_m = re.search(r'\(name "?([^")]+)"?\)', block)
+        if not name_m:
+            continue
+        name = name_m.group(1)
+        nodes = re.findall(r'\(ref "?([^")]+)"?\)\s*\(pin "?([^")]+)"?\)', block)
+        if nodes:
+            membership[name] = {f"{r}.{p}" for r, p in nodes}
+    return membership
+
+
+@requires_kicad_cli
+def test_wired_loads_and_no_shorts(tmp_path: Path):
+    comps = _wired_components()
+    doc, _ = render_wired(comps, {"VCC", "GND", "SDA", "SCL"})
+    path = tmp_path / "wired.kicad_sch"
+    path.write_text(doc, encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    # Loads + renders in KiCad.
+    svg = subprocess.run(
+        [_KICAD_CLI, "sch", "export", "svg", "-o", str(out), str(path)],
+        capture_output=True,
+        text=True,
+    )
+    assert svg.returncode == 0, f"load failed:\n{svg.stderr}"
+
+    # Definitive: the drawn wires reproduce exactly the intended nets (no shorts).
+    got = _kicad_netlist_membership(path, out)
+    expected = _expected_nets(comps)
+    for net, pins in expected.items():
+        assert got.get(net) == pins, f"net {net}: expected {pins}, got {got.get(net)}"
+
+
+@requires_kicad_cli
+def test_extract_then_render_wired_no_shorts(tmp_path: Path):
+    app = _build_synthetic_app()
+    components, net_names = extract_components(app)
+    doc, summary = render_wired(components, net_names)
+    assert summary.wires > 0
+
+    path = tmp_path / "syn_wired.kicad_sch"
+    path.write_text(doc, encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    got = _kicad_netlist_membership(path, out)
+    expected = _expected_nets(components)
+    for net, pins in expected.items():
+        assert got.get(net) == pins, f"net {net}: expected {pins}, got {got.get(net)}"

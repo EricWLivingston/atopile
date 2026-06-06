@@ -4,14 +4,18 @@
 """
 KiCad connectivity-schematic emitter (text output).
 
-``export_schematic`` walks a built faebryk graph, extracts components and the net each
-pin sits on, resolves a symbol per component (real cached ``.kicad_sym`` where
-available, generic box otherwise), places the symbols on a grid, and emits a valid
-``.kicad_sch`` as s-expression text with a ``global_label`` on every connected pin.
+``export_schematic`` walks a built faebryk graph and extracts components and the net
+each pin sits on, then emits a valid ``.kicad_sch`` as s-expression text. Two modes:
+
+- **wire mode** (``draw_wires=True``, default, ``render_wired``): generic bottom-pin
+  boxes in one row; each net is drawn as a horizontal trunk + vertical drops + junctions
+  in the empty channel below. Real drawn nets, provably short-free (``render_wired``).
+- **label mode** (``render``): grid-placed symbols (real cached ``.kicad_sym`` where
+  available, generic box otherwise) with a ``global_label`` per pin and no wires.
 
 We emit text rather than using ``kicad.dumps`` because the typed schematic write path
 cannot currently produce a KiCad-loadable file (``07_ATOPILE_GAPS.md`` §2.11). The
-typed model is still used to *read* cached symbol files for pin geometry.
+typed model is still used to *read* cached symbol files for pin geometry (label mode).
 """
 
 import logging
@@ -24,8 +28,10 @@ from natsort import natsorted
 import faebryk.core.node as fabll
 import faebryk.library._F as F
 from faebryk.exporters.schematic.kicad.generic_symbol import (
+    WIRE_PIN_PITCH,
     SymbolDef,
     build_generic_symbol,
+    build_wire_box,
     escape,
 )
 from faebryk.exporters.schematic.kicad.real_symbol import real_symbol_from_file
@@ -45,6 +51,16 @@ ORIGIN_Y = 50.8
 COL_PITCH = 50.8
 ROW_PITCH = 63.5
 DEFAULT_COLS = 8
+
+# Wire (ladder) mode layout, mm. Components sit in one row at ROW_Y; nets are routed in
+# the empty channel below as a horizontal trunk + vertical drops. LANE_PITCH matches
+# generic_symbol.WIRE_PIN_PITCH so each bottom pin lands in its own global lane.
+LANE0_X = 25.4
+LANE_PITCH = WIRE_PIN_PITCH
+COMPONENT_GAP_LANES = 1  # blank lanes between adjacent components
+ROW_Y = 25.4
+CHANNEL_GAP = 12.7  # gap between the pin row and the first trunk
+TRUNK_PITCH = 5.08  # vertical spacing between net trunks
 
 
 def _u() -> str:
@@ -76,14 +92,23 @@ class SchematicSummary:
     labels: int = 0
     fallback_symbols: int = 0
     unmapped_pads: int = 0
+    wires: int = 0
+    junctions: int = 0
+    trunks: int = 0
     path: str | None = None
 
     def __str__(self) -> str:
-        return (
+        base = (
             f"{self.components} components, {self.nets} nets, {self.labels} labels, "
             f"{self.fallback_symbols} generic-box fallbacks, "
             f"{self.unmapped_pads} unmapped pads"
         )
+        if self.wires or self.trunks:
+            base += (
+                f", {self.wires} wires, {self.junctions} junctions, "
+                f"{self.trunks} trunks"
+            )
+        return base
 
 
 # --------------------------------------------------------------------------------------
@@ -247,6 +272,31 @@ def _label_block(net: str, x: float, y: float) -> str:
     )
 
 
+def _trunk_label_block(net: str, x: float, y: float) -> str:
+    """A net label anchored at the left end of a trunk (points left, justified)."""
+    return (
+        f'  (global_label "{escape(net)}" (shape input) (at {x} {y} 180)'
+        f" (fields_autoplaced)\n"
+        f"    (effects (font (size 1.27 1.27)) (justify right))\n"
+        f"    (uuid {_u()}))"
+    )
+
+
+def _wire_block(x1: float, y1: float, x2: float, y2: float) -> str:
+    return (
+        f"  (wire (pts (xy {x1} {y1}) (xy {x2} {y2}))\n"
+        f"    (stroke (width 0) (type default) (color 0 0 0 0))\n"
+        f"    (uuid {_u()}))"
+    )
+
+
+def _junction_block(x: float, y: float) -> str:
+    return (
+        f"  (junction (at {x} {y}) (diameter 0) (color 0 0 0 0)\n"
+        f"    (uuid {_u()}))"
+    )
+
+
 def render(
     components: list[ComponentIR], net_names: set[str], search_dirs: list[Path]
 ) -> tuple[str, SchematicSummary]:
@@ -305,22 +355,140 @@ def render(
     return doc, summary
 
 
+def render_wired(
+    components: list[ComponentIR], net_names: set[str]
+) -> tuple[str, SchematicSummary]:
+    """
+    Ladder-routed renderer: real drawn wires for nets, generic bottom-pin boxes only.
+
+    Every pin gets its own global x-lane in a single component row; each net is a
+    horizontal trunk in the empty channel below, joined to its pins by straight vertical
+    drops with junctions at interior taps. Because lanes are globally unique and the
+    channel holds no pins, drops can only *cross* other nets (never tap them), so the
+    routing is short-free. See the plan / `13` §1.5 for the argument.
+    """
+    summary = SchematicSummary(components=len(components), nets=len(net_names))
+
+    # Dedupe wire boxes by their (ordered) pin-number tuple, like the label-mode box.
+    box_by_pins: dict[tuple[str, ...], SymbolDef] = {}
+
+    def _box(nums: list[str]) -> SymbolDef:
+        key = tuple(nums)
+        if key not in box_by_pins:
+            lib_id = f"{LIB_PREFIX}:WBOX_{len(box_by_pins)}_{len(nums)}"
+            box_by_pins[key] = build_wire_box(lib_id, nums)
+        return box_by_pins[key]
+
+    instances: list[str] = []
+    sym_paths: list[str] = []
+    # net name -> list of (lane_x, pin_bottom_y) tap points
+    taps: dict[str, list[tuple[float, float]]] = {}
+
+    lane = 0
+    for comp in components:
+        nums = natsorted(p.number for p in comp.pins)
+        n = len(nums)
+        sym = _box(nums)
+        comp.inst_uuid = _u()
+
+        # Contiguous lanes for this component's pins; instance centred over them.
+        first_lane = lane
+        lane_xs = [LANE0_X + (first_lane + k) * LANE_PITCH for k in range(n)]
+        origin_x = LANE0_X + (first_lane + (n - 1) / 2) * LANE_PITCH
+        lane += n + COMPONENT_GAP_LANES
+
+        instances.append(_instance_block(comp, sym, origin_x, ROW_Y))
+        sym_paths.append(
+            f'    (path "/{comp.inst_uuid}" (reference "{escape(comp.ref)}") (unit 1)'
+            f' (value "{escape(comp.value)}") (footprint ""))'
+        )
+
+        net_by_num = {p.number: p.net for p in comp.pins}
+        for num, lane_x in zip(nums, lane_xs):
+            net = net_by_num.get(num)
+            if net is None:
+                continue
+            _, py = sym.pin_xy[num]
+            pin_y = ROW_Y - py  # Y-flip; bottom pin -> below the row
+            taps.setdefault(net, []).append((lane_x, pin_y))
+
+    summary.fallback_symbols = len(box_by_pins)
+
+    # Trunks sit in the empty channel below the (uniform) pin row.
+    channel_y0 = (
+        max((y for pts in taps.values() for _, y in pts), default=ROW_Y) + CHANNEL_GAP
+    )
+
+    wires: list[str] = []
+    junctions: list[str] = []
+    labels: list[str] = []
+    for idx, net in enumerate(sorted(taps)):
+        points = sorted(taps[net])  # by x
+        if len(points) < 2:
+            # Single-pin net: just a label at the pin.
+            x, y = points[0]
+            labels.append(_label_block(net, x, y))
+            summary.labels += 1
+            continue
+        trunk_y = channel_y0 + idx * TRUNK_PITCH
+        xs = [x for x, _ in points]
+        # Vertical drops from each pin to the trunk.
+        for x, y in points:
+            wires.append(_wire_block(x, y, x, trunk_y))
+            summary.wires += 1
+        # Horizontal trunk.
+        wires.append(_wire_block(min(xs), trunk_y, max(xs), trunk_y))
+        summary.wires += 1
+        summary.trunks += 1
+        # Junctions where interior drops tap the trunk (endpoints connect end-to-end).
+        for x in xs[1:-1]:
+            junctions.append(_junction_block(x, trunk_y))
+            summary.junctions += 1
+        # One net label at the trunk's left end.
+        labels.append(_trunk_label_block(net, min(xs), trunk_y))
+        summary.labels += 1
+
+    lib_symbols_text = "\n".join(
+        box_by_pins[k].lib_symbol_text
+        for k in sorted(box_by_pins, key=lambda t: box_by_pins[t].lib_id)
+    )
+    doc = (
+        f"(kicad_sch (version {SCH_VERSION}) (generator eeschema)\n"
+        f"  (uuid {_u()})\n"
+        f'  (paper "{PAPER}")\n'
+        f"  (lib_symbols\n{lib_symbols_text}\n  )\n"
+        f"{chr(10).join(instances)}\n"
+        f"{chr(10).join(wires)}\n"
+        f"{chr(10).join(junctions)}\n"
+        f"{chr(10).join(labels)}\n"
+        f'  (sheet_instances\n    (path "/" (page "1"))\n  )\n'
+        f"  (symbol_instances\n{chr(10).join(sym_paths)}\n  )\n"
+        f")\n"
+    )
+    return doc, summary
+
+
 def export_schematic(
     app: fabll.Node,
     *,
     target_name: str,
     out_path: Path,
     parts_search_dirs: list[Path] | None = None,
+    draw_wires: bool = True,
 ) -> SchematicSummary:
     """
     Export a connectivity ``.kicad_sch`` for ``app`` to ``out_path``.
 
-    ``parts_search_dirs`` are directories searched (recursively) for cached
-    ``.kicad_sym`` files to embed real symbols; if omitted or no match is found, a
-    generic box is synthesised per component.
+    ``draw_wires`` (default) routes each net as a ladder of real drawn wires using
+    generic bottom-pin boxes. Set it ``False`` for the label mode: grid-placed symbols
+    (real cached ``.kicad_sym`` where available, generic box otherwise — searched in
+    ``parts_search_dirs``) with a net-name ``global_label`` on every pin and no wires.
     """
     components, net_names = extract_components(app)
-    doc, summary = render(components, net_names, parts_search_dirs or [])
+    if draw_wires:
+        doc, summary = render_wired(components, net_names)
+    else:
+        doc, summary = render(components, net_names, parts_search_dirs or [])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(doc, encoding="utf-8")
     summary.path = str(out_path)

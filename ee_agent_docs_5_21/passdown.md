@@ -473,6 +473,47 @@ same-named `global_label`s, no wires; header `version 20211123`, `paper A4`.
 
 ---
 
+## Session 9 (2026-06-06) — schematic emitter: draw real net wires (ladder routing)
+
+Goal: extend the Session-8 emitter to **draw lines for nets** instead of the per-pin
+label soup. User chose **ladder/trunk routing** with **generic bottom-pin boxes**.
+
+### What was built
+- **Wire mode**, now the build default (`export_schematic(..., draw_wires=True)` →
+  new `render_wired`). The Session-8 label renderer (`render`, real symbols) is kept and
+  selectable via `draw_wires=False`.
+- **`build_wire_box(lib_id, pins)`** in `kicad/generic_symbol.py` — a box with all pins
+  on the **bottom edge**, evenly spaced (`WIRE_PIN_PITCH=5.08`), pointing down.
+- **`render_wired`** in `kicad/schematic.py`: lays components in one row, assigns every
+  pin a **globally unique x-lane**, and routes each net as a horizontal **trunk** in the
+  empty channel below + vertical **drops** from each pin + **junctions** at interior
+  taps + one net **label** at the trunk's left end. New `_wire_block`/`_junction_block`/
+  `_trunk_label_block` emitters; `SchematicSummary` gains `wires`/`junctions`/`trunks`.
+- Boxes dedupe by pin-number tuple (distinct `lib_id` per distinct pin set), as in
+  label mode.
+
+### Why it's short-free (the crux)
+Lanes are globally unique and the routing channel holds no pins, so a vertical drop at
+`lane_x` can only ever **cross** another net's trunk (a plain crossing = no connection),
+never land on another net's junction or pin. Only intended drop↔trunk↔drop connections
+exist. **Verified**, not just argued: tests export `kicad-cli sch export netlist` and
+assert each net's pin membership equals the IR exactly.
+
+### Verification
+- `pytest test/exporters/test_schematic_export.py` → **11 passed** (4 new wire-mode
+  tests incl. two netlist-membership no-shorts checks; existing label-mode tests stay
+  green). ruff clean.
+- **`ato build examples/i2c`** (wire mode) → 21 wires, 6 junctions, 5 net labels;
+  `kicad-cli` loads + renders, ERC **0 errors** (only 5 benign `atopile`-nickname
+  warnings); netlist reproduces exact nets (hv=6, lv=4, SDA/SCL/Alert=2).
+
+### What this session did NOT do
+- Real symbols in wire mode (wire mode uses generic boxes; real symbols stay label-mode).
+- No human-readable auto-placement, orthogonal point-to-point routing, hierarchical
+  sheets, or power symbols. Agent `schematic_export` tool still deferred.
+
+---
+
 ## Progress log (cumulative)
 
 - [done] Sessions 1–2 — full doc set written (`00`–`14` + RAG + ingestion + passdown). No source modified.
@@ -499,6 +540,11 @@ same-named `global_label`s, no wires; header `version 20211123`, `paper A4`.
   form, generic-box fallback. `ato build examples/i2c` → KiCad-loadable, ERC-clean
   (0 errors). 7 exporter tests pass. Agent tool deferred. (`13` §1.5 / `07` §2.11
   marked resolved.)
+- [done] Session 9 — **Drawn net wires (ladder routing).** Wire mode is the build
+  default: generic bottom-pin boxes, each pin in a unique x-lane, nets routed as
+  trunk+drops+junctions in an empty channel (provably short-free). `build_wire_box` +
+  `render_wired`; label mode retained via `draw_wires=False`. i2c: loads, ERC 0 errors,
+  netlist reproduces exact nets. 11 exporter tests pass (incl. netlist no-shorts).
 - [next] **M3 — tool-registration plumbing** (`_ee` stub tool through the runner),
   then M4–M6 tools. Also still pending: three Session-2 doc edits; optional
   schematic follow-ups (agent `schematic_export` tool; nicer placement/power symbols).

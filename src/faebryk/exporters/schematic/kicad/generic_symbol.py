@@ -19,6 +19,9 @@ from dataclasses import dataclass
 
 PIN_LENGTH = 2.54
 GRID = 2.54
+# Lane spacing for wire-mode bottom-edge pins. The ladder renderer assigns global
+# x-lanes at this same pitch, so each pin lands in its own lane.
+WIRE_PIN_PITCH = 5.08
 
 
 @dataclass
@@ -92,6 +95,59 @@ def build_generic_symbol(lib_id: str, pin_numbers: list[str]) -> SymbolDef:
         f" (effects (font (size 1.27 1.27))))\n"
         f'      (property "Value" "{escape(bare)}" (id 1) (at 0 {-half_h - GRID} 0)'
         f" (effects (font (size 1.27 1.27))))\n"
+        f"{rect}\n"
+        f"{pins_unit}\n"
+        f"    )"
+    )
+
+    return SymbolDef(
+        lib_id=lib_id, lib_symbol_text=text, pin_xy=pin_xy, is_fallback=True
+    )
+
+
+def build_wire_box(lib_id: str, pin_numbers: list[str]) -> SymbolDef:
+    """
+    Build a generic box for *wire mode* with all pins on the **bottom edge**.
+
+    Pins are evenly spaced at ``WIRE_PIN_PITCH`` and point straight down (rotation 90,
+    so the connection point is below the body). Their relative x are symmetric about the
+    centre, so the ladder renderer can place the instance over a contiguous block of
+    global x-lanes and have each pin land in its own lane (no two pins share an x).
+    """
+    nums = list(dict.fromkeys(pin_numbers))  # de-dupe, preserve order
+    bare = lib_id.split(":", 1)[-1]
+    n = len(nums)
+
+    half_w = max(n, 1) * WIRE_PIN_PITCH / 2
+    half_h = GRID
+    pin_y = -(half_h + PIN_LENGTH)  # connection point below the body
+
+    pin_xy: dict[str, tuple[float, float]] = {}
+    pin_blocks: list[str] = []
+    for k, num in enumerate(nums):
+        x = (k - (n - 1) / 2) * WIRE_PIN_PITCH
+        pin_xy[num] = (x, pin_y)
+        pin_blocks.append(
+            f"        (pin passive line (at {x} {pin_y} 90) (length {PIN_LENGTH})\n"
+            f'          (name "~" (effects (font (size 1.27 1.27))))\n'
+            f'          (number "{escape(num)}" (effects (font (size 1.27 1.27)))))'
+        )
+
+    rect = (
+        f'      (symbol "{bare}_0_1"\n'
+        f"        (rectangle (start {-half_w} {half_h}) (end {half_w} {-half_h})\n"
+        f"          (stroke (width 0.254) (type default)) (fill (type background))))"
+    )
+    pins_unit = f'      (symbol "{bare}_1_1"\n' + "\n".join(pin_blocks) + "\n      )"
+
+    text = (
+        f'    (symbol "{lib_id}" (pin_numbers hide) (pin_names (offset 0))'
+        f" (in_bom yes) (on_board yes)\n"
+        f'      (property "Reference" "U" (id 0) (at {-half_w} {half_h + GRID} 0)'
+        f" (effects (font (size 1.27 1.27)) (justify left)))\n"
+        f'      (property "Value" "{escape(bare)}" (id 1)'
+        f" (at {-half_w} {half_h + GRID * 2} 0)"
+        f" (effects (font (size 1.27 1.27)) (justify left)))\n"
         f"{rect}\n"
         f"{pins_unit}\n"
         f"    )"

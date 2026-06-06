@@ -67,6 +67,18 @@ Nothing in `src/atopile/build_steps.py`, `src/atopile/buildutil.py`, `src/atopil
 > build step `generate_schematic` in `src/atopile/build_steps.py`, tests
 > `test/exporters/test_schematic_export.py`. The agent `schematic_export` tool was
 > deliberately deferred (build-step/CLI scope this milestone). See passdown Session 8.
+>
+> ✅ **Session 9 (2026-06-06) — drawn net wires (ladder routing).** The build now
+> defaults to **wire mode** (`export_schematic(draw_wires=True)` → `render_wired`):
+> generic bottom-pin boxes in one row, each pin in a globally unique x-lane, every net
+> drawn as a horizontal **trunk** + vertical **drops** + **junctions** in the empty
+> channel below — no per-pin label soup (one net label per trunk). Unique lanes + empty
+> channel make it **provably short-free** (a drop can only cross other nets, never tap
+> them). New: `build_wire_box` in `generic_symbol.py`, `render_wired` + wire/junction
+> emitters in `schematic.py`. Label mode (real symbols, `draw_wires=False`) is retained.
+> Verified on `examples/i2c`: loads + ERC 0 errors, and `kicad-cli sch export netlist`
+> reproduces the exact intended nets (hv=6, lv=4, SDA/SCL/Alert=2). 11 exporter tests
+> pass (incl. netlist-membership no-shorts checks).
 
 > An EE-agent task asked: *"what would it look like to add a tool that outputs a KiCad
 > `.sch` from the `.ato` code?"* This section captures the investigation + a validated

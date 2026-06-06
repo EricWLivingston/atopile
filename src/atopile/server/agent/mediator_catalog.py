@@ -624,6 +624,38 @@ _TOOL_DIRECTORY: dict[str, ToolDirectoryItem] = {
         typical_output="outputs, cost_estimate",
         keywords=["manufacturing", "gerbers", "cost", "production"],
     ),
+    # EE-agent custom tools (Option C). Logic lands in M4–M6; registered here so they
+    # surface in the tool directory/suggestions.
+    "rag_search": ToolDirectoryItem(
+        name="rag_search",
+        category="research",
+        purpose="Search datasheets/standards/app notes and return cited chunks.",
+        tooltip="Ground a design decision in sources (datasheets, IPC, app notes).",
+        inputs=["query", "corpus", "top_k", "filter"],
+        typical_output="results (text, score, citation)",
+        keywords=["datasheet", "standard", "app note", "cite", "ground", "lookup"],
+        tool_role="both",
+    ),
+    "pyspice_run": ToolDirectoryItem(
+        name="pyspice_run",
+        category="verification",
+        purpose="Run a SPICE DC/transient/AC analysis on a netlist.",
+        tooltip="Simulate circuit behaviour and verify against spec.",
+        inputs=["netlist_path", "analysis", "params", "probes"],
+        typical_output="success, results, errors, duration_ms",
+        keywords=["spice", "simulate", "transient", "dc", "ac", "ngspice"],
+        tool_role="execution",
+    ),
+    "ipc_check": ToolDirectoryItem(
+        name="ipc_check",
+        category="verification",
+        purpose="Check trace widths/clearances vs IPC-2221B/IPC-2152.",
+        tooltip="Verify the layout against IPC trace-width and current rules.",
+        inputs=["build_target", "standards", "ambient_temp_rise_c", "copper_weight_oz"],
+        typical_output="success, findings",
+        keywords=["ipc", "trace width", "clearance", "current capacity", "drc"],
+        tool_role="execution",
+    ),
 }
 
 

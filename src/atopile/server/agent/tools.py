@@ -2092,3 +2092,8 @@ def parse_tool_arguments(raw_arguments: str) -> dict[str, Any]:
 def validate_tool_scope(project_root: str, ctx: AppContext) -> Path:
     """Validate and resolve project root for tool execution."""
     return policy.resolve_project_root(project_root, ctx)
+
+
+# EE-agent custom tools. Imported last (after _register_tool/_TOOL_HANDLERS exist) so
+# the decorators in this module register the EE handlers on import. See _ee/tools_ee.py.
+from atopile.server.agent._ee import tools_ee as _ee_tools  # noqa: E402,F401

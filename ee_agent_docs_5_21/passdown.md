@@ -1,550 +1,253 @@
 # EE Agent — Option C Passdown
 
-> **Purpose.** Track progress of EE agent docs and implementation under **Option C** from `09_HARNESS_ANALYSIS.md`: fork atopile, add `AnthropicProvider` next to `OpenAIProvider` (both supported, switchable via config), reuse atopile's harness as-is, and add three custom tools: **`rag_search`, `pyspice_run`, `ipc_check`**. Out of scope: BOM tool, thermal tool, deepagents, LangGraph state machines.
+> **Purpose.** Track the EE-agent build under **Option C** (`09_HARNESS_ANALYSIS.md`):
+> fork atopile, add an `AnthropicProvider` next to `OpenAIProvider` (switchable via
+> config), reuse atopile's agent runner as-is, and add three custom tools
+> (`rag_search`, `pyspice_run`, `ipc_check`). Out of scope: BOM tool, thermal tool,
+> deepagents, LangGraph state machines.
+>
+> This file is the living memory across sessions. It is organized topically:
+> **Status → Reusable facts → Lessons & gotchas → Completed work → Open items.**
+> The dated progress log at the bottom is just an index.
 
 ---
 
-## Current state (compressed history of Sessions 1–2)
+## Status at a glance
 
-### Decisions locked in
-
-- **Fork atopile, don't replace its harness.** Runner (`src/atopile/server/agent/runner.py`, 2,891 LoC) is ~81% provider-agnostic; we keep it. `LLMProvider` is already a `Protocol`, so swapping providers is the natural extension point.
-- **Dual provider support.** `AnthropicProvider` lives at `src/atopile/server/agent/_ee/provider_anthropic.py`. Switch via `EE_AGENT_PROVIDER=openai|anthropic` (default openai). Both must stay green in CI.
-- **Skills work as-shipped** — no changes to `.claude/skills/*/SKILL.md`.
-- **Three custom tools** register through the existing `_register_tool` decorator in `tools.py`, surfaced via `ToolRegistry()` in `routes/agent/utils.py`.
-
-### Doc set (`ee_agent_docs_5_21/`) — all written
-
-| File | Role |
+| Milestone / feature | State |
 |---|---|
-| `00_ARCHITECTURE.md` | Option C overview |
-| `01_ORCHESTRATOR.md` | Runner IS orchestrator (short) |
-| `02_SIMULATION.md` | `pyspice_run` spec |
-| `03_LAYOUT.md` | Deprecation note |
-| `04_VERIFICATION.md` | `ipc_check` |
-| `05_RAG.md`, `RAG_IMPLEMENTATION_PLAN.md`, `INGESTION_*.md` | RAG corpus + pipeline |
-| `06_ATOPILE_INTEGRATION.md` | Fork mechanics (2 minimal upstream edits planned in M2) |
-| `07_ATOPILE_GAPS.md`, `09_HARNESS_ANALYSIS.md`, `10_LANGCHAIN_FORK_ANALYSIS.md` | Background analysis |
-| `08_PROJECT_PLAN.md` | 8 milestones (M1 fork → M8 release) |
-| `11_ANTHROPIC_PROVIDER.md` | ~400 LoC `AnthropicProvider` reference impl, config diff, route diff, parity test plan |
-| `12_DEV_TEST_HARNESS.md` | 3-tier test plan (unit / replay / live) + `LoggingProvider` decorator |
-| `13_KICAD_SCH_AND_FRONTEND_FILES.md` | Audit: no KiCad schematic emitter today; `ato serve frontend` file explorer is no-op in browser |
-| `14_AGENT_VS_RELEASED_EXTENSION.md` | Why marketplace `v0.12.5` lacks the agent UI + how to run source build |
-| `passdown.md` | This file |
+| M1 — fork bootstrap | ✅ done & pushed |
+| M2 — `AnthropicProvider` (dual provider, stateful, tested) | ✅ done & pushed |
+| **Schematic emitter** (label mode + wire/ladder mode) — *not on the original roadmap; built on request* | ✅ done & pushed |
+| M3 — tool-registration plumbing (`ee_ping` smoke + 3 real-tool scaffolds) | ✅ done & pushed |
+| M4 `rag_search` · M5 `pyspice_run` · M6 `ipc_check` — *registered stubs; bodies TBD* | ⏳ next (M4) |
+| M7 — end-to-end design + eval | ⬜ not started |
 
-### Key source-code seams identified
+Fork: **`github.com/EricWLivingston/atopile`**, branch **`feature/ee-agent`**. `main` is
+left clean to track upstream. All committed work is on the fork.
 
-- **Runner DI**: `provider`, `registry`, `config`. Monkeypatch seams: `runner.build_system_prompt`, `runner.build_initial_user_message`. Upstream's in-file `TestRunner` (`runner.py:2124–2891`) gives us 7 reusable invariant tests via `_StubProvider`/`_StubRegistry`.
-- **Runner instantiated as module-level singleton** in `routes/agent/utils.py:62–67` from `AgentConfig.from_env()` at import time. Implication: env changes after server start don't propagate; tests must not import `routes.agent.utils`.
-- **Agent logs**: every turn writes structured events to `~/.atopile/agent_logs.sqlite` (`model/sqlite.py::AgentLogs`) — primary post-mortem tool.
-- **Test runner**: `ato dev test --llm` produces `artifacts/test-report.{json,html,llm.json}`. Supports `-k`, `--baseline`, `--direct`, `--reuse`.
-- **Backend boot**: `ato serve backend` (port 8501) → `atopile.server.server.run_server` → FastAPI + Pydantic→TS type gen + event bus. `ato serve frontend` (port 5173) runs Vite from `src/ui-server/`.
-
-### Known limitations (carry into Session 3+ planning)
-
-- No KiCad schematic emitter on disk — Zig sexp model is complete but no Python emitter exists. Add to `00_ARCHITECTURE.md` §5 exclusions; flag in `07_ATOPILE_GAPS.md` as upstream contribution.
-- Browser `ato serve frontend` file explorer is a no-op (calls `postToExtension` which only works inside a VS Code webview). Documented as Tier-3 caveat in `12_DEV_TEST_HARNESS.md`.
-- These three follow-up doc edits were queued at end of Session 2 and **still pending**:
-  1. Amend `00_ARCHITECTURE.md` §5 with schematic exclusion.
-  2. Append schematic-emitter candidate to `07_ATOPILE_GAPS.md`.
-  3. Append Tier-3 file-explorer caveat to `12_DEV_TEST_HARNESS.md` §2.
+Doc set lives in `ee_agent_docs_5_21/` (`00`–`14` + RAG/ingestion). Most relevant:
+`00_ARCHITECTURE` (Option C overview), `07_ATOPILE_GAPS` (upstream bugs/contrib
+candidates), `08_PROJECT_PLAN` (7 milestones), `11_ANTHROPIC_PROVIDER` (provider
+reference), `12_DEV_TEST_HARNESS` (test tiers), `13_KICAD_SCH_AND_FRONTEND_FILES`
+(schematic emitter design + frontend caveat).
 
 ---
 
-## Session 3 (2026-06-02) — Local VS Code extension install + dev-loop calibration
+## Reusable facts (still true; check before relying on)
 
-Goal: get the unreleased agent sidebar UI running in the user's real VS Code (not the F5 Extension Development Host), and clarify which kinds of source changes flow through which build path.
+**Repo / git.** `origin` → the fork over **HTTPS** (no SSH key on this machine —
+`git@github.com` fails `Permission denied (publickey)`); `upstream` →
+`atopile/atopile` with `--push upstream no_push`. `uv run ato --version` ≈
+`0.14.1004.post1.dev76`.
 
-### What was done
+**Python install is editable** (`uv pip show atopile` → editable at repo root, venv is
+**Python 3.14**). Edits under `src/atopile/**` and `src/faebryk/**` take effect on next
+backend restart, no reinstall. `ato` is **not** on PATH — use `uv run ato …` or
+`source .venv/bin/activate`.
 
-**Built and installed the VSIX locally.** Followed `14_AGENT_VS_RELEASED_EXTENSION.md` §3. Sequence:
+**Agent runner seams** (`src/atopile/server/agent/`): runner is provider-agnostic;
+`LLMProvider` is a `Protocol` — the provider is the extension point. Runner is a
+**module-level singleton** built in `routes/agent/utils.py` from `AgentConfig.from_env()`
+at import time → env changes after server start don't propagate, and **tests must not
+import `routes.agent.utils`**. Every turn logs to `~/.atopile/agent_logs.sqlite`
+(`model/sqlite.py::AgentLogs`) — primary post-mortem.
 
-1. `cd src/vscode-atopile && npm install` → idempotent, deps already present (`@vscode/vsce@^3.2.1` confirmed in devDeps).
-2. `npm run build:webviews` → React/Vite bundle to `src/vscode-atopile/resources/webviews/sidebar.js` (1.18 MB).
-3. `npm run compile` → webpack to `dist/extension.js` (1 benign warning re `vscode-languageserver-types` dynamic require).
-4. `npx vsce package` → `src/vscode-atopile/atopile-0.0.0.vsix` (91 files, 4.75 MB). Confirmed `extension/resources/webviews/sidebar.js` ships in the archive (validates that `.vscodeignore` line 27 `webviews/**` does *not* strip `resources/webviews/`).
-5. `code --install-extension atopile-0.0.0.vsix` → succeeded. `code --list-extensions --show-versions` now shows `atopile.atopile@0.0.0`.
+**Provider switch.** `EE_AGENT_PROVIDER=openai|anthropic` (default `openai`, so upstream
+behavior is preserved). Anthropic creds from `ATOPILE_AGENT_ANTHROPIC_API_KEY` /
+`ANTHROPIC_API_KEY`; default model `claude-sonnet-4-6`.
 
-**Marketplace conflict turned out to be a non-issue.** The `~/.vscode/extensions/atopile.atopile-0.12.5/` directory exists but is *not* registered in `extensions.json` — it's an orphan. CLI saw no installed atopile extension pre-install. The orphan dir is harmless; user can `rm -rf` whenever.
+**Tests.** Agent tests at `test/server/agent/`; exporter tests at `test/exporters/`.
+`test/` is already in `pyproject` `testpaths` — don't add new top-level test roots.
+Live Anthropic tests are behind a `integration` marker and auto-skip without a key.
+`ato dev test --llm` produces `artifacts/test-report.{json,html,llm.json}`.
 
-**Environment quirks discovered, not yet fixed**:
+**Dev loop (running the unreleased agent UI in real VS Code).**
 
-- `/usr/local/bin/code` is a broken symlink pointing at a stale `/private/var/folders/.../AppTranslocation/<old-id>/...` path. The currently-running VS Code is at a *different* translocation ID, so each launch could in principle reshuffle.
-- Root cause: `Visual Studio Code.app` is not in `/Applications`. macOS Gatekeeper translocates quarantined apps run from outside `/Applications` to ephemeral mounts.
-- Permanent fix (documented for user): quit VS Code → move `.app` into `/Applications` → `xattr -dr com.apple.quarantine` → relaunch → run "Shell Command: Install 'code' command in PATH" from the command palette.
-- For this session, used the running translocation path directly to call `code --install-extension`.
-
-**Verified Python install mode**: `uv pip show atopile` →
-```
-Location: /Users/ericlivingston/atopile/.venv/lib/python3.14/site-packages
-Editable project location: /Users/ericlivingston/atopile
-```
-Editable install confirmed. Edits under `src/atopile/**` will take effect on next backend restart with no reinstall. Caveat: `ato` is not on the shell PATH (`.venv` not auto-activated) — fine for the extension (it spawns its own backend) but smoke-testing from the terminal needs `source .venv/bin/activate` or `uv run ato …`.
-
-**Skimmed `11_ANTHROPIC_PROVIDER.md` against current source** to map the actual edit surface for the upcoming `AnthropicProvider` work. Three files, all Python:
-
-| File | Change | LoC |
+| Change type | Rebuild | Apply |
 |---|---|---|
-| `src/atopile/server/agent/_ee/provider_anthropic.py` | **New**, implements `LLMProvider` Protocol; translates OpenAI ↔ Anthropic message/tool shapes; client-side compaction (Anthropic has no `responses.compact`) | ~400 |
-| `src/atopile/server/agent/config.py` | Add `provider: str = "openai"`; branch on provider for `api_key`/`base_url`/`default_model`; new env vars `ANTHROPIC_API_KEY` / `ATOPILE_AGENT_ANTHROPIC_API_KEY` | ~30 |
-| `src/atopile/server/routes/agent/utils.py` | Replace `OpenAIProvider(...)` with `_make_provider(_config)` that switches on `config.provider` | ~10 |
+| Python `src/atopile/**`, `src/faebryk/**` | none (editable) | reload VS Code window |
+| Extension host TS `src/vscode-atopile/src/**` | `npm run compile` | reload window |
+| Webview React `src/ui-server/src/**` | `npm run build:webviews` | reload window |
+| Ship a VSIX | all above + `npx vsce package` + `code --install-extension` | per release |
 
-Default model: `claude-sonnet-4-6`. Defaults preserve OpenAI behavior, so M2 is backward-compatible.
-
-### Dev-loop reference (established this session)
-
-| Change type | Rebuild required | How to apply |
-|---|---|---|
-| Python: provider, tools, config, routes (`src/atopile/**`) | None — editable install picks up edits | Reload VS Code window (extension respawns backend on activation) |
-| Extension host TypeScript (`src/vscode-atopile/src/**`) | `npm run compile` | Reload window |
-| Webview React (`src/ui-server/src/**`) | `npm run build:webviews` | Reload window |
-| Ship a new VSIX (persists across machines / shells) | All of the above, then `npx vsce package` + `code --install-extension` | One-time per release |
-
-### What this session did NOT do
-
-- **No source files modified.** Only artifact created: `src/vscode-atopile/atopile-0.0.0.vsix` (gitignored build output) and corresponding install in `~/.vscode/extensions/atopile.atopile-0.0.0/`.
-- Did not move `Visual Studio Code.app` to `/Applications` or re-link the `code` CLI — left for user to perform.
-- Did not delete the orphan `~/.vscode/extensions/atopile.atopile-0.12.5/` directory.
-- Did not trace `ToolRegistry` registration site — flagged as the next investigation if user wants to start adding agent tools.
-- Did not start M1/M2/M3 implementation work. Plan-only.
-- Did not apply the three pending Session-2 doc follow-up edits (still queued — see "Known limitations" above).
-
-### Plan file written
-
-`/Users/ericlivingston/.claude/plans/i-want-the-vsix-shimmering-minsky.md` — full VSIX install plan with rollback steps. Approved and executed.
+`kicad-cli` for schematic validation: `/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli`
+(v10.0.3).
 
 ---
 
-## Session 4 (2026-06-03) — M1 fork bootstrap + pinmux removal + M2 provider (additive half)
+## Lessons & gotchas (the *why* — most valuable to carry forward)
 
-Goal: execute Milestone 1 (fork), trim the roadmap from 4 tools to 3, and begin Milestone 2 by laying down the `AnthropicProvider` as purely-additive code (no runtime wiring, no tests).
-
-### What was done
-
-**M1 — fork bootstrap (DONE).**
-- Forked atopile to **`https://github.com/EricWLivingston/atopile`** (note: GitHub username is `EricWLivingston`, not `ericlivingston`).
-- Remotes: `origin` → the fork (**HTTPS**, because no SSH key is configured on this machine — `git@github.com` auth fails with `Permission denied (publickey)`); `upstream` → `https://github.com/atopile/atopile.git` with push disabled (`--push upstream no_push`).
-- Working branch: **`feature/ee-agent`** (tracks `origin/feature/ee-agent`). All work lives here; `main` is left clean to track upstream.
-- Sanity checks: `uv run ato --version` → `0.14.1004.post1.dev76`. Upstream `pytest test/` → 30 passed, 1 failed; `ato build examples/esp32_minimal` → fails only at "Picking parts". **Both failures share one root cause: `easyeda.com` returns HTTP 403 (CloudFront block) during part-picking — an external/network issue, unrelated to our changes.** The compiler pipeline itself is green.
-
-**Roadmap trim — pinmux_check removed (DONE).** Dropped `pinmux_check` from the toolset across all 10 planning docs; the custom toolset is now three tools (`rag_search`, `pyspice_run`, `ipc_check`). `08_PROJECT_PLAN.md` renumbered to **7 milestones** (M6 = `ipc_check`, M7 = end-to-end), cost total `<$185`, critical path `M4–M6` parallel. `grep -ri pinmux ee_agent_docs_5_21/` → zero matches.
-
-**M2 — `AnthropicProvider` (additive half DONE; wiring NOT done).** Per user direction: lowest-risk changes only, no tests this pass.
-- **New** `src/atopile/server/agent/_ee/__init__.py` — side-effect-free package marker.
-- **New** `src/atopile/server/agent/_ee/provider_anthropic.py` (~430 LoC) — `AnthropicProvider` implementing the `LLMProvider` protocol. Reconciled against the *actual* source (not just `11_ANTHROPIC_PROVIDER.md`):
-  - reuses the real `_extract_text` / `_extract_function_calls` / `_extract_output_phase` (exist in `orchestrator_helpers.py` at L432/L402/L413);
-  - builds `TokenUsage(input_tokens, output_tokens, total_tokens, cached_input_tokens)` matching the real dataclass;
-  - mirrors `OpenAIProvider`'s lazy `_get_client()` pattern; dropped the unused `BadRequestError` import.
-- **Purely additive — nothing imports `_ee` yet**, so the existing OpenAI path is byte-for-byte unchanged. Verified `import atopile.server.agent._ee.provider_anthropic` → `AnthropicProvider` (import-smoke only; no behavioral test).
-
-### Gotcha resolved: dependencies declared but never locked/installed
-
-M1's bulk `uv add` wrote 6 EE deps into `pyproject.toml` but, due to a **stale uv local-project metadata cache** (`Using cached metadata for: atopile @ file://...`), uv resolved the old package set and **never persisted any of them to `uv.lock` or installed them** — so `import anthropic` failed and `uv sync` was a no-op. Fix:
-- Scoped `pyproject.toml` runtime deps to **`anthropic` only** (the only dep M2 needs). Removed `voyageai`, `cohere`, `qdrant-client`, `pyspice`, `llama-parse` — to be re-added at their milestones (M4 RAG / M5 sim). Several of these likely lack **Python 3.14** wheels (this venv is 3.14), which is plausibly why the bulk resolve failed.
-- `uv lock --refresh` (busts the stale cache → real 3s resolve) **added `anthropic==0.105.2`**; `uv sync` installed it.
-
-### What this session did NOT do (deferred — see pick-up checklist)
-- No edits to `config.py`, `routes/agent/utils.py`, or any other runtime file. The provider is **inert** until wired.
-- No tests.
-- Did not apply the three still-queued Session-2 doc edits (schematic exclusion etc.).
-- Did not re-add the 5 deferred deps.
-
-### Commits pushed to `feature/ee-agent`
-- `d050d83e` — EE agent: initial changes + planning docs (M1: `config.py` `find_dotenv(usecwd=True)`, enable AI panel, docs)
-- `9d4a4e59` — docs: drop pinmux_check from EE-agent roadmap (3-tool plan)
-- `ea86322b` — fix: lock and install anthropic; defer RAG/sim deps to their milestones
-- `cf0985d9` — feat: add AnthropicProvider (Milestone 2, inert until wired)
-- (`e753bbc2` — earlier "add deps" commit; its lock was inconsistent and was corrected by `ea86322b`.)
-
-### Plan file
-`/Users/ericlivingston/.claude/plans/look-at-08-project-plan-i-ethereal-yeti.md` — reused across the M1, pinmux-removal, M2-additive, and dependency-fix passes.
-
----
-
-## Pick-up checklist for next session — finish Milestone 2
-
-> **✅ COMPLETED in Session 5 (2026-06-04).** Items 1–3 done; the live Claude
-> smoke (item 3's intent) was met by the integration suite. Item 4's test
-> plumbing was pulled forward into M2 (full unit + parity + integration tests).
-> See the Session 5 section below. M3 (tool-registration plumbing) is next.
-
-The provider exists but is **not activated**. To complete M2, do these in order:
-
-1. **Patch `config.py`** (`AgentConfig`) per `11_ANTHROPIC_PROVIDER.md` §4:
-   - Add field `provider: str = "openai"`.
-   - In `from_env()`: read `provider = _env("EE_AGENT_PROVIDER", "openai")`; validate `openai|anthropic`.
-   - Branch credential/endpoint/model selection on provider: anthropic → `api_key` from `ATOPILE_AGENT_ANTHROPIC_API_KEY`/`ANTHROPIC_API_KEY`, `base_url=""` (empty → SDK default), `default_model="claude-sonnet-4-6"`; openai → unchanged.
-   - **Watch-out:** today `AgentConfig.base_url` still defaults to the OpenAI URL — the provider's `_get_client()` does `base_url=self._config.base_url or None`, so until this patch lands, an instantiated `AnthropicProvider` would point at the wrong endpoint. This patch + step 2 are what make it safe to instantiate.
-2. **Patch `routes/agent/utils.py:62–67`**: replace `provider=OpenAIProvider(config=_config)` with a `_make_provider(_config)` helper that returns `AnthropicProvider(config=_config)` when `config.provider == "anthropic"`, else `OpenAIProvider`. Import `AnthropicProvider` from `atopile.server.agent._ee.provider_anthropic`. Default keeps OpenAI → backward-compatible.
-3. **Manual smoke** (still no formal tests if keeping that constraint): set `EE_AGENT_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` + `ATOPILE_AGENT_MODEL=claude-sonnet-4-6`, reload the extension window (respawns backend), and run a trivial prompt end-to-end on Claude. Confirm the OpenAI path still works with the flag unset.
-4. **(M3, when ready) test plumbing** per `12_DEV_TEST_HARNESS.md` §3: `tests/ee/conftest.py`, `tests/ee/test_anthropic_provider.py` (unit translation tests), `tests/ee/test_provider_parity.py`, add `tests/ee` to `pyproject.toml::testpaths`.
-
-### Lower-priority carryovers (not blocking M2)
-- Apply the three queued Session-2 doc edits (schematic exclusion in `00_ARCHITECTURE.md` §5; schematic-emitter candidate in `07_ATOPILE_GAPS.md`; Tier-3 file-explorer caveat in `12_DEV_TEST_HARNESS.md` §2).
-- Re-add deferred deps at their milestones: voyageai/cohere/qdrant-client/llama-parse (M4), pyspice (M5) — verify Python 3.14 wheels or pin versions; use `uv lock --refresh` to avoid the stale-cache trap.
-- User-side env cleanup: move `Visual Studio Code.app` to `/Applications`, strip quarantine, re-link `code` CLI; optionally `rm -rf ~/.vscode/extensions/atopile.atopile-0.12.5/`.
-- Tools investigation: trace `ToolRegistry` + `_register_tool` for where the 3 custom tools get registered (M3+).
+- **uv stale local-project metadata cache.** A bulk `uv add` of EE deps wrote them to
+  `pyproject.toml` but `uv` resolved a cached package set and **never persisted them to
+  `uv.lock` or installed** (`Using cached metadata for: atopile @ file://…`); `uv sync`
+  was a silent no-op. Fix: **`uv lock --refresh`** to bust the cache, then `uv sync`. Also
+  scope deps to what's needed now — several EE deps (voyageai/cohere/qdrant/pyspice/
+  llama-parse) likely lack **Python 3.14** wheels, which probably triggered the bad resolve.
+- **Anthropic Messages API is stateless; the runner assumes OpenAI's stateful Responses
+  API.** After turn 1 the runner sends only the per-turn *delta* and relies on
+  `previous_response_id` to rebuild history. The first `AnthropicProvider` ignored that →
+  turn-2 sent a lone `tool_result` with no preceding `tool_use` → **Anthropic 400
+  (orphaned tool_result)**; the error didn't match the chain-recovery snippets, so the run
+  failed right after the checklist (the "freeze"). Fix: the provider keeps its **own
+  transcript store** keyed by response id and rebuilds the full conversation each call (see
+  Completed work → M2). This is the model for any future stateless provider.
+- **API key delivery to the non-interactive shell.** Keys set in the user's interactive
+  shell aren't visible to the tool shell. Resolved with a gitignored project-root **`.env`**
+  sourced explicitly (`set -a; . ./.env; set +a; uv run pytest …`). `conftest.py` reads
+  `os.getenv` directly (no dotenv), so the key must already be in the process env.
+- **`kicad.dumps` for schematics is broken** (`07_ATOPILE_GAPS.md` §2.11, proven with
+  kicad-cli 10.0.3): re-dumping a known-good `.kicad_sch` fixture yields a file KiCad
+  refuses to load (drops `(symbol_instances)`/`(sheet_instances)`, mis-emits `(symbol …)`).
+  So the emitter writes **sexp text directly**; the typed model is used only to *read*
+  (parse `.kicad_sym` for geometry). The *read* side is fine.
+- **Symbol-format version mismatch.** Cached `.kicad_sym` are KiCad-9 grammar
+  (`20241229`); embedding them verbatim into a `20211123` schematic makes KiCad reject the
+  file. Fix: **regenerate** the symbol in the schematic's own embedded grammar from the
+  parsed typed model. Rule: lib-symbol name must equal the instance `lib_id`
+  (`atopile:<name>`), child unit symbols keep the bare `<name>` prefix; symbol Y flips on
+  instantiation, so a symbol-space pin `(px, py)` maps to schematic `(ix+px, iy−py)`.
+- **Wire routing can silently short nets** (connectivity is geometric: a wire over another
+  pin, or a junction where nets cross, merges them). The ladder design is **provably
+  short-free** by construction — every pin gets a globally unique x-lane and the routing
+  channel holds no pins, so a drop can only *cross* another net (no junction) — and this is
+  **verified**, not just argued, via `kicad-cli sch export netlist` membership assertions.
+- **easyeda.com returns HTTP 403 (CloudFront) during part-picking**, breaking builds for
+  network reasons unrelated to our code. Worked around in `lcsc.py` with a browser
+  User-Agent. A cleaner upstream fix (clear error instead of cryptic `JSONDecodeError`)
+  lives as a local commit in `easyeda2kicad.py` and is **not** pushed (no personal fork of
+  that repo yet).
+- **macOS VS Code translocation (user-side env).** `Visual Studio Code.app` outside
+  `/Applications` gets Gatekeeper-translocated to an ephemeral mount, breaking the
+  `/usr/local/bin/code` symlink. Permanent fix: move the app into `/Applications`,
+  `xattr -dr com.apple.quarantine`, relaunch, re-run "Install 'code' command in PATH".
+- **No circular re-export.** `AnthropicProvider` is imported directly from
+  `_ee.provider_anthropic` in `utils.py`; do **not** re-export it from `provider.py`
+  (that creates `provider.py → _ee → provider.py`).
 
 ---
 
-## Session 5 (2026-06-04) — M2 finished: provider wired + full test suite + live Claude
+## Completed work (condensed)
 
-Goal: complete Milestone 2 by activating the inert `AnthropicProvider` (config +
-route wiring), add the M2 test suite, and verify end-to-end on the real
-Anthropic API. **No git commits/pushes** (per user constraint) — working-tree
-changes only.
+### M1 — fork bootstrap ✅
+Fork + remotes as above; branch `feature/ee-agent`. Trimmed the roadmap from 4 tools to
+3 (dropped `pinmux_check`) → 7 milestones, `<$185` budget. Skills used as-shipped (no
+`.claude/skills/*` changes).
 
-### What was done
+### M2 — `AnthropicProvider` (dual provider, stateful) ✅ pushed
+- `src/atopile/server/agent/_ee/provider_anthropic.py` — implements the `LLMProvider`
+  protocol; translates OpenAI↔Anthropic message/tool shapes; reuses the real
+  `_extract_text`/`_extract_function_calls`/`_extract_output_phase` from
+  `orchestrator_helpers.py`; client-side compaction (no server-side `responses.compact`).
+- **Stateful emulation of `previous_response_id`:** an LRU transcript store
+  (`_MAX_TRANSCRIPTS=64`) keyed by minted response id; `complete()` rebuilds the full
+  conversation (deep-copied so retries/shrinking don't mutate history) and stores the
+  assistant turn so the next delta's `tool_result` pairs with a real `tool_use`. Unknown
+  `previous_response_id` → raise a message containing `"previous_response_id"` so the
+  existing `run_turn_with_chain_recovery` retries from full local history; empty deltas /
+  assistant-terminated transcripts get a `"Continue."` user turn.
+- **Wiring:** `config.py` gained `provider` + `EE_AGENT_PROVIDER` branch (anthropic
+  `base_url=""` → SDK default, which is what stops Claude from hitting the OpenAI
+  endpoint); `routes/agent/utils.py` `_make_provider()` selects the provider. Default
+  OpenAI path unchanged.
+- **Tests** at `test/server/agent/`: 14 offline unit (translation helpers), 1 parity
+  (both providers, monkeypatched request seam, equal normalized output), 4 offline state
+  (the freeze fix), 3 live integration. Offline 19 pass / 4 skip; live user-confirmed
+  end-to-end (agent proceeds past the checklist into real multi-turn tool use).
 
-**M2 wiring (provider now selectable, default still OpenAI).**
+### Schematic emitter ✅ pushed (`src/faebryk/exporters/schematic/`)
+Atopile had **no** Python `.kicad_sch` writer; this adds one. Emits **sexp text**
+(because `kicad.dumps` is broken — see Lessons). Build step `generate_schematic` in
+`build_steps.py` (`@muster.register("schematic", dependencies=[prepare_nets],
+produces_artifact=True)`, in `generate_default`'s deps) writes
+`config.build.paths.output_base.with_suffix(".kicad_sch")` — the exact path
+`domains/manufacturing.py` surfaces as `outputs.kicad_sch`, so it auto-integrates (no
+route/frontend changes).
 
-- **`src/atopile/server/agent/config.py`** — added `provider: str = "openai"`
-  dataclass field; in `from_env()` read `EE_AGENT_PROVIDER` (validated to
-  `openai|anthropic`, else `RuntimeError`) and branch defaults:
-  - **anthropic** → `api_key` from `ATOPILE_AGENT_ANTHROPIC_API_KEY` /
-    `ANTHROPIC_API_KEY`; `base_url=""` (empty → SDK default, override via
-    `EE_AGENT_ANTHROPIC_BASE_URL`); `default_model="claude-sonnet-4-6"`;
-    `default_summary_model="claude-sonnet-4-6"` (kept equal to the main model so
-    a known-valid id is reused; override with `ATOPILE_AGENT_SUMMARY_MODEL`).
-  - **openai** → unchanged (`OPENAI_API_KEY`/`ATOPILE_AGENT_OPENAI_API_KEY`,
-    `https://api.openai.com/v1`, `gpt-5.4`, `gpt-4.1-nano`).
-  - This fixes the Session-4 watch-out: the empty anthropic `base_url` is what
-    keeps `_get_client()` from pointing Claude at the OpenAI endpoint.
-- **`src/atopile/server/routes/agent/utils.py`** — added module-level
-  `_make_provider(config)` (returns `AnthropicProvider` when
-  `config.provider == "anthropic"`, else `OpenAIProvider`) and swapped the single
-  instantiation site to use it. Imported `AnthropicProvider` directly from
-  `_ee.provider_anthropic`.
-  - **Decision:** did **not** re-export `AnthropicProvider` from `provider.py`
-    (the M2 doc suggested it) — that would be a circular import
-    (`provider.py` → `_ee.provider_anthropic` → `provider.py`). Direct import in
-    `utils.py` is the chosen seam.
+- **IR extraction:** components = `has_designator` implementors
+  (`Traits.bind(des).get_obj_raw()`); value via `has_simple_value_representation`; pads
+  via `has_associated_footprint.get_footprint().get_pads()` (`pad.pad_number`); net per
+  pad via a reverse map from `F.Net…get_instances(g)` → `get_connected_pads()` (`is_pad`
+  hashes by node uuid, so net-pad and footprint-pad compare equal).
+- **Label mode** (`render`, `draw_wires=False`): grid of symbols with a `global_label`
+  per pin. Uses **real cached symbols where available** — `real_symbol.py` regenerates the
+  `.kicad_sym` into the schematic's native grammar (see Lessons); generic box fallback
+  (`generic_symbol.py`). Symbol located by `is_atomic_part.symbol` or by
+  `has_part_picked` mfr/partno → `<Mfr>_<Partno>/*.kicad_sym`.
+- **Wire mode** (`render_wired`, **the build default**): generic **bottom-pin boxes**, one
+  global x-lane per pin, each net drawn as a horizontal **trunk** + vertical **drops** +
+  **junctions** in the channel below, one net label per trunk. Provably short-free (see
+  Lessons). Real symbols are label-mode only.
+- **Verified:** 11 exporter tests (incl. two `kicad-cli sch export netlist`
+  no-shorts checks); `ato build examples/i2c` → KiCad loads + renders, ERC **0 errors**
+  (only benign `atopile`-nickname warnings), netlist reproduces exact nets
+  (hv=6, lv=4, SDA/SCL/Alert=2).
 
-**M2 test suite — created, then relocated to mirror the repo's real test root.**
-Initially written under a new top-level `tests/ee/`, then **moved to
-`test/server/agent/`** (mirrors `src/atopile/server/agent/`; `test/` is already
-in `pyproject` `testpaths`). The temporary `testpaths += "tests/ee"` edit was
-reverted and the stray `tests/` dir removed — **net `pyproject.toml` change: none**.
-
-Files at `test/server/agent/`:
-- `conftest.py` — fixtures (`anthropic_config`, `openai_config`,
-  `SimpleNamespace`-based fake Anthropic `Message`/block/usage factories);
-  registers the `integration` marker; `pytest_collection_modifyitems` auto-skips
-  `integration` tests when `ANTHROPIC_API_KEY` is unset.
-- `test_anthropic_provider.py` — **14 offline unit tests** of the pure translation
-  helpers (tool-def convert, message convert incl. `function_call`/
-  `function_call_output` → `tool_use`/`tool_result`, normalize incl. phase +
-  cached-token mapping, `_build_llm_response`, tool-output shrink, compaction
-  skip <6 msgs).
-- `test_provider_parity.py` — **1 offline parity test**: same OpenAI-format
-  `messages`+`tools` through **both** providers with their async
-  `_request_with_retries` seam monkeypatched to canned-but-equivalent responses;
-  asserts equal text, tool-call name/args, phase, and populated usage.
-- `test_anthropic_provider_integration.py` — **3 live tests** (`pytestmark =
-  pytest.mark.integration`): trivial completion, tool-call round-trip, long-history
-  compaction.
-
-### Verification (all green)
-
-- Offline `test/server/agent`: **15 passed, 3 skipped** (integration skipped, no key).
-- Full `test/server`: **21 passed, 3 skipped** (EE tests co-discovered with the
-  existing server tests).
-- OpenAI regression (co-located `provider.py`/`utils.py`/`config.py` tests):
-  **3 passed** — default path unaffected.
-- **Live Anthropic API** (key sourced from a gitignored `.env`): integration file
-  **3 passed in ~13s**; full `test/server/agent` **18 passed, 0 skipped**. This is
-  the real end-to-end-on-Claude confirmation that was M2's last open done-item.
-
-### Gotchas / notes
-
-- **API key delivery:** the key set in the user's interactive shell is *not*
-  visible to the non-interactive Bash tool, and there was no `.env`. Resolved by
-  the user adding `ANTHROPIC_API_KEY` to a project-root **`.env`** (gitignored),
-  which the test run sources silently: `set -a; . ./.env; set +a; uv run pytest …`.
-  Never printed the key. Note `conftest.py` reads `os.getenv` directly (it does
-  **not** call dotenv), so the key must be in the process env at pytest time.
-- Each integration run makes real (small-cost) API calls — keep them behind the
-  `integration` marker / no-key skip for fast CI.
-
-### What this session did NOT do
-- **No git commits or pushes** (explicit constraint). All changes are working-tree only.
-- No changes to the `AnthropicProvider` class itself (already correct from Session 4).
-- The three queued Session-2 doc edits remain pending.
-- Did not start M3 (tool-registration plumbing) — that's next.
-
-### Files touched (working tree)
-- `src/atopile/server/agent/config.py` (provider field + `from_env` branch)
-- `src/atopile/server/routes/agent/utils.py` (`_make_provider` + import)
-- `test/server/agent/{conftest,test_anthropic_provider,test_provider_parity,test_anthropic_provider_integration}.py` (new)
-- `.env` (user-added, gitignored — holds `ANTHROPIC_API_KEY`)
+### M3 — tool-registration plumbing ✅ pushed (`src/atopile/server/agent/_ee/`)
+Wires the EE tool surface through atopile's existing machinery; **no tool logic yet**.
+- **How a tool becomes live (the seams):** a handler via `@_register_tool(name)` in
+  `_TOOL_HANDLERS` (dispatched by `execute_tool`, `tools.py:2068`) **and** a schema in
+  `get_tool_definitions()`. The runner sends *all* `ToolRegistry.definitions()` to the
+  model (`runner.py:440,565`) — no mediator gate on exposure. `_ensure_tool_registry_
+  consistency` (`tools.py:569`) enforces schema⇔handler parity at first call, else raises.
+  `mediator_catalog._TOOL_DIRECTORY` is a non-gating discovery/suggestion list. No
+  per-tool policy allowlist (policy gates file paths only).
+- **EE code stays in `_ee/`:** `tools_ee.py` (4 `@_register_tool` handlers) +
+  `tool_definitions_ee.py` (`get_ee_tool_definitions()` schemas). Two one-line core seams:
+  a **bottom-of-`tools.py`** import (`from ._ee import tools_ee`) triggers handler
+  registration (placed last so the back-import of `_register_tool` resolves); a splice of
+  `*get_ee_tool_definitions()` in `tool_definitions.py`. Plus 3 `_TOOL_DIRECTORY` entries
+  in `mediator_catalog.py` for the real tools.
+- **Tools:** `ee_ping(message)→{ok,echo}` (throwaway smoke proof, not in the directory) +
+  `rag_search`/`pyspice_run`/`ipc_check` registered with their **documented schemas**
+  (`05_RAG`/`02_SIMULATION`/`04_VERIFICATION`) but **graceful stub bodies**
+  (`{"ok": False, "error": "… not implemented yet (M4/M5/M6)"}`) so live runs degrade
+  cleanly until the bodies land.
+- **Verified:** `test/server/agent/test_ee_tools.py` (7 offline tests: consistency guard
+  passes, all 4 schema'd+registered, `ee_ping` echoes, stubs return gracefully, real
+  tools in `available_tool_names()`). Full agent suite 26 pass / 4 skip; ruff clean.
 
 ---
 
-## Session 6 (2026-06-05) — M2 hardened: fixed the multi-turn freeze + first commits/push
+## Open items
 
-Goal: investigate a report that the Anthropic provider "makes a checklist and then
-freezes." This was the real-world blocker Session 5's single-turn integration tests
-missed. Diagnosed, fixed, tested, committed, and pushed to the fork.
-
-### Root cause (confirmed by reading runner + provider)
-
-The runner (`runner.py`) is built for OpenAI's **stateful Responses API**: after the
-first call it sends only the per-turn *delta* (`messages=outputs` or `messages=[]`)
-and relies on the server to rebuild history from `previous_response_id`
-(`runner.py:437`, `:1439`, `:879`, `:717`). **Anthropic's Messages API is
-stateless**, and `AnthropicProvider.complete` ignored `previous_response_id`. So the
-sequence was:
-1. Turn 1 → model calls `checklist_create`. ✅ (user sees the checklist)
-2. Runner calls the provider again with only the `function_call_output` delta.
-3. Provider converted it to a lone `user` `tool_result` whose `tool_use_id`
-   referenced a `tool_use` that was never sent → **Anthropic 400** (orphaned
-   tool_result). `messages=[]` paths would 400 as "messages must be non-empty".
-4. The 400 didn't match `utils._CHAIN_INTEGRITY_ERROR_SNIPPETS`, so chain-recovery
-   didn't fire — the run was marked FAILED right after the checklist = the "freeze."
-
-### Fix — make `AnthropicProvider` stateful (emulate `previous_response_id`)
-
-`src/atopile/server/agent/_ee/provider_anthropic.py` only (no runner/OpenAI-path
-changes):
-- Added `self._transcripts: OrderedDict[response_id → full Anthropic message list]`.
-- `complete()` now rebuilds the full conversation via `_rebuild_conversation()`:
-  start from the stored transcript for `previous_response_id` (deep-copied so
-  retries/shrinking never mutate history), append this turn's converted delta, send
-  the **whole** transcript.
-- After each response, append the assistant turn (text + `tool_use` blocks, via
-  `_assistant_message_from_response`) and store it under the minted id (Anthropic
-  `response.id`, uuid fallback) — so the next delta's `tool_result` pairs with a
-  real preceding `tool_use`. Returned `LLMResponse.id` is forced to match the
-  transcript key.
-- Edge cases: unknown `previous_response_id` → raises a message containing
-  `"previous_response_id"` so the **existing** `run_turn_with_chain_recovery`
-  (`utils.py:209`) retries from full local history; empty deltas (commentary /
-  silent-retry / closing calls) or an assistant-terminated transcript get a
-  `"Continue."` user turn so the request is valid; transcript store bounded by an
-  LRU cap (`_MAX_TRANSCRIPTS = 64`).
-
-### Tests
-
-- **New** `test/server/agent/test_anthropic_provider_state.py` — 4 offline tests
-  (stubbed async client) pinning the behavior: (1) the turn-2 `tool_result` is sent
-  paired with the stored assistant `tool_use` (the orphan that caused the 400 is
-  gone); (2) unknown `previous_response_id` → chain-integrity error; (3) empty delta
-  → `"Continue."` user turn appended; (4) stored transcripts aren't mutated across
-  turns.
-- **Added** a multi-turn live test to `test_anthropic_provider_integration.py`
-  (`test_tool_use_then_tool_result_round_trip`) that reproduces the exact freeze
-  scenario against the real API (turn-1 `tool_use` → turn-2 `tool_result` delta).
-
-### Verification
-- Offline `test/server/agent`: **19 passed, 4 skipped** (live tests skip w/o key).
-- **Live end-to-end on the Anthropic provider — user-confirmed working**: the agent
-  now proceeds past the checklist into real multi-turn tool use (previously froze).
-
-### Git (first commits of the EE-agent working tree → pushed to the fork)
-Session 5's wiring + tests were never committed; this session committed everything
-and pushed `feature/ee-agent` to `origin` (`EricWLivingston/atopile`). Two commits:
-- `fix(picker): work around EasyEDA CloudFront User-Agent block` — `lcsc.py`
-  (separate from the agent work; the build-breaking `easyeda.com` 403 hit during
-  part-picking — see Session 4's note — now sidestepped via a browser User-Agent).
-- `feat(agent): wire Anthropic provider + stateful conversation (Milestone 2)` —
-  `config.py`, `utils.py`, `_ee/provider_anthropic.py`, the four Session-5 test
-  files + the new state test, and this passdown.
-
-(A *separate* robust fix to the upstream `easyeda2kicad` library — raise a clear
-error instead of a cryptic `JSONDecodeError` on non-JSON/blocked responses — was
-made in that library's own repo and is intentionally **not** in this monorepo; it's
-held as a local commit pending a personal fork of `atopile/easyeda2kicad.py`.)
-
-### M2 status
-**Genuinely complete now.** Session 5 wired + tested it but only single-turn; this
-session fixed the multi-turn freeze that blocked real use, and it's committed/pushed.
-
-### What this session did NOT do
-- No `easyeda2kicad.py` push (no fork under the user's account yet).
-- No runner or OpenAI-path changes; no M3 work; the three Session-2 doc edits remain.
+- **M4–M6 — implement the registered tool bodies (next):** `rag_search` (M4),
+  `pyspice_run` (M5), `ipc_check` (M6) are already registered, schema'd, and
+  model-callable as graceful stubs in `_ee/tools_ee.py` — fill in the logic there. The
+  `ee_ping` smoke tool can be removed once a real tool proves the path in production.
+- **Deferred deps**, re-add at their milestones with `uv lock --refresh` and a 3.14-wheel
+  check: voyageai / cohere / qdrant-client / llama-parse (M4 RAG), pyspice (M5 sim).
+- **Schematic follow-ups (optional):** agent `schematic_export` tool (deferred; pattern
+  verified in `tools.py` / `tool_definitions_project.py`); real symbols in wire mode;
+  nicer placement / power symbols. Upstream: fix the `kicad.dumps` schematic write path
+  (`07` §2.11) so the emitter could use the typed model.
+- **`12_DEV_TEST_HARNESS.md` §2** still owes a Tier-3 caveat: the browser
+  `ato serve frontend` file explorer is a no-op (calls `postToExtension`, which only
+  works inside a VS Code webview). The chat panel works in a browser; the file explorer
+  needs the extension. (The other two old Session-2 doc edits — schematic exclusion in
+  `00`, emitter candidate in `07` — are now moot/done since the emitter shipped.)
+- **easyeda2kicad** clear-error fix: push once a personal fork of
+  `atopile/easyeda2kicad.py` exists.
 
 ---
 
-## Session 7 (2026-06-05) — KiCad schematic emitter: investigated, spiked, PAUSED
+## Progress log (index)
 
-Goal: scope *"a tool that outputs a KiCad `.sch` from the `.ato` code."* Investigated
-feasibility, hit a blocker in the planned approach, proved an alternative with a
-`kicad-cli`-validated spike, then **paused before building the feature** (per user).
-**No feature code written; documentation only.** Full detail (with the reproducible
-spike script) lives in `13_KICAD_SCH_AND_FRONTEND_FILES.md` §1.5 — read that to resume.
-
-### What was found
-- **Already-wired output slot:** `domains/manufacturing.py:196-198` surfaces
-  `build_dir/<target>.kicad_sch` as `outputs.kicad_sch` (file-watcher watches it).
-  So an emitter just needs to *write that path* — no route/frontend plumbing.
-- **⚠️ BLOCKER (proven with `kicad-cli 10.0.3`):** the typed `kicad.schematic` model +
-  `kicad.dumps` **cannot emit a KiCad-loadable file.** Re-dumping a known-good fixture
-  → `kicad-cli` "Failed to load schematic." The model drops the root
-  `(symbol_instances)`/`(sheet_instances)` tables and mis-emits `(symbol …)` blocks
-  (52→30 on round-trip). This invalidated the plan's "reuse the typed model" core.
-  Logged as an upstream-bug gap in `07_ATOPILE_GAPS.md` §2.11.
-- **✅ Validated alternative (Option 1 — standalone text emitter):** a spike that
-  writes the `.kicad_sch` sexp **as text** passed **both** `kicad-cli sch export svg`
-  (KiCad loads + renders) **and** `kicad-cli sch erc` (0 errors, 0 unconnected-pin
-  violations → net labels land on pins). Key validated facts: lib-symbol name must equal
-  the instance `lib_id`; symbol Y flips on instantiation so label pos =
-  `(inst.x + pin.x, inst.y − pin.y)`; connectivity via same-named `global_label`s;
-  target version `20211123`. The only ERC output was a benign cosmetic warning about the
-  `atopile` symbol-library nickname not being registered (symbol is embedded; renders).
-
-### Decisions locked (for resume)
-- Output = **label-based connectivity schematic** (generic-box symbols + per-pin net
-  labels, no drawn wires). Readable/auto-routed schematics are out of scope.
-- Surface = exporter (`src/faebryk/exporters/schematic/kicad/`) + build step
-  (`@muster.register("schematic", dependencies=[prepare_nets], …)`) + agent tool
-  (`schematic_export`). Use the **text emitter**, not `kicad.dumps`.
-
-### Pick-up checklist (next session) — see `13` §1.5 for specifics
-1. Graph→IR extraction (components/refdes/pins/nets) — emit-independent, unit-testable.
-2. Generalize the spike writer (N-pin boxes, dedup lib_symbols, summary).
-3. Build step writing `build_dir/<target>.kicad_sch`.
-4. Agent tool `schematic_export` (+ schema) mirroring `_tool_build_run`.
-5. Tests: synthetic-IR→emit→`kicad-cli erc` clean; integration `ato build` on an example.
-- Optional upstream: fix the Zig sexp schematic serializer (`07` §2.11) so
-  `kicad.dumps` works — then the emitter could use the typed model instead.
-
-### What this session did NOT do
-- No feature code; the spike lives in `/tmp` (non-repo) but is reproduced verbatim in
-  `13` §1.5. Only docs changed: `13` §1.5 (full writeup), `07` §2.11 (upstream bug),
-  `00` §5 (exclusion note), this passdown.
-- No git commit/push (working-tree docs only).
-
----
-
-## Session 8 (2026-06-06) — KiCad schematic emitter: BUILT, tested, loads in KiCad
-
-Goal: finish the Session-7 emitter. Scope (user-confirmed): **exporter core + `ato build`
-step** (the agent `schematic_export` tool was deferred); **real picked-part symbols where
-available**, generic-box fallback otherwise.
-
-### What was built
-- **Exporter core** `src/faebryk/exporters/schematic/` (mirrors `exporters/pcb/`):
-  - `kicad/schematic.py` — graph→IR extraction + assembly + `export_schematic(app, *,
-    target_name, out_path, parts_search_dirs)`. Writes the `.kicad_sch` as **sexp text**
-    (not `kicad.dumps`, which is broken — `07` §2.11).
-  - `kicad/generic_symbol.py` — synthesised N-pin rectangular box symbol.
-  - `kicad/real_symbol.py` — regenerates a real cached `.kicad_sym` into the schematic's
-    native `20211123` embedded `(symbol …)` form **from the parsed typed model**
-    (pins + rectangles/polylines/circles/arcs). This was the key fix: embedding the
-    newer (`20241229`) `.kicad_sym` text verbatim made KiCad reject the file; regenerating
-    it in the schematic's own grammar loads cleanly.
-- **Build step** `generate_schematic` in `src/atopile/build_steps.py`
-  (`@muster.register("schematic", dependencies=[prepare_nets], produces_artifact=True)`),
-  added to `generate_default`'s deps so a normal `ato build` emits it. Writes
-  `config.build.paths.output_base.with_suffix(".kicad_sch")` — the exact path
-  `domains/manufacturing.py:196-198` reads as `outputs.kicad_sch`, so it auto-integrates
-  (no route/frontend changes). Search dirs: `config.project.paths.parts` + `<proj>/.ato`.
-- **Tests** `test/exporters/test_schematic_export.py` — 7 tests (generic-symbol unit,
-  render summary + atopile reparse, synthetic-graph `extract_components`, real-symbol
-  regeneration, and 3 `kicad-cli`-gated load/ERC checks). All pass; ruff clean.
-
-### IR extraction (verified APIs)
-Components = `has_designator` implementors (`Traits.bind(des).get_obj_raw()`); value via
-`has_simple_value_representation`; pads via `has_associated_footprint.get_footprint().get_pads()`
-(`pad.pad_number`). Net per pad via a reverse map from every `F.Net.bind_typegraph(tg)
-.get_instances(g)` → `get_connected_pads()` (`is_pad` hashes by node uuid, so net-pad and
-footprint-pad compare equal). Real symbol located by `is_atomic_part.symbol` filename or
-by `Pickable.has_part_picked` manufacturer/partno → `<Mfr>_<Partno>/*.kicad_sym`.
-
-### Verification (all green)
-- `pytest test/exporters/test_schematic_export.py` → **7 passed**.
-- **`ato build` on `examples/i2c`** → "Exporting schematic" stage runs; produces
-  `build/builds/default/default.kicad_sch` with 2 real symbols embedded
-  (cap + MCP9808) + 1 generic box, 5 instances, 16 net labels.
-- **`kicad-cli 10.0.3`**: `sch export svg` → "Plotted… Done." (loads + renders);
-  `sch erc` → **0 Errors, 0 unconnected**. 14 warnings are all benign (5 `atopile`
-  sym-lib-nickname cosmetic + 9 `pin_to_pin` electrical-type-mismatch).
-
-### Key facts honored (from the spike)
-lib-symbol name == instance `lib_id` (`atopile:<name>`); child unit names keep the bare
-`<name>` prefix; Y-flip transform `(ix+px, iy−py)` for label placement; connectivity via
-same-named `global_label`s, no wires; header `version 20211123`, `paper A4`.
-
-### What this session did NOT do
-- No agent `schematic_export` tool (deferred — pattern verified in `tools.py`/
-  `tool_definitions_project.py` for when prioritized).
-- No drawn wires / auto-placement / hierarchical sheets / power symbols.
-- Did not fix the upstream `kicad.dumps` schematic bug (`07` §2.11) — sidestepped.
-
----
-
-## Session 9 (2026-06-06) — schematic emitter: draw real net wires (ladder routing)
-
-Goal: extend the Session-8 emitter to **draw lines for nets** instead of the per-pin
-label soup. User chose **ladder/trunk routing** with **generic bottom-pin boxes**.
-
-### What was built
-- **Wire mode**, now the build default (`export_schematic(..., draw_wires=True)` →
-  new `render_wired`). The Session-8 label renderer (`render`, real symbols) is kept and
-  selectable via `draw_wires=False`.
-- **`build_wire_box(lib_id, pins)`** in `kicad/generic_symbol.py` — a box with all pins
-  on the **bottom edge**, evenly spaced (`WIRE_PIN_PITCH=5.08`), pointing down.
-- **`render_wired`** in `kicad/schematic.py`: lays components in one row, assigns every
-  pin a **globally unique x-lane**, and routes each net as a horizontal **trunk** in the
-  empty channel below + vertical **drops** from each pin + **junctions** at interior
-  taps + one net **label** at the trunk's left end. New `_wire_block`/`_junction_block`/
-  `_trunk_label_block` emitters; `SchematicSummary` gains `wires`/`junctions`/`trunks`.
-- Boxes dedupe by pin-number tuple (distinct `lib_id` per distinct pin set), as in
-  label mode.
-
-### Why it's short-free (the crux)
-Lanes are globally unique and the routing channel holds no pins, so a vertical drop at
-`lane_x` can only ever **cross** another net's trunk (a plain crossing = no connection),
-never land on another net's junction or pin. Only intended drop↔trunk↔drop connections
-exist. **Verified**, not just argued: tests export `kicad-cli sch export netlist` and
-assert each net's pin membership equals the IR exactly.
-
-### Verification
-- `pytest test/exporters/test_schematic_export.py` → **11 passed** (4 new wire-mode
-  tests incl. two netlist-membership no-shorts checks; existing label-mode tests stay
-  green). ruff clean.
-- **`ato build examples/i2c`** (wire mode) → 21 wires, 6 junctions, 5 net labels;
-  `kicad-cli` loads + renders, ERC **0 errors** (only 5 benign `atopile`-nickname
-  warnings); netlist reproduces exact nets (hv=6, lv=4, SDA/SCL/Alert=2).
-
-### What this session did NOT do
-- Real symbols in wire mode (wire mode uses generic boxes; real symbols stay label-mode).
-- No human-readable auto-placement, orthogonal point-to-point routing, hierarchical
-  sheets, or power symbols. Agent `schematic_export` tool still deferred.
-
----
-
-## Progress log (cumulative)
-
-- [done] Sessions 1–2 — full doc set written (`00`–`14` + RAG + ingestion + passdown). No source modified.
-- [done] Session 3 — local VSIX built and installed; dev-loop reference table established; AnthropicProvider edit surface verified against current source. No source modified.
-- [done] Session 4 — M1 fork bootstrap (fork `EricWLivingston/atopile`, branch `feature/ee-agent`); pinmux_check removed (4→3 tools, 7 milestones); M2 additive half landed (`_ee/` provider, `anthropic==0.105.2` locked). Provider inert pending config + route wiring.
-- [done] Session 5 — **M2 finished.** Wired `config.py` provider flag +
-  `routes/agent/utils.py` `_make_provider`; added full test suite at
-  `test/server/agent/` (14 unit + 1 parity + 3 integration). Offline 15 pass /
-  3 skip; live Anthropic 18 pass / 0 skip. No git commits (working tree only).
-- [done] Session 6 — **M2 hardened & committed.** Fixed the multi-turn freeze
-  (stateless Anthropic vs the runner's `previous_response_id` delta design): made
-  `AnthropicProvider` keep its own transcript and rebuild full history each call.
-  Added `test_anthropic_provider_state.py` (4 offline) + a multi-turn live test.
-  Offline 19 pass / 4 skip; live E2E user-confirmed. First commits of the working
-  tree pushed to `origin feature/ee-agent` (picker workaround + agent M2).
-- [done] Session 7 — **KiCad schematic emitter investigated + spiked, then PAUSED.**
-  Found the typed `kicad.dumps` write path is broken (can't emit a KiCad-loadable
-  `.kicad_sch`; `07` §2.11); validated a standalone **text emitter** against
-  `kicad-cli` (loads + ERC-clean). Decisions locked + pick-up checklist in `13` §1.5.
-  Docs only (`13`, `07`, `00`, passdown); no feature code, no commit.
-- [done] Session 8 — **KiCad schematic emitter BUILT & verified.** Text emitter +
-  `generate_schematic` build step in `src/faebryk/exporters/schematic/` +
-  `build_steps.py`; real picked-part symbols regenerated into the schematic's native
-  form, generic-box fallback. `ato build examples/i2c` → KiCad-loadable, ERC-clean
-  (0 errors). 7 exporter tests pass. Agent tool deferred. (`13` §1.5 / `07` §2.11
-  marked resolved.)
-- [done] Session 9 — **Drawn net wires (ladder routing).** Wire mode is the build
-  default: generic bottom-pin boxes, each pin in a unique x-lane, nets routed as
-  trunk+drops+junctions in an empty channel (provably short-free). `build_wire_box` +
-  `render_wired`; label mode retained via `draw_wires=False`. i2c: loads, ERC 0 errors,
-  netlist reproduces exact nets. 11 exporter tests pass (incl. netlist no-shorts).
-- [next] **M3 — tool-registration plumbing** (`_ee` stub tool through the runner),
-  then M4–M6 tools. Also still pending: three Session-2 doc edits; optional
-  schematic follow-ups (agent `schematic_export` tool; nicer placement/power symbols).
+- Sessions 1–2 — full doc set written. No source modified.
+- Session 3 — local VSIX built/installed; dev-loop table established; AnthropicProvider
+  edit surface mapped against source.
+- Session 4 — M1 fork; pinmux dropped (4→3 tools); `AnthropicProvider` landed additively;
+  uv stale-cache trap resolved (`anthropic==0.105.2` locked).
+- Session 5 — M2 wired + full test suite; live Anthropic green (working tree only).
+- Session 6 — M2 hardened: fixed the multi-turn freeze (stateful transcript); first
+  commits pushed to the fork (+ easyeda 403 picker workaround).
+- Session 7 — schematic emitter investigated; `kicad.dumps` blocker found; text-emitter
+  spike validated; paused (docs only).
+- Session 8 — schematic emitter BUILT (label mode, real-symbol regeneration); i2c loads,
+  ERC-clean; 7 tests; pushed.
+- Session 9 — schematic emitter draws net wires (ladder routing, wire mode default);
+  provably + verifiably short-free; 11 tests; pushed.
+- Session 10 — M3 tool-registration plumbing: `ee_ping` smoke + `rag_search`/
+  `pyspice_run`/`ipc_check` registered as schema'd, model-callable graceful stubs in
+  `_ee/`; 7 tests; pushed.
+- **Next** — M4: implement `rag_search` body.

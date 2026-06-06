@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from atopile.server.agent._ee.tool_definitions_ee import get_ee_tool_definitions
 from atopile.server.agent.tool_definitions_project import (
     get_project_tool_definitions,
 )
@@ -13,6 +14,7 @@ def get_tool_definitions() -> list[dict[str, Any]]:
     """OpenAI Responses API function-tool definitions."""
     return [
         *get_project_tool_definitions(),
+        *get_ee_tool_definitions(),
         {
             "type": "function",
             "name": "parts_search",

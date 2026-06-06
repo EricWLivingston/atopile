@@ -191,6 +191,18 @@ The classification matrix:
 
 ---
 
+### 2.11 Schematic emit is broken — `kicad.dumps(SchematicFile)` produces non-loadable files
+
+**Status.** The Zig sexp engine has a full `.kicad_sch` *read* model, but the *write* path is broken. Verified with `kicad-cli 10.0.3` (2026-06-05): re-dumping a known-good fixture through `kicad.dumps` yields a file KiCad refuses to load ("Failed to load schematic"), even though the original loads. The typed `KicadSch` model drops the root `(symbol_instances)`/`(sheet_instances)` tables on load and mis-emits `(symbol …)` blocks (52→30 occurrences on round-trip). So no Python code can currently emit a loadable schematic via the typed model. Full investigation: `13_KICAD_SCH_AND_FRONTEND_FILES.md` §1.5.
+
+**Why PR.** A genuine upstream bug in the sexp schematic serializer — the model is validated only for round-trip *equality through atopile's own parser*, never for KiCad-loadability of the output. Fixing it makes `.kicad_sch` a first-class output for everyone and is the prerequisite for any typed-model schematic emitter.
+
+**Our work regardless.** ✅ **Shipped in Session 8 (2026-06-06).** The EE-agent schematic emitter sidesteps this `dumps` bug entirely: it writes the `.kicad_sch` as sexp *text* (`src/faebryk/exporters/schematic/`) and, for real picked-part symbols, regenerates the embedded `(symbol …)` block in the schematic's native `20211123` form from the *parsed* typed model (the read path works). Wired as the `generate_schematic` build step; verified loadable + ERC-clean in KiCad. So the "no Python schematic emitter exists" gap is now closed for our fork; the upstream `dumps` fix remains a separate nice-to-have (would let an emitter use `kicad.dumps` directly instead of text).
+
+**Estimated effort.** Upstream diagnosis + fix in the Zig sexp serializer: unknown until the `(symbol)` defect is isolated; treat as open-ended.
+
+---
+
 ## 3. Downstream-only gaps — never upstream
 
 These are domain-specific to our agent workflow and don't belong in atopile.

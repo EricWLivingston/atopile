@@ -365,6 +365,114 @@ session fixed the multi-turn freeze that blocked real use, and it's committed/pu
 
 ---
 
+## Session 7 (2026-06-05) — KiCad schematic emitter: investigated, spiked, PAUSED
+
+Goal: scope *"a tool that outputs a KiCad `.sch` from the `.ato` code."* Investigated
+feasibility, hit a blocker in the planned approach, proved an alternative with a
+`kicad-cli`-validated spike, then **paused before building the feature** (per user).
+**No feature code written; documentation only.** Full detail (with the reproducible
+spike script) lives in `13_KICAD_SCH_AND_FRONTEND_FILES.md` §1.5 — read that to resume.
+
+### What was found
+- **Already-wired output slot:** `domains/manufacturing.py:196-198` surfaces
+  `build_dir/<target>.kicad_sch` as `outputs.kicad_sch` (file-watcher watches it).
+  So an emitter just needs to *write that path* — no route/frontend plumbing.
+- **⚠️ BLOCKER (proven with `kicad-cli 10.0.3`):** the typed `kicad.schematic` model +
+  `kicad.dumps` **cannot emit a KiCad-loadable file.** Re-dumping a known-good fixture
+  → `kicad-cli` "Failed to load schematic." The model drops the root
+  `(symbol_instances)`/`(sheet_instances)` tables and mis-emits `(symbol …)` blocks
+  (52→30 on round-trip). This invalidated the plan's "reuse the typed model" core.
+  Logged as an upstream-bug gap in `07_ATOPILE_GAPS.md` §2.11.
+- **✅ Validated alternative (Option 1 — standalone text emitter):** a spike that
+  writes the `.kicad_sch` sexp **as text** passed **both** `kicad-cli sch export svg`
+  (KiCad loads + renders) **and** `kicad-cli sch erc` (0 errors, 0 unconnected-pin
+  violations → net labels land on pins). Key validated facts: lib-symbol name must equal
+  the instance `lib_id`; symbol Y flips on instantiation so label pos =
+  `(inst.x + pin.x, inst.y − pin.y)`; connectivity via same-named `global_label`s;
+  target version `20211123`. The only ERC output was a benign cosmetic warning about the
+  `atopile` symbol-library nickname not being registered (symbol is embedded; renders).
+
+### Decisions locked (for resume)
+- Output = **label-based connectivity schematic** (generic-box symbols + per-pin net
+  labels, no drawn wires). Readable/auto-routed schematics are out of scope.
+- Surface = exporter (`src/faebryk/exporters/schematic/kicad/`) + build step
+  (`@muster.register("schematic", dependencies=[prepare_nets], …)`) + agent tool
+  (`schematic_export`). Use the **text emitter**, not `kicad.dumps`.
+
+### Pick-up checklist (next session) — see `13` §1.5 for specifics
+1. Graph→IR extraction (components/refdes/pins/nets) — emit-independent, unit-testable.
+2. Generalize the spike writer (N-pin boxes, dedup lib_symbols, summary).
+3. Build step writing `build_dir/<target>.kicad_sch`.
+4. Agent tool `schematic_export` (+ schema) mirroring `_tool_build_run`.
+5. Tests: synthetic-IR→emit→`kicad-cli erc` clean; integration `ato build` on an example.
+- Optional upstream: fix the Zig sexp schematic serializer (`07` §2.11) so
+  `kicad.dumps` works — then the emitter could use the typed model instead.
+
+### What this session did NOT do
+- No feature code; the spike lives in `/tmp` (non-repo) but is reproduced verbatim in
+  `13` §1.5. Only docs changed: `13` §1.5 (full writeup), `07` §2.11 (upstream bug),
+  `00` §5 (exclusion note), this passdown.
+- No git commit/push (working-tree docs only).
+
+---
+
+## Session 8 (2026-06-06) — KiCad schematic emitter: BUILT, tested, loads in KiCad
+
+Goal: finish the Session-7 emitter. Scope (user-confirmed): **exporter core + `ato build`
+step** (the agent `schematic_export` tool was deferred); **real picked-part symbols where
+available**, generic-box fallback otherwise.
+
+### What was built
+- **Exporter core** `src/faebryk/exporters/schematic/` (mirrors `exporters/pcb/`):
+  - `kicad/schematic.py` — graph→IR extraction + assembly + `export_schematic(app, *,
+    target_name, out_path, parts_search_dirs)`. Writes the `.kicad_sch` as **sexp text**
+    (not `kicad.dumps`, which is broken — `07` §2.11).
+  - `kicad/generic_symbol.py` — synthesised N-pin rectangular box symbol.
+  - `kicad/real_symbol.py` — regenerates a real cached `.kicad_sym` into the schematic's
+    native `20211123` embedded `(symbol …)` form **from the parsed typed model**
+    (pins + rectangles/polylines/circles/arcs). This was the key fix: embedding the
+    newer (`20241229`) `.kicad_sym` text verbatim made KiCad reject the file; regenerating
+    it in the schematic's own grammar loads cleanly.
+- **Build step** `generate_schematic` in `src/atopile/build_steps.py`
+  (`@muster.register("schematic", dependencies=[prepare_nets], produces_artifact=True)`),
+  added to `generate_default`'s deps so a normal `ato build` emits it. Writes
+  `config.build.paths.output_base.with_suffix(".kicad_sch")` — the exact path
+  `domains/manufacturing.py:196-198` reads as `outputs.kicad_sch`, so it auto-integrates
+  (no route/frontend changes). Search dirs: `config.project.paths.parts` + `<proj>/.ato`.
+- **Tests** `test/exporters/test_schematic_export.py` — 7 tests (generic-symbol unit,
+  render summary + atopile reparse, synthetic-graph `extract_components`, real-symbol
+  regeneration, and 3 `kicad-cli`-gated load/ERC checks). All pass; ruff clean.
+
+### IR extraction (verified APIs)
+Components = `has_designator` implementors (`Traits.bind(des).get_obj_raw()`); value via
+`has_simple_value_representation`; pads via `has_associated_footprint.get_footprint().get_pads()`
+(`pad.pad_number`). Net per pad via a reverse map from every `F.Net.bind_typegraph(tg)
+.get_instances(g)` → `get_connected_pads()` (`is_pad` hashes by node uuid, so net-pad and
+footprint-pad compare equal). Real symbol located by `is_atomic_part.symbol` filename or
+by `Pickable.has_part_picked` manufacturer/partno → `<Mfr>_<Partno>/*.kicad_sym`.
+
+### Verification (all green)
+- `pytest test/exporters/test_schematic_export.py` → **7 passed**.
+- **`ato build` on `examples/i2c`** → "Exporting schematic" stage runs; produces
+  `build/builds/default/default.kicad_sch` with 2 real symbols embedded
+  (cap + MCP9808) + 1 generic box, 5 instances, 16 net labels.
+- **`kicad-cli 10.0.3`**: `sch export svg` → "Plotted… Done." (loads + renders);
+  `sch erc` → **0 Errors, 0 unconnected**. 14 warnings are all benign (5 `atopile`
+  sym-lib-nickname cosmetic + 9 `pin_to_pin` electrical-type-mismatch).
+
+### Key facts honored (from the spike)
+lib-symbol name == instance `lib_id` (`atopile:<name>`); child unit names keep the bare
+`<name>` prefix; Y-flip transform `(ix+px, iy−py)` for label placement; connectivity via
+same-named `global_label`s, no wires; header `version 20211123`, `paper A4`.
+
+### What this session did NOT do
+- No agent `schematic_export` tool (deferred — pattern verified in `tools.py`/
+  `tool_definitions_project.py` for when prioritized).
+- No drawn wires / auto-placement / hierarchical sheets / power symbols.
+- Did not fix the upstream `kicad.dumps` schematic bug (`07` §2.11) — sidestepped.
+
+---
+
 ## Progress log (cumulative)
 
 - [done] Sessions 1–2 — full doc set written (`00`–`14` + RAG + ingestion + passdown). No source modified.
@@ -380,5 +488,17 @@ session fixed the multi-turn freeze that blocked real use, and it's committed/pu
   Added `test_anthropic_provider_state.py` (4 offline) + a multi-turn live test.
   Offline 19 pass / 4 skip; live E2E user-confirmed. First commits of the working
   tree pushed to `origin feature/ee-agent` (picker workaround + agent M2).
+- [done] Session 7 — **KiCad schematic emitter investigated + spiked, then PAUSED.**
+  Found the typed `kicad.dumps` write path is broken (can't emit a KiCad-loadable
+  `.kicad_sch`; `07` §2.11); validated a standalone **text emitter** against
+  `kicad-cli` (loads + ERC-clean). Decisions locked + pick-up checklist in `13` §1.5.
+  Docs only (`13`, `07`, `00`, passdown); no feature code, no commit.
+- [done] Session 8 — **KiCad schematic emitter BUILT & verified.** Text emitter +
+  `generate_schematic` build step in `src/faebryk/exporters/schematic/` +
+  `build_steps.py`; real picked-part symbols regenerated into the schematic's native
+  form, generic-box fallback. `ato build examples/i2c` → KiCad-loadable, ERC-clean
+  (0 errors). 7 exporter tests pass. Agent tool deferred. (`13` §1.5 / `07` §2.11
+  marked resolved.)
 - [next] **M3 — tool-registration plumbing** (`_ee` stub tool through the runner),
-  then M4–M6 tools. Also still pending: three Session-2 doc edits.
+  then M4–M6 tools. Also still pending: three Session-2 doc edits; optional
+  schematic follow-ups (agent `schematic_export` tool; nicer placement/power symbols).

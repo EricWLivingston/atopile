@@ -863,6 +863,29 @@ def build_design(ctx: BuildStepContext) -> None:
 
 
 @muster.register(
+    "schematic",
+    description="Exporting schematic",
+    dependencies=[prepare_nets],
+    produces_artifact=True,
+)
+def generate_schematic(ctx: BuildStepContext) -> None:
+    """Emit a KiCad connectivity schematic (`<target>.kicad_sch`)."""
+    from faebryk.exporters.schematic import export_schematic
+
+    app = ctx.require_app()
+    out_path = config.build.paths.output_base.with_suffix(".kicad_sch")
+    # Project parts plus dependency parts (under .ato/modules) for symbol embedding.
+    search_dirs = [config.project.paths.parts, config.project_dir / ".ato"]
+    summary = export_schematic(
+        app,
+        target_name=config.build.name,
+        out_path=out_path,
+        parts_search_dirs=search_dirs,
+    )
+    logger.info(f"Exported schematic to {out_path} ({summary})")
+
+
+@muster.register(
     "bom",
     dependencies=[build_design],
     produces_artifact=True,
@@ -1180,6 +1203,7 @@ def generate_datasheets(ctx: BuildStepContext) -> None:
         generate_variable_report,
         # generate_power_tree,
         generate_datasheets,
+        generate_schematic,
     ],
     virtual=True,
 )

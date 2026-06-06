@@ -138,6 +138,7 @@ These were in earlier versions of this plan and are now out of scope:
 - **No LangGraph state machines.** Atopile's skill-driven checklist replaces these.
 - **No BOM tool.** Atopile's `report_bom` returns structured `BOMData` directly. The agent can read and reason about it without a separate BOM agent. Multi-distributor enrichment (Octopart) is a future addition if needed.
 - **No thermal tool.** Out of scope for v1. Thermal reasoning can happen via `rag_search(corpus="datasheets")` reading R_θJA values and the agent computing junction temps in its head or via `python_repl`-style tools if we later add one.
+- **Schematic generation — ✅ now shipped (Session 8, 2026-06-06).** A label-based "connectivity schematic" exporter (`src/faebryk/exporters/schematic/`) + `generate_schematic` build step now emit `build_dir/<target>.kicad_sch` on `ato build`, verified loadable + ERC-clean in KiCad. It writes sexp *text* (the typed `kicad.dumps` write path is broken — see `13_KICAD_SCH_AND_FRONTEND_FILES.md` §1.5 / `07_ATOPILE_GAPS.md` §2.11). Wrapping it as an agent `schematic_export` tool is a deferred follow-up.
 
 These can be added later. The architecture supports it — each is just another tool registered into `ToolRegistry`.
 

@@ -20,7 +20,8 @@ typed model is still used to *read* cached symbol files for pin geometry (label 
 
 import logging
 import uuid as _uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from natsort import natsorted
@@ -31,6 +32,8 @@ from faebryk.exporters.schematic.kicad.generic_symbol import (
     WIRE_PIN_PITCH,
     SymbolDef,
     build_generic_symbol,
+    build_power_symbol,
+    build_pwr_flag_symbol,
     build_wire_box,
     escape,
 )
@@ -61,6 +64,13 @@ COMPONENT_GAP_LANES = 1  # blank lanes between adjacent components
 ROW_Y = 25.4
 CHANNEL_GAP = 12.7  # gap between the pin row and the first trunk
 TRUNK_PITCH = 5.08  # vertical spacing between net trunks
+
+# Hierarchical mode: child-sheet reference boxes are stacked in a left column.
+SHEET_X = 12.7
+SHEET_Y0 = 25.4
+SHEET_DY = 20.32
+SHEET_W = 33.02
+SHEET_H = 12.7
 
 
 def _u() -> str:
@@ -95,6 +105,7 @@ class SchematicSummary:
     wires: int = 0
     junctions: int = 0
     trunks: int = 0
+    power_symbols: int = 0
     path: str | None = None
 
     def __str__(self) -> str:
@@ -103,6 +114,8 @@ class SchematicSummary:
             f"{self.fallback_symbols} generic-box fallbacks, "
             f"{self.unmapped_pads} unmapped pads"
         )
+        if self.power_symbols:
+            base += f", {self.power_symbols} power symbols"
         if self.wires or self.trunks:
             base += (
                 f", {self.wires} wires, {self.junctions} junctions, "
@@ -159,6 +172,139 @@ def extract_components(app: fabll.Node) -> tuple[list[ComponentIR], set[str]]:
 
     components = natsorted(components, key=lambda c: c.ref)
     return components, net_names
+
+
+# --------------------------------------------------------------------------------------
+# Net classification (power / ground / signal)
+# --------------------------------------------------------------------------------------
+class NetRole(str, Enum):
+    SIGNAL = "signal"
+    POWER = "power"  # the hv side of an ElectricPower rail
+    GROUND = "ground"  # the lv side of an ElectricPower rail
+
+
+# Direct child names of ``ElectricPower`` and the role each implies.
+_POWER_EDGES = {"hv": NetRole.POWER, "vcc": NetRole.POWER}
+_GROUND_EDGES = {"lv": NetRole.GROUND, "gnd": NetRole.GROUND}
+
+
+def classify_nets(app: fabll.Node) -> dict[str, NetRole]:
+    """Map each named net to POWER (rail hv), GROUND (rail lv), or SIGNAL.
+
+    A net is a rail if any electrical on it is a direct ``hv``/``lv`` (or the deprecated
+    ``vcc``/``gnd`` aliases) child of an ``ElectricPower``. Ground wins ties. Lets the
+    emitter drop power symbols instead of bare labels on rails.
+    """
+    tg, g = app.tg, app.g
+    roles: dict[str, NetRole] = {}
+    for net in F.Net.bind_typegraph(tg).get_instances(g):
+        name = net.get_name()
+        if not name:
+            continue
+        role = NetRole.SIGNAL
+        for iface in net.get_connected_interfaces():
+            parent = iface.get_parent()
+            if parent is None:
+                continue
+            pnode, ename = parent
+            try:
+                if not pnode.isinstance(F.ElectricPower):
+                    continue
+            except Exception:  # noqa: BLE001 - type probe is best-effort cosmetic
+                continue
+            if ename in _GROUND_EDGES:
+                role = NetRole.GROUND
+                break  # ground is decisive
+            if ename in _POWER_EDGES:
+                role = NetRole.POWER
+        roles[name] = role
+    return roles
+
+
+# --------------------------------------------------------------------------------------
+# Hierarchy -> sheet tree
+# --------------------------------------------------------------------------------------
+@dataclass
+class SheetIR:
+    """One schematic sheet, mirroring an ``.ato`` module in the design hierarchy.
+
+    The root sheet (``parent is None``) maps to the app module; each child maps to an
+    ``is_ato_module`` instance that (transitively) contains designated components.
+    ``uuid`` / ``file_stem`` are assigned by the emitter at render time.
+    """
+
+    name: str
+    node_id: str  # stable id of the backing module node ("" only for a synthetic root)
+    components: list[ComponentIR] = field(default_factory=list)
+    children: list["SheetIR"] = field(default_factory=list)
+    uuid: str = ""  # sheet-instance uuid; "" => this is the root sheet
+    file_stem: str = ""  # child .kicad_sch filename stem; "" => root file
+
+    def walk(self) -> "list[SheetIR]":
+        """Pre-order: self then descendants (root first)."""
+        out = [self]
+        for child in self.children:
+            out.extend(child.walk())
+        return out
+
+
+def _ato_module_ids(app: fabll.Node) -> set[str]:
+    """Stable ids of every ``is_ato_module`` instance (empty if unavailable).
+
+    ``is_ato_module`` lives in the atopile compiler layer; importing it lazily keeps the
+    exporter importable without atopile and degrades to a single flat sheet if the trait
+    is missing (e.g. a graph built directly via fabll rather than from ``.ato``).
+    """
+    try:
+        from atopile.compiler.ast_visitor import is_ato_module
+    except Exception:  # noqa: BLE001 - no atopile layer -> flat sheet
+        return set()
+
+    tg, g = app.tg, app.g
+    return {
+        fabll.Traits.bind(t).get_obj_raw().get_root_id()
+        for t in fabll.Traits.get_implementors(is_ato_module.bind_typegraph(tg), g=g)
+    }
+
+
+def build_sheet_tree(components: list[ComponentIR], app: fabll.Node) -> SheetIR:
+    """Group ``components`` into a sheet tree following the ``.ato`` module hierarchy.
+
+    Each component lands on the sheet of its **nearest enclosing ``is_ato_module``**;
+    nested modules become nested sheets. Components with no module ancestry (or when the
+    ``is_ato_module`` trait is unavailable) fall onto the root sheet, so the result is
+    always a valid single-root tree.
+    """
+    ato_ids = _ato_module_ids(app)
+    root = SheetIR(name=app.get_name(), node_id=app.get_root_id())
+    if not ato_ids:
+        root.components = list(components)
+        return root
+
+    for comp in components:
+        chain: list[fabll.Node] = []
+        if comp.module is not None:
+            chain = [
+                node
+                for node, _name in comp.module.get_hierarchy()
+                if node.get_root_id() in ato_ids
+            ]
+        sheet = root
+        for node in chain:
+            nid = node.get_root_id()
+            if nid == root.node_id:
+                continue  # app root is the root sheet itself
+            existing = next((c for c in sheet.children if c.node_id == nid), None)
+            if existing is None:
+                existing = SheetIR(name=node.get_name(), node_id=nid)
+                sheet.children.append(existing)
+            sheet = existing
+        sheet.components.append(comp)
+
+    # Deterministic order for stable output.
+    for sheet in root.walk():
+        sheet.children = natsorted(sheet.children, key=lambda s: (s.name, s.node_id))
+    return root
 
 
 # --------------------------------------------------------------------------------------
@@ -233,9 +379,21 @@ class _SymbolRegistry:
         self.fallback_count += 1
         return generic
 
+    def add(self, sym: SymbolDef) -> SymbolDef:
+        """Register an externally-built symbol (e.g. a power symbol) for lib text."""
+        return self._by_lib_id.setdefault(sym.lib_id, sym)
+
     def lib_symbols_text(self) -> str:
         return "\n".join(
             self._by_lib_id[k].lib_symbol_text for k in sorted(self._by_lib_id)
+        )
+
+    def lib_symbols_text_for(self, lib_ids: set[str]) -> str:
+        """``lib_symbols`` text for just the symbols used on one sheet (sorted)."""
+        return "\n".join(
+            self._by_lib_id[k].lib_symbol_text
+            for k in sorted(lib_ids)
+            if k in self._by_lib_id
         )
 
 
@@ -259,6 +417,27 @@ def _instance_block(comp: ComponentIR, sym: SymbolDef, ix: float, iy: float) -> 
         f'    (property "Datasheet" "" (id 3) (at {ix} {iy} 0)'
         f" (effects (font (size 1.27 1.27)) hide))\n"
         f"{pin_lines}\n"
+        f"  )"
+    )
+
+
+def _power_instance_block(
+    lib_id: str, value: str, ref: str, x: float, y: float, inst_uuid: str
+) -> str:
+    """A single-pin power-symbol (or PWR_FLAG) instance at ``(x, y)``, hidden ref."""
+    return (
+        f'  (symbol (lib_id "{lib_id}") (at {x} {y} 0) (unit 1)\n'
+        f"    (in_bom yes) (on_board yes) (fields_autoplaced)\n"
+        f"    (uuid {inst_uuid})\n"
+        f'    (property "Reference" "{escape(ref)}" (id 0) (at {x} {y - 5.08} 0)'
+        f" (effects (font (size 1.27 1.27)) hide))\n"
+        f'    (property "Value" "{escape(value)}" (id 1) (at {x} {y - 3.81} 0)'
+        f" (effects (font (size 1.27 1.27))))\n"
+        f'    (property "Footprint" "" (id 2) (at {x} {y} 0)'
+        f" (effects (font (size 1.27 1.27)) hide))\n"
+        f'    (property "Datasheet" "" (id 3) (at {x} {y} 0)'
+        f" (effects (font (size 1.27 1.27)) hide))\n"
+        f'    (pin "1" (uuid {_u()}))\n'
         f"  )"
     )
 
@@ -468,29 +647,303 @@ def render_wired(
     return doc, summary
 
 
+def _sheet_ref_block(sheet: SheetIR, x: float, y: float) -> str:
+    """A ``(sheet …)`` reference block placed in a parent sheet's file."""
+    fname = f"{sheet.file_stem}.kicad_sch"
+    return (
+        f"  (sheet (at {x} {y}) (size {SHEET_W} {SHEET_H}) (fields_autoplaced)\n"
+        f"    (stroke (width 0.1524) (type solid)) (fill (color 0 0 0 0.0000))\n"
+        f"    (uuid {sheet.uuid})\n"
+        f'    (property "Sheetname" "{escape(sheet.name)}" (id 0) (at {x} {y - 0.7} 0)'
+        f" (effects (font (size 1.27 1.27)) (justify left bottom)))\n"
+        f'    (property "Sheetfile" "{escape(fname)}" (id 1)'
+        f" (at {x} {y + SHEET_H + 0.7} 0)"
+        f" (effects (font (size 1.27 1.27)) (justify left top)))\n"
+        f"  )"
+    )
+
+
+def render_hierarchical(
+    components: list[ComponentIR],
+    net_names: set[str],
+    app: fabll.Node,
+    *,
+    root_stem: str,
+    search_dirs: list[Path],
+    net_roles: dict[str, NetRole] | None = None,
+) -> tuple[dict[str, str], SchematicSummary]:
+    """Render a hierarchical, real-symbol schematic: one sheet per ``.ato`` module.
+
+    Returns ``{filename: sexp_text}`` — the root file is ``f"{root_stem}.kicad_sch"``;
+    each module becomes a child ``.kicad_sch`` beside it. Real cached symbols are used
+    where available (generic box otherwise) and every pin carries a ``global_label`` so
+    connectivity rides on label names: the netlist is complete with no wires, and a
+    human can rearrange/wire freely without breaking it. All instances are centralised
+    in the root's ``(symbol_instances)`` with their full ``/<sheet…>/<symbol>`` paths.
+    """
+    if net_roles is None:
+        net_roles = classify_nets(app)
+    root = build_sheet_tree(components, app)
+    return render_sheet_tree(
+        root,
+        net_names,
+        root_stem=root_stem,
+        search_dirs=search_dirs,
+        net_roles=net_roles,
+    )
+
+
+_PWR_FLAG_LIB_ID = f"{LIB_PREFIX}:PWR_FLAG"
+
+
+def render_sheet_tree(
+    root: SheetIR,
+    net_names: set[str],
+    *,
+    root_stem: str,
+    search_dirs: list[Path],
+    net_roles: dict[str, NetRole] | None = None,
+) -> tuple[dict[str, str], SchematicSummary]:
+    """Emit ``{filename: sexp_text}`` for a prebuilt :class:`SheetIR` tree.
+
+    Separated from :func:`render_hierarchical` so emission (sheet files, instance paths,
+    cross-sheet label connectivity) can be exercised without a built ``.ato`` app. When
+    ``net_roles`` marks a pin's net ``POWER``/``GROUND``, that pin gets a power-symbol
+    glyph (and the net one shared ``PWR_FLAG`` driver) instead of a ``global_label``;
+    otherwise every pin is labelled. Default ``None`` -> all labels.
+    """
+    roles = net_roles or {}
+    registry = _SymbolRegistry(search_dirs)
+    flag_def = build_pwr_flag_symbol(_PWR_FLAG_LIB_ID)
+    power_sym_cache: dict[str, SymbolDef] = {}
+    flagged_nets: set[str] = set()
+    pwr_n = [0]
+    flg_n = [0]
+    n_components = sum(len(s.components) for s in root.walk())
+    summary = SchematicSummary(components=n_components, nets=len(net_names))
+
+    # Pass 1: assign each non-root sheet a uuid + filename and its root->sheet path. The
+    # filename is **deterministic** — derived from the module's sanitized name path, not
+    # the (per-build random) uuid — so rebuilds reuse the same files. ``seen_stems``
+    # keeps filenames unique if two name paths sanitize to the same string.
+    path_by_sheet: dict[int, list[str]] = {}
+    sheet_instances: list[str] = ['    (path "/" (page "1"))']
+    page = [1]
+    seen_stems: set[str] = set()
+
+    def _unique_stem(base: str) -> str:
+        stem, n = base, 2
+        while stem in seen_stems:
+            stem = f"{base}-{n}"
+            n += 1
+        seen_stems.add(stem)
+        return stem
+
+    def _assign(
+        sheet: SheetIR, prefix: list[str], names: list[str], is_root: bool
+    ) -> None:
+        if is_root:
+            sheet.file_stem = root_stem
+            path_by_sheet[id(sheet)] = []
+            name_path = names
+        else:
+            sheet.uuid = _u()  # internal: (sheet) block + (symbol_instances) path
+            name_path = names + [sanitize_filepath_part(sheet.name) or "sheet"]
+            sheet.file_stem = _unique_stem(f"{root_stem}-{'-'.join(name_path)}")
+            path = prefix + [sheet.uuid]
+            path_by_sheet[id(sheet)] = path
+            page[0] += 1
+            sheet_instances.append(
+                f'    (path "/{"/".join(path)}" (page "{page[0]}"))'
+            )
+        for ch in sheet.children:
+            _assign(ch, path_by_sheet[id(sheet)], name_path, False)
+
+    _assign(root, [], [], True)
+
+    # Pass 2: emit each sheet file; collect all symbol instances for the root file.
+    symbol_instances: list[str] = []
+    files: dict[str, str] = {}
+
+    def _emit(sheet: SheetIR, is_root: bool) -> None:
+        path = path_by_sheet[id(sheet)]
+        instances: list[str] = []
+        labels: list[str] = []
+        used: set[str] = set()
+
+        def _place_power(net: str, ground: bool, lx: float, ly: float) -> None:
+            """Drop a power glyph on a rail pin (+ one shared PWR_FLAG per net)."""
+            lib_id = (
+                f"{LIB_PREFIX}:{'GND' if ground else 'PWR'}_"
+                f"{sanitize_filepath_part(net) or 'net'}"
+            )
+            psym = power_sym_cache.get(lib_id)
+            if psym is None:
+                psym = build_power_symbol(lib_id, net, ground=ground)
+                power_sym_cache[lib_id] = psym
+            registry.add(psym)
+            used.add(lib_id)
+            pwr_n[0] += 1
+            inst = _u()
+            instances.append(
+                _power_instance_block(lib_id, net, f"#PWR{pwr_n[0]:04d}", lx, ly, inst)
+            )
+            symbol_instances.append(
+                f'    (path "/{"/".join(path + [inst])}"'
+                f' (reference "#PWR{pwr_n[0]:04d}") (unit 1)'
+                f' (value "{escape(net)}") (footprint ""))'
+            )
+            summary.power_symbols += 1
+            if net in flagged_nets:
+                return
+            # First sighting of this rail net -> add one PWR_FLAG driver here.
+            flagged_nets.add(net)
+            registry.add(flag_def)
+            used.add(flag_def.lib_id)
+            flg_n[0] += 1
+            finst = _u()
+            instances.append(
+                _power_instance_block(
+                    flag_def.lib_id, "PWR_FLAG", f"#FLG{flg_n[0]:04d}", lx, ly, finst
+                )
+            )
+            symbol_instances.append(
+                f'    (path "/{"/".join(path + [finst])}"'
+                f' (reference "#FLG{flg_n[0]:04d}") (unit 1)'
+                f' (value "PWR_FLAG") (footprint ""))'
+            )
+
+        for i, comp in enumerate(sheet.components):
+            sym = registry.resolve(comp)
+            used.add(sym.lib_id)
+            comp.inst_uuid = _u()
+            col, row = i % DEFAULT_COLS, i // DEFAULT_COLS
+            ix = ORIGIN_X + col * COL_PITCH
+            iy = ORIGIN_Y + row * ROW_PITCH
+            instances.append(_instance_block(comp, sym, ix, iy))
+
+            net_by_num = {p.number: p.net for p in comp.pins}
+            for num, (px, py) in sym.pin_xy.items():
+                net = net_by_num.get(num)
+                if net is None:
+                    continue
+                lx, ly = ix + px, iy - py
+                role = roles.get(net, NetRole.SIGNAL)
+                if role is NetRole.POWER or role is NetRole.GROUND:
+                    _place_power(net, role is NetRole.GROUND, lx, ly)
+                else:
+                    labels.append(_label_block(net, lx, ly))
+                    summary.labels += 1
+            summary.unmapped_pads += sum(
+                1 for num in net_by_num if num not in sym.pin_xy
+            )
+
+            inst_path = "/".join(path + [comp.inst_uuid])
+            symbol_instances.append(
+                f'    (path "/{inst_path}" (reference "{escape(comp.ref)}") (unit 1)'
+                f' (value "{escape(comp.value)}") (footprint ""))'
+            )
+
+        # Child-sheet reference blocks live in *this* sheet's file.
+        sheet_refs = [
+            _sheet_ref_block(ch, SHEET_X, SHEET_Y0 + ci * SHEET_DY)
+            for ci, ch in enumerate(sheet.children)
+        ]
+        # Recurse first so the root's doc (assembled below) sees every symbol instance.
+        for ch in sheet.children:
+            _emit(ch, False)
+
+        body = (
+            f"  (lib_symbols\n{registry.lib_symbols_text_for(used)}\n  )\n"
+            f"{chr(10).join(instances)}\n"
+            f"{chr(10).join(sheet_refs)}\n"
+            f"{chr(10).join(labels)}\n"
+        )
+        if is_root:
+            doc = (
+                f"(kicad_sch (version {SCH_VERSION}) (generator eeschema)\n"
+                f"  (uuid {_u()})\n"
+                f'  (paper "{PAPER}")\n'
+                f"{body}"
+                f"  (sheet_instances\n{chr(10).join(sheet_instances)}\n  )\n"
+                f"  (symbol_instances\n{chr(10).join(symbol_instances)}\n  )\n"
+                f")\n"
+            )
+        else:
+            doc = (
+                f"(kicad_sch (version {SCH_VERSION}) (generator eeschema)\n"
+                f"  (uuid {_u()})\n"
+                f'  (paper "{PAPER}")\n'
+                f"{body}"
+                f")\n"
+            )
+        files[f"{sheet.file_stem}.kicad_sch"] = doc
+
+    _emit(root, True)
+    summary.fallback_symbols = registry.fallback_count
+    return files, summary
+
+
+class SchematicMode(str, Enum):
+    HIERARCHICAL = "hierarchical"  # real symbols, sheet per module, labels (default)
+    WIRED = "wired"  # provably short-free ladder of generic boxes
+    LABELS = "labels"  # flat grid of real symbols with a label per pin
+
+
 def export_schematic(
     app: fabll.Node,
     *,
     target_name: str,
     out_path: Path,
     parts_search_dirs: list[Path] | None = None,
-    draw_wires: bool = True,
+    mode: SchematicMode = SchematicMode.HIERARCHICAL,
+    draw_wires: bool | None = None,
 ) -> SchematicSummary:
     """
-    Export a connectivity ``.kicad_sch`` for ``app`` to ``out_path``.
+    Export a connectivity schematic for ``app`` to ``out_path``.
 
-    ``draw_wires`` (default) routes each net as a ladder of real drawn wires using
-    generic bottom-pin boxes. Set it ``False`` for the label mode: grid-placed symbols
-    (real cached ``.kicad_sym`` where available, generic box otherwise — searched in
-    ``parts_search_dirs``) with a net-name ``global_label`` on every pin and no wires.
+    ``mode`` selects the view:
+
+    - ``hierarchical`` (default): real cached symbols (generic box otherwise) placed on
+      one ``.kicad_sch`` **sheet per ``.ato`` module**, with a net-name ``global_label``
+      on every pin. Connectivity rides on the labels, so the netlist is complete without
+      wires and a human can rearrange/route it without breaking it. Child sheet files
+      are written beside ``out_path`` (the root).
+    - ``wired``: a provably short-free ladder of generic bottom-pin boxes, drawn nets.
+    - ``labels``: a flat grid of real symbols with a label per pin (single file).
+
+    ``draw_wires`` is the legacy boolean (``True`` -> ``wired``, else ``labels``) and
+    overrides ``mode`` when given.
     """
+    if draw_wires is not None:
+        mode = SchematicMode.WIRED if draw_wires else SchematicMode.LABELS
+
     components, net_names = extract_components(app)
-    if draw_wires:
-        doc, summary = render_wired(components, net_names)
-    else:
-        doc, summary = render(components, net_names, parts_search_dirs or [])
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(doc, encoding="utf-8")
+
+    if mode is SchematicMode.HIERARCHICAL:
+        files, summary = render_hierarchical(
+            components,
+            net_names,
+            app,
+            root_stem=out_path.stem,
+            search_dirs=parts_search_dirs or [],
+        )
+        for fname, doc in files.items():
+            (out_path.parent / fname).write_text(doc, encoding="utf-8")
+        # Remove stale child sheets from earlier builds (the root has no "-", so the
+        # glob never matches it). Filenames are deterministic, so this only deletes
+        # sheets no longer emitted (renamed/removed modules, old random-suffixed ones).
+        for old in out_path.parent.glob(f"{out_path.stem}-*.kicad_sch"):
+            if old.name not in files:
+                old.unlink()
+    else:
+        if mode is SchematicMode.WIRED:
+            doc, summary = render_wired(components, net_names)
+        else:
+            doc, summary = render(components, net_names, parts_search_dirs or [])
+        out_path.write_text(doc, encoding="utf-8")
+
     summary.path = str(out_path)
     logger.info("Exported schematic %s (%s)", out_path, summary)
     return summary

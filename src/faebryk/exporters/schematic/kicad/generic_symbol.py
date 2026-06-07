@@ -105,6 +105,89 @@ def build_generic_symbol(lib_id: str, pin_numbers: list[str]) -> SymbolDef:
     )
 
 
+# Power-symbol glyphs (KiCad's stock GND triangle / power up-arrow), origin at the pin.
+_GND_GLYPH = (
+    "(polyline (pts (xy 0 0) (xy 0 -1.27) (xy 1.27 -1.27) (xy 0 -2.54)"
+    " (xy -1.27 -1.27) (xy 0 -1.27))\n"
+    "          (stroke (width 0) (type default)) (fill (type none)))"
+)
+_PWR_GLYPH = (
+    "(polyline (pts (xy -0.762 1.27) (xy 0 2.54))"
+    " (stroke (width 0) (type default)) (fill (type none)))\n"
+    "        (polyline (pts (xy 0 0) (xy 0 2.54))"
+    " (stroke (width 0) (type default)) (fill (type none)))\n"
+    "        (polyline (pts (xy 0 2.54) (xy 0.762 1.27))"
+    " (stroke (width 0) (type default)) (fill (type none)))"
+)
+
+
+def build_power_symbol(lib_id: str, net_name: str, *, ground: bool) -> SymbolDef:
+    """Build a KiCad **power symbol** for ``net_name`` (ground triangle or power arrow).
+
+    A power symbol connects *by name, wirelessly*: the ``(power)`` flag plus a hidden
+    ``power_in`` pin at the origin whose ``name`` equals ``net_name`` make instances
+    of that name one global net (all sheets). Place the instance at a component
+    pin's connection point and the length-0 pin lands on it — no wire needed. The single
+    pin is at ``(0, 0)``; the caller positions the instance.
+    """
+    bare = lib_id.split(":", 1)[-1]
+    glyph = _GND_GLYPH if ground else _PWR_GLYPH
+    pin_rot = 270 if ground else 90
+    ref_y, val_y = (-6.35, -3.81) if ground else (-3.81, 3.556)
+
+    text = (
+        f'    (symbol "{lib_id}" (power) (pin_names (offset 0))'
+        f" (in_bom yes) (on_board yes)\n"
+        f'      (property "Reference" "#PWR" (id 0) (at 0 {ref_y} 0)'
+        f" (effects (font (size 1.27 1.27)) hide))\n"
+        f'      (property "Value" "{escape(net_name)}" (id 1) (at 0 {val_y} 0)'
+        f" (effects (font (size 1.27 1.27))))\n"
+        f'      (symbol "{bare}_0_1"\n'
+        f"        {glyph})\n"
+        f'      (symbol "{bare}_1_1"\n'
+        f"        (pin power_in line (at 0 0 {pin_rot}) (length 0) hide\n"
+        f'          (name "{escape(net_name)}" (effects (font (size 1.27 1.27))))\n'
+        f'          (number "1" (effects (font (size 1.27 1.27)))))\n'
+        f"      )\n"
+        f"    )"
+    )
+    return SymbolDef(
+        lib_id=lib_id, lib_symbol_text=text, pin_xy={"1": (0.0, 0.0)}, is_fallback=True
+    )
+
+
+def build_pwr_flag_symbol(lib_id: str) -> SymbolDef:
+    """Build a ``PWR_FLAG``: a ``power_out`` driver that marks a power net as driven.
+
+    KiCad errors (``power_pin_not_driven``) on a power net whose only pins are
+    ``power_in``. One ``PWR_FLAG`` on the net (atop a rail pin) supplies the needed
+    ``power_out`` and clears the error. Its pin is named ``~`` so it connects by
+    geometry, not name; pin at ``(0, 0)``.
+    """
+    bare = lib_id.split(":", 1)[-1]
+    text = (
+        f'    (symbol "{lib_id}" (power) (pin_numbers hide)'
+        f" (pin_names (offset 0) hide) (in_bom yes) (on_board yes)\n"
+        f'      (property "Reference" "#FLG" (id 0) (at 0 1.905 0)'
+        f" (effects (font (size 1.27 1.27)) hide))\n"
+        f'      (property "Value" "PWR_FLAG" (id 1) (at 0 3.81 0)'
+        f" (effects (font (size 1.27 1.27))))\n"
+        f'      (symbol "{bare}_0_0"\n'
+        f"        (pin power_out line (at 0 0 90) (length 0) hide\n"
+        f'          (name "~" (effects (font (size 1.27 1.27))))\n'
+        f'          (number "1" (effects (font (size 1.27 1.27)))))\n'
+        f"      )\n"
+        f'      (symbol "{bare}_0_1"\n'
+        f"        (polyline (pts (xy 0 0) (xy 0 1.27) (xy -1.016 1.905) (xy 0 2.54)"
+        f" (xy 1.016 1.905) (xy 0 1.27))\n"
+        f"          (stroke (width 0) (type default)) (fill (type none))))\n"
+        f"    )"
+    )
+    return SymbolDef(
+        lib_id=lib_id, lib_symbol_text=text, pin_xy={"1": (0.0, 0.0)}, is_fallback=True
+    )
+
+
 def build_wire_box(lib_id: str, pin_numbers: list[str]) -> SymbolDef:
     """
     Build a generic box for *wire mode* with all pins on the **bottom edge**.

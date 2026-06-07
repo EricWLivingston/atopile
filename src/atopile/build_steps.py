@@ -870,19 +870,19 @@ def build_design(ctx: BuildStepContext) -> None:
 )
 def generate_schematic(ctx: BuildStepContext) -> None:
     """Emit a KiCad connectivity schematic (`<target>.kicad_sch`) with drawn nets."""
-    from faebryk.exporters.schematic import export_schematic
+    from faebryk.exporters.schematic import SchematicMode, export_schematic
 
     app = ctx.require_app()
     out_path = config.build.paths.output_base.with_suffix(".kicad_sch")
     # Project parts plus dependency parts (under .ato/modules) for symbol embedding
-    # (label mode only; wire mode uses generic boxes).
+    # (hierarchical/label modes use real cached symbols; wire mode uses generic boxes).
     search_dirs = [config.project.paths.parts, config.project_dir / ".ato"]
     summary = export_schematic(
         app,
         target_name=config.build.name,
         out_path=out_path,
         parts_search_dirs=search_dirs,
-        draw_wires=True,
+        mode=SchematicMode.HIERARCHICAL,
     )
     logger.info(f"Exported schematic to {out_path} ({summary})")
 

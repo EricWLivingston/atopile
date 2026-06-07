@@ -15,8 +15,9 @@ write path, which currently cannot produce a KiCad-loadable schematic (see
 """
 
 from faebryk.exporters.schematic.kicad.schematic import (
+    SchematicMode,
     SchematicSummary,
     export_schematic,
 )
 
-__all__ = ["SchematicSummary", "export_schematic"]
+__all__ = ["SchematicMode", "SchematicSummary", "export_schematic"]

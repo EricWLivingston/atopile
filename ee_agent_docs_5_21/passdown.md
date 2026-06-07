@@ -19,6 +19,7 @@
 | M1 — fork bootstrap | ✅ done & pushed |
 | M2 — `AnthropicProvider` (dual provider, stateful, tested) | ✅ done & pushed |
 | **Schematic emitter** (label mode + wire/ladder mode) — *not on the original roadmap; built on request* | ✅ done & pushed |
+| **Schematic — hierarchical real-symbol mode** (sheet per `.ato` module, labels = valid netlist; now the build default) | ✅ done (working tree) |
 | M3 — tool-registration plumbing (`ee_ping` smoke + 3 real-tool scaffolds) | ✅ done & pushed |
 | M4 `rag_search` · M5 `pyspice_run` · M6 `ipc_check` — *registered stubs; bodies TBD* | ⏳ next (M4) |
 | M7 — end-to-end design + eval | ⬜ not started |
@@ -217,10 +218,56 @@ Wires the EE tool surface through atopile's existing machinery; **no tool logic 
   `ee_ping` smoke tool can be removed once a real tool proves the path in production.
 - **Deferred deps**, re-add at their milestones with `uv lock --refresh` and a 3.14-wheel
   check: voyageai / cohere / qdrant-client / llama-parse (M4 RAG), pyspice (M5 sim).
-- **Schematic follow-ups (optional):** agent `schematic_export` tool (deferred; pattern
-  verified in `tools.py` / `tool_definitions_project.py`); real symbols in wire mode;
-  nicer placement / power symbols. Upstream: fix the `kicad.dumps` schematic write path
-  (`07` §2.11) so the emitter could use the typed model.
+- **Schematic — hierarchical real-symbol mode (DONE, working tree).** Goal was
+  human-readable schematics from `.ato` code. KiCad has **no** schematic autorouter /
+  autoplacer / autoclean (`kicad-cli sch` = erc/export/upgrade only), so the chosen design
+  is a **polished human-cleanup base**: real cached symbols placed on **one sheet per
+  `.ato` module** (hierarchical sheets), with a `global_label` on every pin. The
+  load-bearing invariant: a KiCad netlist is defined by label *names*, and **global labels
+  connect across the whole sheet hierarchy** — so the schematic is electrically complete
+  with **zero wires**, and a human can rearrange/route it without breaking the netlist
+  (`kicad-cli sch erc`/`export netlist` verify at any point). All in
+  `src/faebryk/exporters/schematic/kicad/schematic.py`: `build_sheet_tree`
+  (groups components by `is_ato_module` via `get_hierarchy`/`get_implementors`),
+  `render_hierarchical` / `render_sheet_tree` (root + child `.kicad_sch` files; instances
+  centralised in the root's `(symbol_instances)` with nested `/<sheet>/<sym>` paths),
+  `classify_nets` (power/ground via `ElectricPower.hv/lv`). `export_schematic` gained a
+  `mode` flag (`hierarchical` default | `wired` | `labels`; legacy `draw_wires` maps on);
+  `build_steps.py:generate_schematic` now selects `hierarchical`. **Verified:** 7 new
+  exporter tests (cross-sheet netlist + classify_nets), ruff clean, and `ato build
+  examples/i2c` → ERC **0 errors**, netlist exact (hv=6, lv=4, SDA/SCL/Alert=2) across the
+  `temp_sensor` sub-sheet. Format was locked first with a kicad-cli spike (the 2-sheet
+  `NET_SHARED` cross-sheet proof).
+- **Schematic — power symbols (M3b, DONE, working tree).** Rail pins now render as real
+  KiCad **power symbols** (GND triangle / power up-arrow) instead of labels; signal pins
+  keep labels. `build_power_symbol` / `build_pwr_flag_symbol` in `generic_symbol.py`;
+  `render_sheet_tree` gained a `net_roles` arg and a `_place_power` branch
+  (`render_hierarchical` feeds it `classify_nets(app)`); `SchematicSummary.power_symbols`.
+  **Key gotchas (kicad-cli-locked, spike `/tmp/pwr_spike/`):** a power symbol connects by
+  the `(power)` flag **+ a `power_in` pin whose `name` is the net** — a `passive` pin
+  *splits* the net (no name connection). A `power_in`-only net then errors
+  `power_pin_not_driven`, so the emitter drops **one `PWR_FLAG`** (a `power_out` driver,
+  pin name `~`, connects by geometry) atop the first pin of each rail net → ERC back to
+  **0 errors**. +4 tests (23 total in the file); `ato build examples/i2c` ERC 0 errors,
+  netlist still exact, hv→arrows / lv→triangles, one PWR_FLAG per rail. (Real-symbol pins
+  are typed `Unspecified` in the cached `.kicad_sym`, so a handful of benign `pin_to_pin`
+  *warnings* remain — pin-metadata only, not connectivity.)
+- **Schematic — deterministic filenames + cleanup (M3c, DONE, working tree).** Child sheet
+  files were named `<root>-<module>-<8 hex>` where the hex was a fresh `uuid4()` **per
+  build**, so rebuilds piled up duplicate files for the same module. Fixed in `schematic.py`:
+  `render_sheet_tree._assign` now derives `file_stem` from the module's **sanitized name
+  path** (`default-temp_sensor.kicad_sch`, no hex; `seen_stems` adds a deterministic `-2` on
+  collision); `sheet.uuid` is still random but only used internally (the `(sheet)` block +
+  `(symbol_instances)` path). `export_schematic` (hierarchical) now **deletes stale**
+  `{stem}-*.kicad_sch` not in the current output (root has no `-`, never matched).
+  **Verified:** `ato build examples/i2c` twice → exactly `default.kicad_sch` +
+  `default-temp_sensor.kicad_sch` both times, ERC 0 errors; +3 tests (26 total), ruff clean.
+  (Deferred: making the internal uuids deterministic for byte-identical rebuilds.)
+- **Schematic follow-ups (optional):** real symbols in *wire* mode; agent
+  `schematic_export` tool (deferred; pattern in `tools.py` / `tool_definitions_project.py`);
+  **Q2 image export** (`kicad-cli sch export svg/pdf` wrapper — trivial now the schematic is
+  readable). Stale child `.kicad_sch` from a prior build aren't cleaned up (harmless; KiCad
+  loads only referenced sheets). Upstream: fix `kicad.dumps` schematic write (`07` §2.11).
 - **`12_DEV_TEST_HARNESS.md` §2** still owes a Tier-3 caveat: the browser
   `ato serve frontend` file explorer is a no-op (calls `postToExtension`, which only
   works inside a VS Code webview). The chat panel works in a browser; the file explorer
@@ -250,4 +297,17 @@ Wires the EE tool surface through atopile's existing machinery; **no tool logic 
 - Session 10 — M3 tool-registration plumbing: `ee_ping` smoke + `rag_search`/
   `pyspice_run`/`ipc_check` registered as schema'd, model-callable graceful stubs in
   `_ee/`; 7 tests; pushed.
-- **Next** — M4: implement `rag_search` body.
+- Session 11 — schematic **hierarchical real-symbol mode** (human-cleanup base): sheet per
+  `.ato` module, labels carry connectivity (valid netlist, no wires), now the build
+  default; format locked via kicad-cli 2-sheet spike; i2c ERC-clean + exact netlist; +7
+  tests (18 total), ruff clean. Working tree only.
+- Session 12 — schematic **power symbols (M3b)**: rail pins → GND-triangle / power-arrow
+  glyphs + one `PWR_FLAG` driver per rail (clears `power_pin_not_driven`); grammar locked
+  via kicad-cli spike; i2c ERC-clean + exact netlist; +4 tests (23 total), ruff clean.
+  Working tree only.
+- Session 13 — schematic **M3c**: deterministic child-sheet filenames (no per-build hex)
+  + stale-file cleanup, fixing duplicate `<module>` files piling up across builds; i2c
+  double-build → stable two files, ERC-clean; +3 tests (26 total), ruff clean. **Schematic
+  work (sessions 11–13) still not committed/pushed.**
+- **Next** — commit/push the schematic work (sessions 11–13); then M4 (`rag_search` body)
+  on the EE-agent track, or Q2 image export.

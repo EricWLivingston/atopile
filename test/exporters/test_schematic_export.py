@@ -18,6 +18,8 @@ from faebryk.exporters.schematic.kicad import schematic as S
 from faebryk.exporters.schematic.kicad.generic_symbol import (
     SymbolDef,
     build_generic_symbol,
+    build_power_symbol,
+    build_pwr_flag_symbol,
     build_wire_box,
 )
 from faebryk.exporters.schematic.kicad.real_symbol import build_real_symbol
@@ -398,3 +400,330 @@ def test_extract_then_render_wired_no_shorts(tmp_path: Path):
     expected = _expected_nets(components)
     for net, pins in expected.items():
         assert got.get(net) == pins, f"net {net}: expected {pins}, got {got.get(net)}"
+
+
+# --------------------------------------------------------------------------------------
+# Hierarchical mode (real symbols + sheets per .ato module, labels for connectivity)
+# --------------------------------------------------------------------------------------
+def test_build_sheet_tree_flat_without_ato_modules():
+    # The synthetic app is built directly via fabll, so it carries no is_ato_module
+    # trait -> everything falls onto a single root sheet.
+    app = _build_synthetic_app()
+    comps, _ = extract_components(app)
+    root = S.build_sheet_tree(comps, app)
+    assert root.children == []
+    assert {c.ref for c in root.components} == {"R1", "R2"}
+    assert len(root.walk()) == 1
+
+
+def test_render_hierarchical_labels_every_pin(tmp_path: Path):
+    app = _build_synthetic_app()
+    comps, nets = extract_components(app)
+    files, summary = S.render_hierarchical(
+        comps, nets, app, root_stem="syn", search_dirs=[]
+    )
+    # No sub-modules -> single root file, a label on every connected pin.
+    assert set(files) == {"syn.kicad_sch"}
+    assert summary.labels == 4
+    root_doc = files["syn.kicad_sch"]
+    assert "(symbol_instances" in root_doc  # instances centralised in the root
+    assert root_doc.count("(global_label") == 4
+
+    path = tmp_path / "syn.kicad_sch"
+    path.write_text(root_doc, encoding="utf-8")
+    assert kicad.loads(kicad.schematic.SchematicFile, path).kicad_sch is not None
+
+
+def _two_sheet_tree() -> "S.SheetIR":
+    """Root with two child sheets sharing a net across the sheet boundary."""
+    root = S.SheetIR(name="root", node_id="r")
+    root.children = [
+        S.SheetIR(
+            name="blockA",
+            node_id="a",
+            components=[
+                ComponentIR("R1", "1k", [PinIR("1", "NET_A"), PinIR("2", "SHARED")])
+            ],
+        ),
+        S.SheetIR(
+            name="blockB",
+            node_id="b",
+            components=[
+                ComponentIR("R2", "2k", [PinIR("1", "SHARED"), PinIR("2", "NET_B")])
+            ],
+        ),
+    ]
+    return root
+
+
+def test_render_sheet_tree_structure():
+    root = _two_sheet_tree()
+    files, summary = S.render_sheet_tree(
+        root, {"NET_A", "SHARED", "NET_B"}, root_stem="m", search_dirs=[]
+    )
+    assert len(files) == 3  # root + two children
+    assert summary.components == 2
+
+    root_doc = files["m.kicad_sch"]
+    # Root references both child sheets + centralises both instances (nested paths).
+    assert root_doc.count("(sheet (at") == 2
+    assert root_doc.count("(reference") == 2
+    assert re.search(r'\(path "/[0-9a-f-]+/[0-9a-f-]+"', root_doc), root_doc
+
+    # Children carry their symbols but no instances/sheet bookkeeping.
+    child_docs = [v for k, v in files.items() if k != "m.kicad_sch"]
+    for doc in child_docs:
+        assert "(symbol_instances" not in doc
+        assert "(sheet_instances" not in doc
+        assert "(symbol (lib_id" in doc
+
+
+@requires_kicad_cli
+def test_hierarchical_cross_sheet_netlist(tmp_path: Path):
+    # The load-bearing invariant: same-named global labels connect across sheets.
+    root = _two_sheet_tree()
+    files, _ = S.render_sheet_tree(
+        root, {"NET_A", "SHARED", "NET_B"}, root_stem="m", search_dirs=[]
+    )
+    for fname, doc in files.items():
+        (tmp_path / fname).write_text(doc, encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    got = _kicad_netlist_membership(tmp_path / "m.kicad_sch", out)
+    assert got.get("SHARED") == {"R1.2", "R2.1"}  # spans both child sheets
+    assert got.get("NET_A") == {"R1.1"}
+    assert got.get("NET_B") == {"R2.2"}
+
+
+def test_export_schematic_mode_dispatch(tmp_path: Path):
+    app = _build_synthetic_app()
+    out = tmp_path / "d.kicad_sch"
+
+    # Default is hierarchical (centralised symbol_instances, no drawn wires).
+    S.export_schematic(app, target_name="d", out_path=out)
+    text = out.read_text()
+    assert "(symbol_instances" in text and "(wire " not in text
+
+    # Legacy draw_wires=True still selects the ladder (wire) renderer.
+    S.export_schematic(app, target_name="d", out_path=out, draw_wires=True)
+    assert "(wire " in out.read_text()
+
+
+# --------------------------------------------------------------------------------------
+# Net classification (power / ground / signal)
+# --------------------------------------------------------------------------------------
+def _build_power_app() -> fabll.Node:
+    """Two components whose pads tie to the hv (power) and lv (ground) of a rail."""
+    from faebryk.libs.net_naming import attach_net_names
+    from faebryk.libs.nets import bind_electricals_to_fbrk_nets
+
+    g = fabll.graph.GraphView.create()
+    tg = fbrk.TypeGraph.create(g=g)
+
+    class _Comp(fabll.Node):
+        a = F.Electrical.MakeChild()
+        b = F.Electrical.MakeChild()
+        lead_a = fabll.Traits.MakeEdge(F.Lead.is_lead.MakeChild(), [a])
+        lead_b = fabll.Traits.MakeEdge(F.Lead.is_lead.MakeChild(), [b])
+        a.add_dependant(lead_a)
+        b.add_dependant(lead_b)
+        _is_interface = fabll.Traits.MakeEdge(fabll.is_interface.MakeChild())
+        _is_module = fabll.Traits.MakeEdge(fabll.is_module.MakeChild())
+
+    class _App(fabll.Node):
+        c1 = _Comp.MakeChild()
+        c2 = _Comp.MakeChild()
+        pwr = F.ElectricPower.MakeChild()
+        _is_module = fabll.Traits.MakeEdge(fabll.is_module.MakeChild())
+
+    app = _App.bind_typegraph(tg).create_instance(g=g)
+    pwr = app.pwr.get()
+    comps = [app.c1.get(), app.c2.get()]
+    for idx, comp in enumerate(comps, start=1):
+        fabll.Traits.create_and_add_instance_to(comp, F.has_designator).setup(
+            designator=f"R{idx}"
+        )
+        fp_node = fabll.Node.bind_typegraph(tg).create_instance(g=g)
+        fp_trait = fabll.Traits.create_and_add_instance_to(
+            fp_node, F.Footprints.is_footprint
+        )
+        for lead_iface, num in ((comp.a.get(), "1"), (comp.b.get(), "2")):
+            pad_node = fabll.Node.bind_typegraph(tg).create_instance(g=g)
+            pad = fabll.Traits.create_and_add_instance_to(
+                pad_node, F.Footprints.is_pad
+            ).setup(pad_name=num, pad_number=num)
+            fabll.Traits.create_and_add_instance_to(
+                node=lead_iface.get_trait(F.Lead.is_lead),
+                trait=F.Lead.has_associated_pads,
+            ).setup(pad)
+            fp_node.add_child(pad_node)
+        fabll.Traits.create_and_add_instance_to(
+            comp, F.Footprints.has_associated_footprint
+        ).setup(fp_trait)
+        # a -> rail hv (power), b -> rail lv (ground)
+        comp.a.get()._is_interface.get().connect_to(pwr.hv.get())
+        comp.b.get()._is_interface.get().connect_to(pwr.lv.get())
+
+    nets = bind_electricals_to_fbrk_nets(tg, g)
+    attach_net_names(nets)
+    return app
+
+
+def test_classify_nets_signal_only():
+    app = _build_synthetic_app()
+    roles = S.classify_nets(app)
+    assert roles and set(roles.values()) == {S.NetRole.SIGNAL}
+
+
+def test_classify_nets_power_and_ground():
+    app = _build_power_app()
+    roles = S.classify_nets(app)
+    assert S.NetRole.POWER in roles.values()
+    assert S.NetRole.GROUND in roles.values()
+
+
+# --------------------------------------------------------------------------------------
+# Power symbols (M3b)
+# --------------------------------------------------------------------------------------
+def test_build_power_symbol():
+    gnd = build_power_symbol("atopile:GND_GND", "GND", ground=True)
+    assert gnd.pin_xy == {"1": (0.0, 0.0)}
+    assert "(power)" in gnd.lib_symbol_text
+    # connects by name: a power_in pin whose name is the net
+    assert "power_in" in gnd.lib_symbol_text
+    assert '(name "GND"' in gnd.lib_symbol_text
+
+    pwr = build_power_symbol("atopile:PWR_V3", "V3", ground=False)
+    assert "(power)" in pwr.lib_symbol_text and '(name "V3"' in pwr.lib_symbol_text
+
+
+def test_build_pwr_flag_symbol():
+    flag = build_pwr_flag_symbol("atopile:PWR_FLAG")
+    # a power_out driver (clears power_pin_not_driven)
+    assert "(power)" in flag.lib_symbol_text and "power_out" in flag.lib_symbol_text
+
+
+def test_render_sheet_tree_power_symbols_replace_labels():
+    root = S.SheetIR(
+        name="root",
+        node_id="r",
+        components=[
+            ComponentIR(
+                "U1", "", [PinIR("1", "VCC"), PinIR("2", "GND"), PinIR("3", "SIG")]
+            )
+        ],
+    )
+    roles = {
+        "VCC": S.NetRole.POWER,
+        "GND": S.NetRole.GROUND,
+        "SIG": S.NetRole.SIGNAL,
+    }
+    files, summary = S.render_sheet_tree(
+        root, {"VCC", "GND", "SIG"}, root_stem="p", search_dirs=[], net_roles=roles
+    )
+    doc = files["p.kicad_sch"]
+    assert summary.power_symbols == 2  # VCC + GND pins
+    assert summary.labels == 1  # only the signal pin is labelled
+    assert doc.count("(global_label") == 1
+    assert "atopile:PWR_VCC" in doc and "atopile:GND_GND" in doc
+    # exactly one PWR_FLAG driver per rail net
+    assert doc.count('(reference "#FLG') == 2
+
+
+@requires_kicad_cli
+def test_power_app_rails_connect_via_power_symbols(tmp_path: Path):
+    app = _build_power_app()
+    comps, nets = extract_components(app)
+    files, summary = S.render_hierarchical(
+        comps, nets, app, root_stem="pwr", search_dirs=[]
+    )
+    # Every rail pin became a power symbol; no labels left.
+    assert summary.power_symbols == 4
+    assert summary.labels == 0
+
+    for fname, doc in files.items():
+        (tmp_path / fname).write_text(doc, encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    # Rails connect through the power symbols (by power-pin name).
+    got = _kicad_netlist_membership(tmp_path / "pwr.kicad_sch", out)
+    assert got.get("hv") == {"R1.1", "R2.1"}
+    assert got.get("lv") == {"R1.2", "R2.2"}
+
+    # The PWR_FLAG drivers keep ERC error-free.
+    root_path = tmp_path / "pwr.kicad_sch"
+    erc = subprocess.run(
+        [_KICAD_CLI, "sch", "erc", "-o", str(out / "erc.rpt"), str(root_path)],
+        capture_output=True,
+        text=True,
+    )
+    report = (out / "erc.rpt").read_text() if (out / "erc.rpt").exists() else erc.stdout
+    assert "Errors 0" in report, report
+
+
+# --------------------------------------------------------------------------------------
+# Deterministic filenames + stale-file cleanup (M3c)
+# --------------------------------------------------------------------------------------
+def _named_two_sheet_tree() -> "S.SheetIR":
+    root = S.SheetIR(name="root", node_id="r")
+    root.children = [
+        S.SheetIR(
+            name="power", node_id="p",
+            components=[ComponentIR("U1", "", [PinIR("1", "A")])],
+        ),
+        S.SheetIR(
+            name="sensor", node_id="s",
+            components=[ComponentIR("U2", "", [PinIR("1", "B")])],
+        ),
+    ]
+    return root
+
+
+def test_hierarchical_child_filenames_deterministic():
+    # Readable, hex-free, and identical across renders (no per-build random suffix).
+    f1, _ = S.render_sheet_tree(
+        _named_two_sheet_tree(), {"A", "B"}, root_stem="default", search_dirs=[]
+    )
+    f2, _ = S.render_sheet_tree(
+        _named_two_sheet_tree(), {"A", "B"}, root_stem="default", search_dirs=[]
+    )
+    assert set(f1) == {
+        "default.kicad_sch",
+        "default-power.kicad_sch",
+        "default-sensor.kicad_sch",
+    }
+    assert set(f1) == set(f2)
+
+
+def test_hierarchical_filename_collision_gets_suffix():
+    # Two sheets whose names collide get a deterministic "-2".
+    root = S.SheetIR(name="root", node_id="r")
+    root.children = [
+        S.SheetIR(
+            name="dup", node_id="1",
+            components=[ComponentIR("U1", "", [PinIR("1", "A")])],
+        ),
+        S.SheetIR(
+            name="dup", node_id="2",
+            components=[ComponentIR("U2", "", [PinIR("1", "B")])],
+        ),
+    ]
+    files, _ = S.render_sheet_tree(
+        root, {"A", "B"}, root_stem="default", search_dirs=[]
+    )
+    assert "default-dup.kicad_sch" in files
+    assert "default-dup-2.kicad_sch" in files
+
+
+def test_export_schematic_cleans_stale_children(tmp_path: Path):
+    app = _build_synthetic_app()
+    out = tmp_path / "default.kicad_sch"
+    stale = tmp_path / "default-oldmodule.kicad_sch"
+    stale.write_text("stale", encoding="utf-8")
+
+    S.export_schematic(app, target_name="default", out_path=out)  # hierarchical default
+
+    assert out.exists()
+    assert not stale.exists()  # leftover from a prior build is removed

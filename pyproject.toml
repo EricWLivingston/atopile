@@ -73,6 +73,10 @@ dependencies = [
     "websockets>=12.0",
     "zstd>=1.5.6.7",
     "anthropic",
+    "chromadb",
+    "cohere",
+    "rank-bm25",
+    "pdfminer-six",
 ]
 
 [project.urls]
@@ -104,6 +108,8 @@ dev = [
     #"austin-python>=2.1.2",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.4.0",
+    "jupyterlab>=4.5.8",
+    "ipykernel>=7.2.0",
 ]
 
 
@@ -126,7 +132,7 @@ artifacts = [
     "**/visualizer/web/dist",
     "**/dashboard/web/dist",
 ]
-packages = ["src/faebryk", "src/atopile"]
+packages = ["src/faebryk", "src/atopile", "src/ee_agent_rag"]
 exclude = ["**/.zig-cache", "**/.zig-cache/**", "**/zig-out", "**/zig-out/**"]
 
 [tool.hatch.build.targets.wheel.hooks.scikit-build]

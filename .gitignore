@@ -231,3 +231,12 @@ src/atopile/layout_server/static/editor.js.map
 # vscode layout editor webview bundle artifacts
 src/vscode-atopile/resources/layout-editor/editor.js
 src/vscode-atopile/resources/layout-editor/editor.js.map
+
+# EE-agent RAG (M4): corpus PDFs + generated indexes/caches (not source)
+/data/
+
+# Jupyter notebooks (local dev/tuning surface, not committed)
+*.ipynb
+
+# Local-only RAG notebook/tuning reference (not committed)
+ee_agent_docs_5_21/16_RAG_NOTEBOOK_AND_TUNING.md

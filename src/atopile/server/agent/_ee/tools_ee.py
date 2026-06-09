@@ -31,12 +31,13 @@ async def _tool_ee_ping(
 async def _tool_rag_search(
     arguments: dict[str, Any], project_root: Path, ctx: AppContext
 ) -> dict[str, Any]:
-    """Scaffold: RAG retrieval lands in M4."""
-    return {
-        "ok": False,
-        "error": "rag_search not implemented yet (M4)",
-        "results": [],
-    }
+    """Hybrid retrieval (dense+BM25 -> RRF -> Cohere rerank) over the EE knowledge base.
+
+    Implemented in M4; delegates to the framework-agnostic retriever in ``ee_agent_rag``.
+    """
+    from .tools_rag import run_rag_search
+
+    return await run_rag_search(arguments)
 
 
 @_register_tool("pyspice_run")

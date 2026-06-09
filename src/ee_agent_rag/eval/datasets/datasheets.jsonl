@@ -1,0 +1,4 @@
+{"query": "What is the typical quiescent current of the TLV713P?", "must_contain_mpn": "TLV713P", "must_contain_section": "Electrical"}
+{"query": "TLV713P maximum input voltage absolute rating", "must_contain_mpn": "TLV713P", "must_contain_section": "Absolute Maximum"}
+{"query": "TPS62840 minimum input voltage", "must_contain_mpn": "TPS62840", "must_contain_section": "Recommended Operating"}
+{"query": "TPS62840 quiescent current Iq", "must_contain_mpn": "TPS62840", "must_contain_section": "Electrical"}

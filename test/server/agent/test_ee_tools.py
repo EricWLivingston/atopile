@@ -60,7 +60,7 @@ def test_ee_ping_defaults_empty_message():
 
 @pytest.mark.parametrize(
     ("name", "milestone"),
-    [("rag_search", "M4"), ("pyspice_run", "M5"), ("ipc_check", "M6")],
+    [("pyspice_run", "M5"), ("ipc_check", "M6")],
 )
 def test_real_tool_stubs_return_gracefully(name: str, milestone: str):
     result = asyncio.run(
@@ -70,3 +70,15 @@ def test_real_tool_stubs_return_gracefully(name: str, milestone: str):
     )
     assert result["ok"] is False
     assert milestone in result["error"]
+
+
+def test_rag_search_implemented_degrades_without_query():
+    # rag_search is live (M4); with no query it must reject gracefully, not raise or
+    # report a not-implemented stub. (Wrapper behaviour covered in test_ee_rag_tool.py.)
+    result = asyncio.run(
+        tools.execute_tool(
+            name="rag_search", arguments={}, project_root=Path("."), ctx=None
+        )
+    )
+    assert result["ok"] is False
+    assert "query" in result["error"]

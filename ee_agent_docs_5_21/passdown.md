@@ -21,7 +21,8 @@
 | **Schematic emitter** (label mode + wire/ladder mode) — *not on the original roadmap; built on request* | ✅ done & pushed |
 | **Schematic — hierarchical real-symbol mode** (sheet per `.ato` module, labels = valid netlist; now the build default) | ✅ done (working tree) |
 | M3 — tool-registration plumbing (`ee_ping` smoke + 3 real-tool scaffolds) | ✅ done & pushed |
-| M4 `rag_search` · M5 `pyspice_run` · M6 `ipc_check` — *registered stubs; bodies TBD* | ⏳ next (M4) |
+| **M4 — `rag_search` retriever** (Chroma + LlamaParse + OpenAI embed + Cohere rerank; datasheets-only v1) | ✅ done & committed |
+| M5 `pyspice_run` · M6 `ipc_check` — *registered stubs; bodies TBD* | ⏳ next (M5) |
 | M7 — end-to-end design + eval | ⬜ not started |
 
 Fork: **`github.com/EricWLivingston/atopile`**, branch **`feature/ee-agent`**. `main` is
@@ -125,6 +126,17 @@ Live Anthropic tests are behind a `integration` marker and auto-skip without a k
 - **No circular re-export.** `AnthropicProvider` is imported directly from
   `_ee.provider_anthropic` in `utils.py`; do **not** re-export it from `provider.py`
   (that creates `provider.py → _ee → provider.py`).
+- **LlamaParse SDK is unusable on Python 3.14.** `llama-parse`'s `llama_cloud` dependency
+  does `import pydantic.v1`, and pydantic 2.12's bundled v1 shim is broken on 3.14
+  (`llama_cloud.types` fails at *import* with a `UndefinedType` validator error). chromadb /
+  cohere / rank-bm25 / pdfminer all import fine. Fix: **dropped the `llama-parse` package**
+  and call the LlamaParse REST API directly with httpx (`ee_agent_rag/parse.py`) — same
+  service / `LLAMA_CLOUD_API_KEY` / `parsing_instruction`, minus the broken (huge) tree.
+  This is the template for any future LlamaIndex-adjacent dep on 3.14.
+- **Chroma metadata is scalar + non-null only.** No `None`, no lists. `store._scrub` drops
+  `None` (e.g. empty MPN) and JSON-encodes lists, or upsert raises. Always scrub on write.
+- **`uv add` stale-cache trap struck again** for the RAG deps (landed in `pyproject` but not
+  `uv.lock`); `uv lock --refresh` then `uv sync` fixed it, as before.
 
 ---
 
@@ -208,16 +220,68 @@ Wires the EE tool surface through atopile's existing machinery; **no tool logic 
   passes, all 4 schema'd+registered, `ee_ping` echoes, stubs return gracefully, real
   tools in `available_tool_names()`). Full agent suite 26 pass / 4 skip; ruff clean.
 
+### M4 — `rag_search` retriever ✅ committed (`fe5517d2`)
+Fills in the M4 tool body. Stack locked (no LangChain): **Chroma · LlamaParse · OpenAI
+`text-embedding-3-large` · Cohere rerank**. New framework-agnostic package
+**`src/ee_agent_rag/`** (knows nothing about the agent runner) + a thin agent wrapper.
+- **Pipeline.** Ingest: `classify → parse(LlamaParse REST) → chunk(section-aware ##) →
+  enrich(MPN regex + deterministic chunk_id + optional OpenAI summary) → embed(OpenAI,
+  dim-tunable) → Chroma + rank-bm25 sidecar`. Query (`retriever.rag_search`): dense(Chroma)
+  + sparse(BM25) → **RRF fusion** → **Cohere rerank** → `{text, score, citation}`.
+- **LlamaParse via REST** (`parse.py`), not the SDK — the SDK can't import on 3.14 (see
+  Lessons). Parsed markdown cached by file hash under `data/.parsed_cache/`.
+- **Wiring.** `_ee/tools_rag.py::run_rag_search` calls the sync retriever via
+  `asyncio.to_thread` and degrades to `{ok:false,error}` on any failure (missing keys,
+  empty index, import error) so a live run never crashes; `_ee/tools_ee.py` M4 stub swapped
+  to delegate. Heavy deps imported lazily in the handler → server startup stays light.
+- **Eval.** `eval/runner.py` recall@K gate (datasheets baseline **0.80**); seed dataset
+  `eval/datasets/datasheets.jsonl` (4 Qs — **expand to ~30** for a real signal).
+- **Tests.** `test/ee_agent_rag/test_rag_pipeline.py` (offline pure logic: chunk+pages,
+  MPN, deterministic id, RRF, scrub, where-builder, tokenizer) + `test/server/agent/
+  test_ee_rag_tool.py` (wrapper: query-validation, exception degradation, format/truncate,
+  pass-through); M3 stub test updated (`rag_search` now live). **40 pass / 4 skip, ruff
+  clean.** End-to-end retrieval quality is validated in the notebook + eval (needs keys).
+- **Dev surface.** `notebooks/rag_pipeline.ipynb` — one cell per stage, `%autoreload`, the
+  retrieval stages shown separately (dense/sparse/fused/reranked) for tuning. **gitignored**
+  (`*.ipynb`). Full how-to/tuning/knob reference in **`16_RAG_NOTEBOOK_AND_TUNING.md`**
+  (also gitignored, local-only). `.env.example` at repo root → copy to `.env` (gitignored):
+  `OPENAI_API_KEY`, `LLAMA_CLOUD_API_KEY`, `COHERE_API_KEY`. Corpus PDFs go in
+  `data/datasheets/` (`data/` gitignored).
+- **Deps added:** `chromadb`, `cohere`, `rank-bm25`, `pdfminer-six` (+ `jupyterlab`,
+  `ipykernel` dev). All resolve on 3.14.
+
 ---
 
 ## Open items
 
-- **M4–M6 — implement the registered tool bodies (next):** `rag_search` (M4),
-  `pyspice_run` (M5), `ipc_check` (M6) are already registered, schema'd, and
-  model-callable as graceful stubs in `_ee/tools_ee.py` — fill in the logic there. The
+- **M5–M6 — implement the remaining tool bodies (next):** `pyspice_run` (M5),
+  `ipc_check` (M6) are registered, schema'd, and model-callable as graceful stubs in
+  `_ee/tools_ee.py` — fill in the logic there (M4's `_ee/tools_rag.py` → `ee_agent_rag/` is
+  the template: real logic in a framework-agnostic package, thin wrapper delegates). The
   `ee_ping` smoke tool can be removed once a real tool proves the path in production.
-- **Deferred deps**, re-add at their milestones with `uv lock --refresh` and a 3.14-wheel
-  check: voyageai / cohere / qdrant-client / llama-parse (M4 RAG), pyspice (M5 sim).
+- **M4 RAG — expand beyond datasheets (the main follow-up).** v1 is **datasheets-only**, one
+  deterministic retrieval path. The pipeline is built for more corpora but they're not wired:
+  - **Add data + corpus-specific parsers/chunkers.** `classify.py` already routes
+    standards / app_notes / textbooks / internal by folder + first-page regex, and
+    `config.DOC_TYPE_TO_CORPUS` maps them — but `chunk._CHUNKERS` only has datasheets/
+    app_notes, so `chunk_dispatch` raises `NotImplementedError` for the rest. Each new type
+    needs: a parser instruction in `parse._INSTRUCTIONS` (or reuse), a chunker (**standards**
+    = clause-aware, one chunk per numbered clause `6.2.1`; **textbooks** = heading-aware
+    ~600 tok; **internal** = heading-aware), type-specific enrich metadata
+    (standards: `standard`/`revision`/`clause`; textbooks: `book`/`chapter`), and a few
+    `MPN_PATTERNS`-style extractors. Then drop PDFs in `data/<corpus>/` and ingest.
+  - **Standards corpus caveat:** IPC-2221A vs B differ — tag `revision`, prefer latest;
+    most IPC standards are paid (use company-licensed copies / public MIL-STD for dev).
+    This corpus is what M6 `ipc_check` will lean on, so it's a natural pairing.
+  - **Then wire query routing:** v1 hardcodes/searches all corpora; add the Haiku corpus
+    classifier (`05_RAG.md` pipeline) so a query hits the right collection(s).
+  - Other deferred RAG bits: query rewriting/expansion, retrieving against the stored
+    `summary` field, the `get_standard_clause` direct-lookup tool, byte-stable chunk-id
+    determinism. Build the eval set per corpus (`RECALL_BASELINES` already has baselines).
+- **Deferred deps** for later milestones, re-add with `uv lock --refresh` + a 3.14-wheel
+  check: pyspice (M5 sim). (M4 RAG deps are **in**: chromadb, cohere, rank-bm25,
+  pdfminer-six. `voyageai`/`qdrant`/`llama-parse` were **not** used — we went OpenAI embed /
+  Chroma / LlamaParse-REST instead; do not re-add them.)
 - **Schematic — hierarchical real-symbol mode (DONE, working tree).** Goal was
   human-readable schematics from `.ato` code. KiCad has **no** schematic autorouter /
   autoplacer / autoclean (`kicad-cli sch` = erc/export/upgrade only), so the chosen design
@@ -309,5 +373,12 @@ Wires the EE tool surface through atopile's existing machinery; **no tool logic 
   + stale-file cleanup, fixing duplicate `<module>` files piling up across builds; i2c
   double-build → stable two files, ERC-clean; +3 tests (26 total), ruff clean. **Schematic
   work (sessions 11–13) still not committed/pushed.**
-- **Next** — commit/push the schematic work (sessions 11–13); then M4 (`rag_search` body)
-  on the EE-agent track, or Q2 image export.
+- Session 14 — **M4 `rag_search` retriever** built end-to-end: framework-agnostic
+  `ee_agent_rag/` package (Chroma + LlamaParse-REST + OpenAI embed + Cohere rerank, no
+  LangChain), agent wrapper `_ee/tools_rag.py`, eval runner, step-by-step tuning notebook
+  (gitignored) + local `16_RAG_NOTEBOOK_AND_TUNING.md`. Cleared the LlamaParse-SDK-on-3.14
+  blocker (REST workaround). 40 pass / 4 skip, ruff clean; **committed `fe5517d2`**
+  (datasheets-only v1; needs keys + PDFs + a ~30-Q eval to tune for real).
+- **Next** — tune M4 on a real datasheet corpus (keys + ~10 PDFs + expand eval), **and/or**
+  expand RAG to standards/app_notes/textbooks corpora (see Open items), **then** M5
+  (`pyspice_run` body). Q2 schematic image export still optional.

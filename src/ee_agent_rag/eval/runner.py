@@ -33,17 +33,30 @@ def _passes(q: dict, results: list[dict]) -> bool:
     if "must_contain_text" in q:
         needle = q["must_contain_text"].lower()
         ok &= any(needle in (r["text"] or "").lower() for r in results)
+    if "must_source_contain" in q:
+        needle = q["must_source_contain"].lower()
+        ok &= any(
+            needle in (r["citation"].get("source") or "").lower() for r in results
+        )
     return ok
 
 
 def run_eval(
-    corpus: str, dataset_path: Path, top_k: int = 5, verbose: bool = True
+    corpus: str,
+    dataset_path: Path,
+    top_k: int = 5,
+    verbose: bool = True,
+    indices: list[int] | None = None,
 ) -> dict:
+    """Recall@K over the dataset. ``indices`` (0-based) restricts to a subset —
+    re-evaluating only previous misses avoids burning paid rerank calls."""
     queries = [
         json.loads(line)
         for line in Path(dataset_path).read_text().splitlines()
         if line.strip()
     ]
+    if indices is not None:
+        queries = [queries[i] for i in indices]
     hits, misses = 0, []
     for q in queries:
         results = rag_search(q["query"], corpus=corpus, top_k=top_k)

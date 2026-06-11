@@ -60,6 +60,11 @@ class CorpusStore:
         got = self.collection.get(where={"source_hash": source_hash}, limit=1)
         return bool(got["ids"])
 
+    def delete_source(self, source_hash: str) -> None:
+        """Drop all chunks of a document — re-ingest must not leave stale chunks
+        behind when content/chunking changed (chunk ids change with content)."""
+        self.collection.delete(where={"source_hash": source_hash})
+
     def upsert(self, chunks: list[dict], embeddings: list[list[float]]) -> None:
         self.collection.upsert(
             ids=[c["metadata"]["chunk_id"] for c in chunks],

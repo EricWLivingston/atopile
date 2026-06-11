@@ -8,6 +8,7 @@ from ee_agent_rag.enrich import (
     extract_mpn_and_manufacturer,
     stable_chunk_id,
 )
+from ee_agent_rag.parse import _apply_sidecar_patch, _strip_header_title_pollution
 from ee_agent_rag.retriever import reciprocal_rank_fusion
 from ee_agent_rag.store import _scrub, _to_where, tokenize
 
@@ -98,3 +99,51 @@ def test_tokenizer_keeps_part_numbers_whole():
 
 def test_approx_tokens():
     assert approx_tokens("a" * 400) == 100
+
+
+_TITLE = "Electrical Characteristics (@ TA = 25°C)"
+_POLLUTED_TABLE = f"""\
+## {_TITLE}
+
+| {_TITLE}<br/>Parameter | {_TITLE}<br/>Min. | {_TITLE} | {_TITLE}<br/>Unit |
+| --- | --- | --- | --- |
+| Forward Voltage | 0.35 | CD0603-B0240R | V |
+"""
+
+
+def test_strip_header_title_pollution():
+    out = _strip_header_title_pollution(_POLLUTED_TABLE)
+    lines = out.splitlines()
+    assert lines[2] == "| Parameter | Min. |  | Unit |"
+    # body rows and separator untouched
+    assert lines[3] == "| --- | --- | --- | --- |"
+    assert "| Forward Voltage | 0.35 | CD0603-B0240R | V |" in out
+    # idempotent, and clean headers pass through unchanged
+    assert _strip_header_title_pollution(out) == out
+
+
+def test_strip_header_pollution_ignores_unrelated_br():
+    # cells with <br/> but no shared prefix must not be rewritten
+    md = "| A<br/>x | B<br/>y |\n| --- | --- |\n| 1 | 2 |\n"
+    assert _strip_header_title_pollution(md) == md
+
+
+def test_sidecar_patch_applies_and_skips_unsafe(tmp_path, recwarn):
+    import json
+
+    cache = tmp_path / "abc.md"
+    patch = [
+        {"find": "| 0.43 | 0.5 |  |", "replace": "|  | 0.43 | 0.5 |", "note": "shift"},
+        {"find": "not present", "replace": "x", "note": "stale entry"},
+        {"find": "row", "replace": "x", "note": "ambiguous entry"},
+    ]
+    (tmp_path / "abc.patch.json").write_text(json.dumps(patch))
+    md = "row one | 0.43 | 0.5 |  |\nrow two\n"
+    out = _apply_sidecar_patch(md, cache)
+    assert "|  | 0.43 | 0.5 |" in out
+    assert "row two" in out  # ambiguous 'row' entry not applied
+    assert len(recwarn) == 2  # stale + ambiguous both warned
+
+
+def test_sidecar_patch_noop_without_file(tmp_path):
+    assert _apply_sidecar_patch("text", tmp_path / "none.md") == "text"

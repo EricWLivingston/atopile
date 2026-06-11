@@ -3,11 +3,18 @@
 Uses the ``dimensions`` request param (Matryoshka truncation) so EMBED_DIM is a single
 tunable. ``input_type`` has no OpenAI equivalent — the same model is used for documents
 and queries, which is correct for OpenAI embeddings.
+
+Query embeddings are cached on disk (keyed by model|dim|text hash): embeddings are
+deterministic, so the cache is lossless and makes repeated eval runs free. Document
+embeddings are not cached here — ingest already skips unchanged files by source hash.
 """
 
 from __future__ import annotations
 
-from .config import EMBED_BATCH_SIZE, EMBED_DIM, EMBED_MODEL
+import hashlib
+import json
+
+from .config import EMBED_BATCH_SIZE, EMBED_CACHE, EMBED_DIM, EMBED_MODEL
 
 
 class OpenAIEmbedder:
@@ -33,4 +40,11 @@ class OpenAIEmbedder:
         return self._embed(texts)
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed([text])[0]
+        key = hashlib.sha256(f"{self.model}|{self.dim}|{text}".encode()).hexdigest()
+        cache = EMBED_CACHE / f"{key}.json"
+        if cache.exists():
+            return json.loads(cache.read_text())
+        vec = self._embed([text])[0]
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(vec))
+        return vec

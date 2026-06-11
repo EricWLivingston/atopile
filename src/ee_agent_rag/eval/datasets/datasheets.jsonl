@@ -1,4 +1,50 @@
-{"query": "What is the typical quiescent current of the TLV713P?", "must_contain_mpn": "TLV713P", "must_contain_section": "Electrical"}
-{"query": "TLV713P maximum input voltage absolute rating", "must_contain_mpn": "TLV713P", "must_contain_section": "Absolute Maximum"}
-{"query": "TPS62840 minimum input voltage", "must_contain_mpn": "TPS62840", "must_contain_section": "Recommended Operating"}
-{"query": "TPS62840 quiescent current Iq", "must_contain_mpn": "TPS62840", "must_contain_section": "Electrical"}
+{"query": "What is the maximum repetitive peak reverse voltage of the CD0603-B0340R Schottky diode?", "must_source_contain": "CD0603", "must_contain_section": "Absolute Maximum"}
+{"query": "Which small leadless chip diode is suitable for high frequency rectification in switch mode power supplies?", "must_source_contain": "CD0603"}
+{"query": "CM02X5R104M06AH capacitance and voltage rating", "must_source_contain": "CM02X5R"}
+{"query": "How do I decode a Kyocera multilayer ceramic chip capacitor part number?", "must_source_contain": "CM02X5R", "must_contain_text": "X5R"}
+{"query": "What qualification standard are Panasonic ERJ thick film chip resistors rated to for automotive use?", "must_source_contain": "ERJ2GE", "must_contain_text": "AEC-Q200"}
+{"query": "How is the resistance value encoded in the ERJ resistor part number?", "must_source_contain": "ERJ2GE"}
+{"query": "What is the rated current of the LQG15HN 1.6 nH chip inductor?", "must_source_contain": "LQG15HN"}
+{"query": "Which Murata chip inductor series is designed for high frequency mobile phone circuits like PA and VCO?", "must_source_contain": "LQG15HN"}
+{"query": "What is the typical propagation delay of the MC100EP51 differential clock D flip-flop?", "must_source_contain": "MC100EP51"}
+{"query": "What happens to the EP51 flip-flop clock inputs when they are left open?", "must_source_contain": "MC100EP51"}
+{"query": "What is the internal voltage reference of the MCP4728 DAC?", "must_source_contain": "MCP4728", "must_contain_text": "2.048"}
+{"query": "What output voltage range does the MCP4728 provide using the internal reference with gain setting of 2?", "must_source_contain": "MCP4728", "must_contain_text": "4.096"}
+{"query": "Which quad DAC stores its settings in nonvolatile memory so outputs are restored immediately after power-up?", "must_source_contain": "MCP4728", "must_contain_mpn": "MCP4728"}
+{"query": "What is the switching frequency of the NCP6334B buck converter?", "must_source_contain": "NCP6334"}
+{"query": "What input voltage range does the NCP6334B operate from?", "must_source_contain": "NCP6334", "must_contain_text": "5.5"}
+{"query": "How can I translate an I2C bus between 1.8 V and 5 V without a direction pin?", "must_source_contain": "NVT2008"}
+{"query": "What is the ON-state resistance of the NVT2008 translator switch?", "must_source_contain": "NVT2008"}
+{"query": "What is the maximum on-resistance of the Si2366DS at VGS = 4.5 V?", "must_source_contain": "SI2366"}
+{"query": "Which 30 V N-channel MOSFET in SOT-23 works as a load switch for portable applications?", "must_source_contain": "SI2366"}
+{"query": "What is the maximum data rate of the SP3088E transceiver?", "must_source_contain": "SP3088"}
+{"query": "What is the receiver output state of the SP3088E when the bus lines are left undriven or shorted?", "must_source_contain": "SP3088"}
+{"query": "What is the dropout voltage of the SPX3819 at full load?", "must_source_contain": "SPX3819", "must_contain_text": "340"}
+{"query": "SPX3819 quiescent current", "must_source_contain": "SPX3819"}
+{"query": "What is the gain-bandwidth product of the LMV324 op amp?", "must_source_contain": "lmv324"}
+{"query": "Which low-voltage op amp family has rail-to-rail output and an input common-mode range that includes ground?", "must_source_contain": "lmv324"}
+{"query": "What is the maximum system clock frequency of the RM46L852 microcontroller?", "must_source_contain": "rm46l852", "must_contain_text": "220"}
+{"query": "How much program flash and RAM does the RM46L852 provide?", "must_source_contain": "rm46l852"}
+{"query": "Which microcontroller has dual CPUs running in lockstep for safety-critical applications?", "must_source_contain": "rm46l852", "must_contain_text": "lockstep"}
+{"query": "What is the typical quiescent current of the TPS61030 boost converter?", "must_source_contain": "tps61030", "must_contain_mpn": "TPS61030"}
+{"query": "Which boost converter can deliver 1 A at 5 V from an input as low as 1.8 V?", "must_source_contain": "tps61030"}
+{"query": "What inductor value is recommended for a typical TPS61030 application?", "must_source_contain": "tps61030", "must_contain_text": "6.8"}
+{"query": "What input capacitor is recommended to improve transient and EMI behavior of the TPS61030?", "must_source_contain": "tps61030"}
+{"query": "How do I set the output voltage of an adjustable TPS61030 boost converter?", "must_source_contain": "tps61030", "must_contain_mpn": "TPS61030"}
+{"query": "How does the NCP6334B buck converter behave at light load currents?", "must_source_contain": "NCP6334", "must_contain_text": "PFM"}
+{"query": "What should be connected to the SPX3819 bypass pin for low-noise operation?", "must_source_contain": "SPX3819"}
+{"query": "What output capacitor considerations keep the SPX3819 LDO stable?", "must_source_contain": "SPX3819"}
+{"query": "How should the NVT2008 enable pin be connected in an always-on application?", "must_source_contain": "NVT2008"}
+{"query": "Do I need pull-up resistors on the bus side of the NVT2008 when devices are open-drain?", "must_source_contain": "NVT2008"}
+{"query": "How can the LMV324 op amp drive a large capacitive load without oscillating?", "must_source_contain": "lmv324", "must_contain_text": "isolation"}
+{"query": "Why does direct capacitive loading cause an op amp buffer to ring or oscillate?", "must_source_contain": "lmv324", "must_contain_text": "phase"}
+{"query": "How many SP3088E transceivers can share one RS-485 bus?", "must_source_contain": "SP3088", "must_contain_text": "256"}
+{"query": "What protection does the SP3088E provide when a board is hot-plugged into a live backplane?", "must_source_contain": "SP3088"}
+{"query": "How do I update all four MCP4728 DAC outputs simultaneously?", "must_source_contain": "MCP4728", "must_contain_text": "LDAC"}
+{"query": "What happens to the MCP4728 outputs in power-down mode?", "must_source_contain": "MCP4728"}
+{"query": "What supply configurations let the MC100EP51 operate in PECL and NECL modes?", "must_source_contain": "MC100EP51", "must_contain_text": "PECL"}
+{"query": "What core and I/O supply voltages does the RM46L852 require?", "must_source_contain": "rm46l852", "must_contain_text": "1.32"}
+{"query": "How does the maximum forward current of the CD0603 Schottky diode change with ambient temperature?", "must_source_contain": "CD0603"}
+{"query": "What is the total gate charge of the Si2366DS MOSFET?", "must_source_contain": "SI2366"}
+{"query": "What is the minimum self-resonant frequency of the LQG15HN 1.6 nH inductor?", "must_source_contain": "LQG15HN", "must_contain_text": "6000"}
+{"query": "What is the rated power of a 0402 size ERJ thick film chip resistor?", "must_source_contain": "ERJ2GE"}

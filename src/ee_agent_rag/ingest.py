@@ -30,9 +30,19 @@ def _sha256(path: Path) -> str:
 
 
 def ingest_one(
-    path: Path, *, force: bool = False, with_summaries: bool | None = None
+    path: Path,
+    *,
+    force: bool = False,
+    reparse: bool = False,
+    with_summaries: bool | None = None,
 ) -> dict:
-    """Ingest a single document. Returns a status dict."""
+    """Ingest a single document. Returns a status dict.
+
+    ``force`` re-chunks/re-embeds/re-stores even if the source is unchanged but
+    **reuses the cached parse** — it must never silently clobber a parse that was
+    produced with special settings (e.g. premium mode). Pass ``reparse=True`` to
+    also bust the parse cache (after changing the parser instruction).
+    """
     path = Path(path)
     doc_type = classify(path)
     corpus = DOC_TYPE_TO_CORPUS[doc_type]
@@ -41,8 +51,9 @@ def ingest_one(
     store = CorpusStore(corpus)
     if not force and store.has_source(source_hash):
         return {"status": "skipped", "reason": "unchanged", "path": str(path)}
+    store.delete_source(source_hash)  # no stale chunks if content/chunking changed
 
-    parsed_md = parse(path, doc_type, force=force)
+    parsed_md = parse(path, doc_type, force=reparse)
     raw_chunks = chunk_dispatch(parsed_md, doc_type)
     enriched = enrich(
         raw_chunks,
@@ -67,11 +78,13 @@ def ingest_one(
     }
 
 
-def ingest_many(paths: list[Path], *, force: bool = False) -> list[dict]:
+def ingest_many(
+    paths: list[Path], *, force: bool = False, reparse: bool = False
+) -> list[dict]:
     results = []
     for p in paths:
         try:
-            results.append(ingest_one(p, force=force))
+            results.append(ingest_one(p, force=force, reparse=reparse))
         except Exception as e:  # noqa: BLE001 - report, keep going
             results.append({"status": "error", "path": str(p), "error": str(e)})
         print(results[-1])
@@ -81,9 +94,18 @@ def ingest_many(paths: list[Path], *, force: bool = False) -> list[dict]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Ingest documents into the RAG store.")
     ap.add_argument("paths", nargs="+", type=Path)
-    ap.add_argument("--force", action="store_true", help="re-parse + re-ingest")
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="re-ingest even if unchanged (reuses the cached parse)",
+    )
+    ap.add_argument(
+        "--reparse",
+        action="store_true",
+        help="also bust the parse cache (paid LlamaParse call per doc)",
+    )
     args = ap.parse_args()
-    ingest_many(args.paths, force=args.force)
+    ingest_many(args.paths, force=args.force or args.reparse, reparse=args.reparse)
 
 
 if __name__ == "__main__":

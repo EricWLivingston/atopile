@@ -38,26 +38,61 @@ def reciprocal_rank_fusion(*ranked_lists: list[dict], k: int = RRF_K) -> list[di
 
 
 def _cohere_rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]:
-    """Rerank ``candidates`` (dicts with ``content``) with Cohere; attach ``score``."""
+    """Rerank ``candidates`` (dicts with ``content``) with Cohere; attach ``score``.
+
+    Responses are disk-cached: rerank is deterministic in (model, query, documents,
+    top_n), so the cache is lossless and repeated runs over unchanged candidates are
+    free (matters for eval-driven tuning, where most queries don't change between
+    iterations).
+    """
     if not candidates:
         return []
     key = os.environ.get("COHERE_API_KEY")
     if not key:
         raise RuntimeError("COHERE_API_KEY is not set. Add it to your .env.")
 
-    import cohere
+    import hashlib
+    import json
 
-    client = cohere.ClientV2(api_key=key)
-    resp = client.rerank(
-        model=RERANK_MODEL,
-        query=query,
-        documents=[c["content"] for c in candidates],
-        top_n=min(top_k, len(candidates)),
-    )
+    from .config import RERANK_CACHE
+
+    documents = [c["content"] for c in candidates]
+    top_n = min(top_k, len(candidates))
+    digest = hashlib.sha256(
+        json.dumps([RERANK_MODEL, query, top_n, documents]).encode()
+    ).hexdigest()
+    cache_path = RERANK_CACHE / f"{digest}.json"
+
+    if cache_path.exists():
+        ranked = json.loads(cache_path.read_text())
+    else:
+        import time
+
+        import cohere
+
+        client = cohere.ClientV2(api_key=key)
+        for attempt in range(4):
+            try:
+                resp = client.rerank(
+                    model=RERANK_MODEL, query=query, documents=documents, top_n=top_n
+                )
+                break
+            except cohere.errors.TooManyRequestsError:
+                # Trial keys allow 10 calls/min; back off and retry.
+                if attempt == 3:
+                    raise
+                time.sleep(20.0 * (attempt + 1))
+        ranked = [
+            {"index": r.index, "relevance_score": r.relevance_score}
+            for r in resp.results
+        ]
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(ranked))
+
     out = []
-    for r in resp.results:
-        hit = dict(candidates[r.index])
-        hit["score"] = r.relevance_score
+    for r in ranked:
+        hit = dict(candidates[r["index"]])
+        hit["score"] = r["relevance_score"]
         out.append(hit)
     return out
 

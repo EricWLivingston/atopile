@@ -61,12 +61,20 @@ TEXTBOOK_OVERLAP_TOKENS = 100
 INTERNAL_MAX_TOKENS = 1500
 
 # --- Storage roots ----------------------------------------------------------------
-DATA_ROOT = Path(os.environ.get("EE_DATA_ROOT", "./data")).resolve()
+# Default anchors at the *source tree* (<repo>/data), NOT the cwd: the backend server's
+# cwd is the opened project, so a cwd-relative default would silently point the agent's
+# rag_search at an empty store. EE_DATA_ROOT still overrides.
+_REPO_DATA = Path(__file__).resolve().parents[2] / "data"
+DATA_ROOT = Path(os.environ.get("EE_DATA_ROOT", _REPO_DATA)).resolve()
 PARSED_CACHE = DATA_ROOT / ".parsed_cache"  # parsed markdown, keyed by source hash
 CHROMA_PATH = Path(
     os.environ.get("EE_CHROMA_PATH", str(DATA_ROOT / ".chroma"))
 ).resolve()
 BM25_DIR = DATA_ROOT / ".bm25"
+# Disk caches for paid query-time calls (identical inputs -> identical outputs, so
+# caching is lossless). Keyed by content hash; safe to delete anytime.
+EMBED_CACHE = DATA_ROOT / ".embed_cache"  # query embeddings
+RERANK_CACHE = DATA_ROOT / ".rerank_cache"  # Cohere rerank responses
 
 # --- Recall@5 baselines (eval gate) -----------------------------------------------
 RECALL_BASELINES: dict[Corpus, float] = {

@@ -1,0 +1,43 @@
+* ee_agent_spice bundled device models (v1: passives + sources + discretes).
+*
+* The runner auto-.includes this file, so an agent-authored netlist can reference these
+* model names directly (e.g. `D1 a k Dgen`, `Q1 c b e Q2N3904`, `M1 d g s s NMOS_GEN`)
+* without knowing any file paths. Generic, first-order models — good enough to verify
+* topology/behaviour (oscillation, switching, rectification), not vendor-accurate specs.
+* For accurate parts the agent should inline a vendor .model from a datasheet/rag_search.
+
+* --- Diodes -------------------------------------------------------------------------
+* Generic small-signal silicon diode (~0.7 V drop).
+.model Dgen   D(IS=1e-14 RS=10 N=1.0 CJO=2p BV=75 IBV=1e-6)
+* Generic Schottky (~0.3 V drop).
+.model Dschottky D(IS=1e-7 RS=2 N=1.05 CJO=10p BV=40)
+* Red LED (~1.8 V forward).
+.model DLED   D(IS=1e-18 RS=4 N=2.0 CJO=15p)
+
+* --- Bipolar transistors -------------------------------------------------------------
+* 2N3904 NPN general purpose.
+.model Q2N3904 NPN(IS=6.7e-15 BF=200 VAF=100 IKF=0.3 ISE=6.7e-15 NE=1.5 RB=10 RC=1 CJE=4.5p CJC=3.6p TF=0.3n TR=240n)
+* 2N3906 PNP general purpose.
+.model Q2N3906 PNP(IS=1e-14 BF=180 VAF=100 IKF=0.1 ISE=1e-13 NE=1.5 RB=10 RC=2 CJE=8p CJC=9.7p TF=0.6n TR=34n)
+
+* --- MOSFETs (level 1; logic-level thresholds) --------------------------------------
+* Generic N-channel (Vth ~ 2 V).
+.model NMOS_GEN NMOS(LEVEL=1 VTO=2.0 KP=20u GAMMA=0.5 LAMBDA=0.02 CGSO=5p CGDO=5p)
+* Generic P-channel (Vth ~ -2 V).
+.model PMOS_GEN PMOS(LEVEL=1 VTO=-2.0 KP=10u GAMMA=0.5 LAMBDA=0.02 CGSO=5p CGDO=5p)
+
+* --- Op-amps --------------------------------------------------------------------------
+* Ideal op-amp, 3-pin (non-inverting in, inverting in, out): `X1 inp inn out OPAMP_IDEAL`.
+* Single-pole: A0 = 100k, fp = 10 Hz -> GBW ~ 1 MHz; Rin 10 Meg differential, Rout 10.
+* NO supply rails -> the output does NOT clip. If saturation matters (comparators,
+* railing oscillators), inline a vendor .subckt or clamp the output yourself.
+.subckt OPAMP_IDEAL inp inn out
+Rin inp inn 10Meg
+* gain stage with a single pole at 10 Hz (1k * 15.915u)
+Eg p1 0 inp inn 1e5
+Rp p1 p2 1k
+Cp p2 0 15.915u
+* unity buffer behind a small output resistance
+Eo o1 0 p2 0 1
+Ro o1 out 10
+.ends OPAMP_IDEAL

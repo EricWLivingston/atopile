@@ -38,7 +38,8 @@ def get_ee_tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Search the engineering knowledge base (datasheets, standards, app "
                 "notes, atopile examples/docs) and return ranked, cited chunks. Use to "
-                "ground design decisions in sources rather than guessing."
+                "ground design decisions in sources rather than guessing. Call "
+                "skill_read('rag_search') before first use for scope/when-to-use rules."
             ),
             "parameters": {
                 "type": "object",
@@ -73,23 +74,47 @@ def get_ee_tool_definitions() -> list[dict[str, Any]]:
             "type": "function",
             "name": "pyspice_run",
             "description": (
-                "Run a SPICE analysis (DC operating point, transient, or AC small-"
-                "signal) on a netlist and return probed results. Use to verify "
-                "circuit behaviour against spec."
+                "Run an ngspice analysis on a SPICE netlist you author and return "
+                "summary stats per probe. ONLY for analog subcircuits with a definable "
+                "spec (oscillator frequency, LDO/RC transient, filter cutoff, bias "
+                "point). Do NOT simulate purely-digital logic (use "
+                "design_diagnostics), datasheet-answerable specs (use rag_search), or "
+                "whole boards — scope each run to the minimal subcircuit. Call "
+                "skill_read('pyspice_run') "
+                "before your first simulation for netlist/model/scope rules. "
+                "Pass the circuit body in 'netlist' (device lines only; ground is node "
+                "0 — do NOT add .tran/.ac/.op or .end, they are generated from "
+                "'analysis'/'params'). Bundled models you may reference without an "
+                ".include: Dgen, Dschottky, DLED, Q2N3904, Q2N3906, NMOS_GEN, PMOS_GEN,"
+                " OPAMP_IDEAL (X1 inp inn out OPAMP_IDEAL; GBW ~1 MHz, no rails/no "
+                "clipping); for accurate parts inline a vendor .model. Raw waveforms "
+                "go to "
+                "result_file (.npz); you get min/max/mean only."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "netlist_path": {"type": "string"},
+                    "netlist": {
+                        "type": "string",
+                        "description": (
+                            "SPICE circuit body (device lines, plus any .model/.subckt/"
+                            ".param). No analysis cards or .end."
+                        ),
+                    },
+                    "netlist_path": {
+                        "type": ["string", "null"],
+                        "description": "Alternative to 'netlist': path to a deck.",
+                    },
                     "analysis": {
                         "type": "string",
-                        "enum": ["dc", "ac", "tran"],
+                        "enum": ["op", "dc", "ac", "tran"],
                     },
                     "params": {
                         "type": "object",
                         "description": (
-                            "Analysis-specific parameters, e.g. "
-                            "{\"t_end\": \"10ms\", \"t_step\": \"10us\"}."
+                            "Analysis params. tran: {t_step,t_end,uic?}; ac: "
+                            "{variation(dec|lin|oct),n_points,f_start,f_stop}; dc: "
+                            "{source,start,stop,step}; op: {}."
                         ),
                         "additionalProperties": True,
                     },
@@ -97,11 +122,14 @@ def get_ee_tool_definitions() -> list[dict[str, Any]]:
                         "type": "array",
                         "items": {"type": "string"},
                         "default": [],
-                        "description": "Node or device names to record.",
+                        "description": (
+                            "Nodes/currents to record: a node name ('out' or 'v(out)') "
+                            "or a source current ('i(v1)'). Empty = all nodes."
+                        ),
                     },
                     "project_path": {"type": ["string", "null"]},
                 },
-                "required": ["netlist_path", "analysis"],
+                "required": ["analysis"],
                 "additionalProperties": False,
             },
         },
@@ -111,7 +139,8 @@ def get_ee_tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Check the built design against IPC standards (IPC-2221B trace "
                 "width/clearance, IPC-2152 current capacity) using declared net "
-                "currents and the PCB layout. Returns findings cited to clauses."
+                "currents and the PCB layout. Returns findings cited to clauses. Call "
+                "skill_read('ipc_check') before first use for scope/when-to-use rules."
             ),
             "parameters": {
                 "type": "object",
@@ -126,6 +155,42 @@ def get_ee_tool_definitions() -> list[dict[str, Any]]:
                     "copper_weight_oz": {"type": "number", "default": 1.0},
                     "project_path": {"type": ["string", "null"]},
                 },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "skills_list",
+            "description": (
+                "List every available skill (id + one-line description). Skills are "
+                "specialized guidance docs you can load on demand; the always-loaded "
+                "core skills are flagged. Call this to discover guidance before a "
+                "specialized task, then load one with skill_read."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "type": "function",
+            "name": "skill_read",
+            "description": (
+                "Read one skill's full guidance doc on demand. Use skills_list to find "
+                "the id. For EE tools, read the matching skill before first use (e.g. "
+                "skill_read('pyspice_run') before simulating) to get scope/when-to-use "
+                "rules and avoid wasted work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "description": "Skill id from skills_list, e.g. 'pyspice_run'.",
+                    },
+                },
+                "required": ["skill_id"],
                 "additionalProperties": False,
             },
         },

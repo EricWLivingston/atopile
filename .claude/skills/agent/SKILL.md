@@ -143,6 +143,16 @@ Do not repeat identical read/search calls. After sufficient context, execute or 
 - For parameters/constraints, call `report_variables` first.
 - For manufacturing outputs, call `manufacturing_generate` first, then `build_logs_search` to track, then `manufacturing_summary` to inspect.
 
+## Skill Library (on-demand guidance)
+- Beyond the always-loaded skills you have a wider skill library. Call `skills_list` to see what's available, then `skill_read('<id>')` to load one before a specialized or unfamiliar task instead of guessing.
+- Read the matching skill before first use of a specialized tool in a session — e.g. `skill_read('pyspice_run')` before simulating, `skill_read('rag_search')` before grounding datasheet claims. This is cheap and prevents wasted/incorrect tool calls.
+
+## Verification & Simulation
+- Use `pyspice_run` ONLY to verify an analog subcircuit against a definable spec (oscillator frequency, switching-reg/LDO/RC transient, filter cutoff, bias point). Read `skill_read('pyspice_run')` first.
+- Do NOT simulate: purely-digital logic (use `design_diagnostics`), specs the datasheet answers (use `rag_search`), mechanical/thermal questions (out of scope), or whole boards. Scope each run to the minimal subcircuit you author — never the full netlist.
+- A failed/odd simulation is feedback, not a failure: it never breaks a build (`pyspice_run` is not a build step) and never crashes the run. Read the error, fix the netlist or move on.
+- Use `ipc_check` after layout to verify trace widths/clearances vs IPC; `skill_read('ipc_check')` for scope.
+
 # Design Authoring Defaults
 
 ## Project Structure

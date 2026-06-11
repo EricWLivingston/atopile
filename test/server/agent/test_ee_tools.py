@@ -15,7 +15,14 @@ import pytest
 
 from atopile.server.agent import mediator_catalog, tools
 
-_EE_TOOLS = {"ee_ping", "rag_search", "pyspice_run", "ipc_check"}
+_EE_TOOLS = {
+    "ee_ping",
+    "rag_search",
+    "pyspice_run",
+    "ipc_check",
+    "skills_list",
+    "skill_read",
+}
 _REAL_TOOLS = {"rag_search", "pyspice_run", "ipc_check"}
 
 
@@ -58,10 +65,7 @@ def test_ee_ping_defaults_empty_message():
     assert result == {"ok": True, "echo": ""}
 
 
-@pytest.mark.parametrize(
-    ("name", "milestone"),
-    [("pyspice_run", "M5"), ("ipc_check", "M6")],
-)
+@pytest.mark.parametrize(("name", "milestone"), [("ipc_check", "M6")])
 def test_real_tool_stubs_return_gracefully(name: str, milestone: str):
     result = asyncio.run(
         tools.execute_tool(
@@ -70,6 +74,18 @@ def test_real_tool_stubs_return_gracefully(name: str, milestone: str):
     )
     assert result["ok"] is False
     assert milestone in result["error"]
+
+
+def test_pyspice_run_implemented_degrades_without_analysis():
+    # pyspice_run is live (M5); with no analysis it must reject gracefully
+    # (success=False), not raise. (Wrapper behaviour in test_ee_pyspice_tool.)
+    result = asyncio.run(
+        tools.execute_tool(
+            name="pyspice_run", arguments={}, project_root=Path("."), ctx=None
+        )
+    )
+    assert result["success"] is False
+    assert result["errors"][0]["type"] == "invalid_analysis"
 
 
 def test_rag_search_implemented_degrades_without_query():

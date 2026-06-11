@@ -77,6 +77,7 @@ dependencies = [
     "cohere",
     "rank-bm25",
     "pdfminer-six",
+    "pyspice",
 ]
 
 [project.urls]
@@ -132,7 +133,7 @@ artifacts = [
     "**/visualizer/web/dist",
     "**/dashboard/web/dist",
 ]
-packages = ["src/faebryk", "src/atopile", "src/ee_agent_rag"]
+packages = ["src/faebryk", "src/atopile", "src/ee_agent_rag", "src/ee_agent_spice"]
 exclude = ["**/.zig-cache", "**/.zig-cache/**", "**/zig-out", "**/zig-out/**"]
 
 [tool.hatch.build.targets.wheel.hooks.scikit-build]

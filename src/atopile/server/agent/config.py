@@ -87,14 +87,23 @@ class AgentConfig:
             _parse_fixed_skill_token_budgets,
         )
 
-        # Load .env from the project root (if present) so API keys are available.
-        # The backend is launched with cwd set to the opened project root (see the
-        # VS Code extension's backendServer spawn), so search from the working
-        # directory upward rather than from this source file's location.
+        # Load .env so API keys / EE_AGENT_PROVIDER are available. The backend is
+        # launched with cwd set to the *opened project* root (see the VS Code
+        # extension's backendServer spawn), which is usually NOT inside the atopile
+        # checkout — so a cwd-only search misses this fork's gitignored repo-root
+        # `.env` and the provider silently falls back to the openai default with no
+        # key (run fails instantly; the UI just shows "thinking..."). Search the cwd
+        # first (so a project can ship its own `.env`), then fall back to the atopile
+        # source-tree root. load_dotenv defaults to override=False, so the cwd `.env`
+        # wins on any overlapping key.
         try:
             from dotenv import find_dotenv, load_dotenv
 
             load_dotenv(find_dotenv(usecwd=True))
+            # src/atopile/server/agent/config.py -> repo root is 4 parents up.
+            repo_env = Path(__file__).resolve().parents[4] / ".env"
+            if repo_env.is_file():
+                load_dotenv(repo_env)
         except ImportError:
             pass
 

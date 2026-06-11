@@ -656,6 +656,26 @@ _TOOL_DIRECTORY: dict[str, ToolDirectoryItem] = {
         keywords=["ipc", "trace width", "clearance", "current capacity", "drc"],
         tool_role="execution",
     ),
+    "skills_list": ToolDirectoryItem(
+        name="skills_list",
+        category="research",
+        purpose="List available on-demand skills (specialized guidance docs).",
+        tooltip="Discover specialized guidance you can load before a task.",
+        inputs=[],
+        typical_output="skills (id, description, always_loaded)",
+        keywords=["skill", "guidance", "help", "how to", "discover", "recipe"],
+        tool_role="discovery",
+    ),
+    "skill_read": ToolDirectoryItem(
+        name="skill_read",
+        category="research",
+        purpose="Read one skill's full guidance doc on demand.",
+        tooltip="Load specialized guidance (e.g. when/how to use a tool) just-in-time.",
+        inputs=["skill_id"],
+        typical_output="body (skill markdown)",
+        keywords=["skill", "guidance", "help", "scope", "when to use", "pyspice"],
+        tool_role="discovery",
+    ),
 }
 
 

@@ -27,7 +27,9 @@
 | **M5 — `pyspice_run` runner** (PySpice + libngspice; agent-authored netlist; passives + sources + discretes + `OPAMP_IDEAL`) | ✅ done & committed |
 | **Skill-discovery tools** (`skills_list`/`skill_read` + per-tool guidance skills) | ✅ done & committed |
 | **Agent run-log viewer** (Logs-tab "Agent" mode; streams `agent_events`) — *off-roadmap; built on request* | ✅ done & committed |
-| M6 — `ipc_check` — *registered stub; body TBD* | ⏳ next (M6) |
+| **Dynamic model routing** (per-turn complexity classifier → Haiku/Sonnet/Opus tiers; `EE_AGENT_DYNAMIC_MODEL=1`, anthropic-only, off by default) | ✅ done & committed |
+| **Diode auto-picking** (DIODES endpoint + `is_pickable_by_type` on `Diode`; fixes the silent "ghost component" drop) — *off-roadmap; user-reported* | ✅ done & committed |
+| M6 — `ipc_check` — *registered stub; body TBD* | ⏸ tabled (user call, session 22) |
 | M7 — end-to-end design + eval | ⬜ not started |
 
 Fork: **`github.com/EricWLivingston/atopile`**, branch **`feature/ee-agent`**. `main` is
@@ -165,6 +167,20 @@ Live Anthropic tests are behind a `integration` marker and auto-skip without a k
   and call the LlamaParse REST API directly with httpx (`ee_agent_rag/parse.py`) — same
   service / `LLAMA_CLOUD_API_KEY` / `parsing_instruction`, minus the broken (huge) tree.
   This is the template for any future LlamaIndex-adjacent dep on 3.14.
+- **Per-call model override, never provider/config mutation.** The runner + provider
+  are a module-level singleton shared by all sessions, so dynamic model selection must
+  flow as a `model` kwarg through `LLMProvider.complete()` (both providers do
+  `model or self._config.model` at payload-build); mutating config would race across
+  concurrent sessions. Switching model mid-chain is provably safe on the Anthropic
+  path (the transcript store rebuilds the full conversation per call and doesn't
+  condition on model — API-verified: payload model == served model). The OpenAI
+  Responses chain references server-side state created under one model and is
+  **unverified** → `dynamic_model` is forced off for `provider != "anthropic"`.
+  Router rules: fail-open to "standard" on any error/timeout (~5 s cap), and never
+  downshift to "simple" while a design is in progress (parser-enforced, not just
+  prompt-requested). NB the in-file `TestRunner` cases drive `run_turn` with
+  duck-typed minimal configs → new config reads in the turn path need
+  `getattr(cfg, ..., default)`.
 - **The cwd trap struck a third time: `ee_agent_rag.config.DATA_ROOT` defaulted to
   `./data` (cwd-relative).** The backend's cwd is the *opened project*, so the agent's
   `rag_search` in production would have opened an empty store at `<project>/data/.chroma`
@@ -515,6 +531,38 @@ never in the UI.
 
 ## Open items
 
+- **FOLLOW-UP — extend auto-picking to MOSFETs and other active components.** The
+  diode picker (session 23) proved the recipe; the user's call: LEDs/MOSFETs/actives
+  stay **manual-pick for now** (parametric auto-pick of actives is too coarse), but
+  the path is open. Facts to reuse: the components API already serves more classes —
+  `POST /v0/query/leds` and `/v0/query/mosfets` both exist (probed live: fake
+  endpoints 404, these return pydantic field specs; `leds` wants
+  `package, qty, forward_voltage, reverse_working_voltage, reverse_leakage_current,
+  max_current, max_brightness, color`). Recipe per class: (1) add the endpoint to
+  `Pickable.Endpoint` (`src/faebryk/library/Pickable.py`); (2) attach
+  `is_pickable_by_type.MakeChild(endpoint=…, params={...})` to the library module
+  with keys exactly matching the endpoint's field spec; (3) nothing else — request
+  dataclasses are generated dynamically (`picker/api/models.py make_dataclass`),
+  literal serialization already matches the wire format, and the post-pick verify
+  step guards mismatches. LED needs enum (`color`) serialization care; check
+  `test_pick_led_by_colour` (currently skipped "TODO: add support for diodes" —
+  unskip/adapt when LED lands). Upstream-contrib candidate alongside the diode picker.
+
+- **Silent-ghost UX (found during the diode investigation, not fixed):** a module with
+  no picker and no footprint logs only `ATTENTION: No pickers and no footprint …` and
+  the build still reports success — the part is then absent from BOM/netlist/PCB/
+  schematic while its nets remain (the "ghost"). Diodes are fixed; any other
+  unpickable type still fails this silently. Promoting the warning to a visible build
+  warning/strict error is a one-line policy change (`picker.py:165`) but changes
+  upstream-visible behavior — needs a deliberate call.
+
+- **Schematic real-symbol lookup misses some picked parts (cosmetic):**
+  `_find_symbol_file` rebuilds the parts-dir name by sanitizing
+  `has_part_picked.manufacturer` — "UNI-ROYAL(Uniroyal Elec)" ≠ cached dir
+  `UNI_ROYAL_0603WAF1002T5E`, so those parts get the generic-box fallback instead of
+  their cached real symbol (electrically complete, just less pretty). Fix idea: derive
+  the dir from the footprint lib-id prefix instead of re-sanitizing the mfr string.
+
 - **Table-fidelity suspects left for review (low priority).** The new
   `column_shift_suspect` scanner flags 5 suspects in 2 docs (both reviewed, left as-is):
   SPX3819's JEDEC package-outline table is a **genuine** shift (`A`: 1.75 = the JEDEC MAX
@@ -739,6 +787,35 @@ never in the UI.
   **`DATA_ROOT` cwd-trap fix** (see Lessons) + `.env.example` comment updated; verified
   from a foreign cwd: store resolves to `<repo>/data`, 1065 chunks visible. Suites
   101 pass / 4 skip.
-- **Next** — M6 (`ipc_check` body; pairs with the standards-corpus RAG expansion),
-  **and/or** expand RAG corpora (see Open items), **then** M7 (end-to-end design using
-  all 3 tools). Q2 schematic image export still optional.
+- Session 22 — **dynamic model routing** (user-requested; M6 tabled): per-turn
+  complexity classifier (`_ee/model_router.py`, Haiku call, fail-open to standard,
+  parser-enforced no-downshift while a design is in progress) →
+  Haiku 4.5 / Sonnet 4.6 / Opus 4.8 tiers; mechanism = optional `model` kwarg through
+  `LLMProvider.complete()` (both providers; per-call, singleton-safe); runner routes
+  once per `run_turn` and threads `effective_model` through all 4 provider call sites,
+  telemetry (`model_routed` event, progress payloads, `AgentTurnResult.model`) and the
+  agent log viewer for free. Opt-in `EE_AGENT_DYNAMIC_MODEL=1`, anthropic-only
+  (config-gated), defaults off. +19 tests (`test_model_router.py`, incl. live
+  classification: easy→simple, hard board design→complex, 2.8 s); live-verified
+  payload-model == API-served-model for override + default; `claude-opus-4-8` id
+  validated. Suite 62 pass / 4 skip (+1 live), ruff clean. **Deferred:** mid-run
+  escalation on circuit-breaker/chain-recovery signals (the per-call seam now exists),
+  OpenAI-path routing. **NB:** the local `.env` pins `ATOPILE_AGENT_MODEL` to haiku
+  (old cheap-testing choice) — remove it so the standard tier is sonnet when enabling
+  routing.
+- Session 23 — **diode auto-picking** (user-reported "ghost component"): a bare
+  `new Diode` with only constraints was silently dropped from BOM/netlist/PCB/
+  schematic (picker logs `ATTENTION: No pickers and no footprint`, build still
+  green) because `Pickable.Endpoint` only wired resistors/capacitors/inductors —
+  while the live components API already serves `/v0/query/diodes` (probed: returns
+  10 real parts for VF 0.5–0.8 V in the client's own wire format). Fix: `DIODES`
+  endpoint enum entry + `is_pickable_by_type` on `Diode` with params exactly matching
+  the API field spec (~12 lines); + `test_pick_diode_by_params` (live, mirrors the
+  resistor sibling). Verified: auto-pick example now picks **D1 = LRC SM260AF**, in
+  BOM + schematic with its real symbol, ERC 0, netlist connectivity exact; picker
+  suite 32 pass / 1 skip, ruff clean. MOSFET/LED/actives expansion deliberately
+  deferred (manual-pick preferred) — see Open items FOLLOW-UP. Two adjacent findings
+  recorded as Open items (silent-ghost UX, symbol-dirname mismatch).
+- **Next** — M7 (end-to-end design + eval) and/or expand RAG corpora (see Open
+  items); M6 `ipc_check` is tabled (stub stays registered + degrades gracefully).
+  Q2 schematic image export still optional.

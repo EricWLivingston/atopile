@@ -19,10 +19,15 @@
 | M1 — fork bootstrap | ✅ done & pushed |
 | M2 — `AnthropicProvider` (dual provider, stateful, tested) | ✅ done & pushed |
 | **Schematic emitter** (label mode + wire/ladder mode) — *not on the original roadmap; built on request* | ✅ done & pushed |
-| **Schematic — hierarchical real-symbol mode** (sheet per `.ato` module, labels = valid netlist; now the build default) | ✅ done (working tree) |
+| **Schematic — hierarchical real-symbol mode** (sheet per `.ato` module, labels = valid netlist; now the build default) | ✅ done & pushed |
+| **Schematic — human-ready mode** (connectivity-clustered placement, bbox-aware cells, power/ground auto-wired via stub+oriented glyph, oriented labels, paper/title) | ✅ done & committed |
 | M3 — tool-registration plumbing (`ee_ping` smoke + 3 real-tool scaffolds) | ✅ done & pushed |
 | **M4 — `rag_search` retriever** (Chroma + LlamaParse + OpenAI embed + Cohere rerank; datasheets-only v1) | ✅ done & committed |
-| M5 `pyspice_run` · M6 `ipc_check` — *registered stubs; bodies TBD* | ⏳ next (M5) |
+| **M4 tuning + table-fidelity hardening** (14-doc corpus, 50-q eval, recall@5 = 0.98; 3 parse-defect flavors fixed: instruction → premium → sidecar patches; `table_fidelity` scanner) | ✅ done & committed |
+| **M5 — `pyspice_run` runner** (PySpice + libngspice; agent-authored netlist; passives + sources + discretes + `OPAMP_IDEAL`) | ✅ done & committed |
+| **Skill-discovery tools** (`skills_list`/`skill_read` + per-tool guidance skills) | ✅ done & committed |
+| **Agent run-log viewer** (Logs-tab "Agent" mode; streams `agent_events`) — *off-roadmap; built on request* | ✅ done & committed |
+| M6 — `ipc_check` — *registered stub; body TBD* | ⏳ next (M6) |
 | M7 — end-to-end design + eval | ⬜ not started |
 
 Fork: **`github.com/EricWLivingston/atopile`**, branch **`feature/ee-agent`**. `main` is
@@ -98,6 +103,19 @@ Live Anthropic tests are behind a `integration` marker and auto-skip without a k
   shell aren't visible to the tool shell. Resolved with a gitignored project-root **`.env`**
   sourced explicitly (`set -a; . ./.env; set +a; uv run pytest …`). `conftest.py` reads
   `os.getenv` directly (no dotenv), so the key must already be in the process env.
+- **`.env` discovery was cwd-relative → silent "thinking…" freeze.** `config.from_env()`
+  loaded the `.env` via `find_dotenv(usecwd=True)`, which walks up from the **backend's cwd
+  = the *opened project* root**, normally *outside* the atopile checkout — so the fork's
+  repo-root `.env` was never found, `EE_AGENT_PROVIDER` stayed unset → **defaulted to
+  `openai` with no key**, and the run failed instantly with `run_failed: No API key
+  configured` (visible in the agent log, **not** surfaced in the UI — the chat just sits on
+  "thinking…"). Fix: `from_env()` now also loads the source-tree repo-root `.env`
+  (`Path(__file__).resolve().parents[4]/".env"`) as a fallback after the cwd search
+  (`override=False`, so a project-local `.env` still wins). Post-mortem path correction: the
+  agent log is **`agent_logs.db`** (not `.sqlite`) under **`get_log_dir()`** =
+  `~/Library/Logs/atopile/` on macOS — `sqlite3 … "SELECT timestamp,level,event,summary FROM
+  agent_events ORDER BY id DESC"`. (Separate latent UX bug, not yet fixed: a `run_failed`
+  shows as a perpetual "thinking…" instead of surfacing the error to the chat.)
 - **`kicad.dumps` for schematics is broken** (`07_ATOPILE_GAPS.md` §2.11, proven with
   kicad-cli 10.0.3): re-dumping a known-good `.kicad_sch` fixture yields a file KiCad
   refuses to load (drops `(symbol_instances)`/`(sheet_instances)`, mis-emits `(symbol …)`).
@@ -114,6 +132,20 @@ Live Anthropic tests are behind a `integration` marker and auto-skip without a k
   short-free** by construction — every pin gets a globally unique x-lane and the routing
   channel holds no pins, so a drop can only *cross* another net (no junction) — and this is
   **verified**, not just argued, via `kicad-cli sch export netlist` membership assertions.
+  Same discipline in the human-ready mode: power stubs are **straight only** — L-shaped
+  elbows toward "pretty vertical glyphs" can land exactly on the adjacent pin's stub end
+  (2.54-pitch pin rows) and short *different* rails, so they were rejected. Straight stubs
+  + disjoint placement cells (each = bbox + 15.24 mm margin > stub 5.08 + glyph 2.54) are
+  short-free by construction; `test_schematic_placement.py` asserts cell disjointness.
+- **KiCad property text angle is *relative* to the instance rotation.** A rotated power
+  glyph rendered its net-name text vertical even with `(at x y 0)` on the property; the
+  emitter compensates with `(360 − rot) % 360` so text stays horizontal in all four glyph
+  orientations (`_power_instance_block`).
+- **Late grid-snapping breaks geometric invariants.** Snapping each placed item's absolute
+  origin independently shifts neighbors by ≤1 grid step and can collapse the inter-cell
+  gap. Rule: make all placement *inputs* lattice-valued (extents rounded up at
+  construction) so positions are sums of lattice values and never need late rounding
+  (`placement.py` module docstring).
 - **easyeda.com returns HTTP 403 (CloudFront) during part-picking**, breaking builds for
   network reasons unrelated to our code. Worked around in `lcsc.py` with a browser
   User-Agent. A cleaner upstream fix (clear error instead of cryptic `JSONDecodeError`)
@@ -133,10 +165,101 @@ Live Anthropic tests are behind a `integration` marker and auto-skip without a k
   and call the LlamaParse REST API directly with httpx (`ee_agent_rag/parse.py`) — same
   service / `LLAMA_CLOUD_API_KEY` / `parsing_instruction`, minus the broken (huge) tree.
   This is the template for any future LlamaIndex-adjacent dep on 3.14.
+- **The cwd trap struck a third time: `ee_agent_rag.config.DATA_ROOT` defaulted to
+  `./data` (cwd-relative).** The backend's cwd is the *opened project*, so the agent's
+  `rag_search` in production would have opened an empty store at `<project>/data/.chroma`
+  and degraded to `{ok:false}` (all prior end-to-end checks ran from the repo root and
+  masked it). Fix: default now anchors at the source tree
+  (`Path(__file__).parents[2]/'data'`); `EE_DATA_ROOT` still overrides. Rule of thumb by
+  now: **any default path in code the backend imports must be source-tree-anchored, never
+  cwd-relative** (same class as the session-17 `.env` fix).
 - **Chroma metadata is scalar + non-null only.** No `None`, no lists. `store._scrub` drops
   `None` (e.g. empty MPN) and JSON-encodes lists, or upsert raises. Always scrub on write.
+- **Don't trust LlamaParse instruction-following for structure you can synthesize.** It
+  silently ignored "insert `<!-- page N -->` markers" (0 markers emitted), and twice
+  collapsed an equation region *plus its prose* into a `[Diagram: …]` placeholder
+  (deleting "a 6.8 µH inductance is recommended" from the index — the only eval miss).
+  Fix: fetch the **per-page JSON result** (`…/result/json`) and synthesize page markers in
+  code (`parse.py`); treat parse-instruction wording as best-effort only.
+- **Chroma rejects duplicate ids within one upsert.** `stable_chunk_id` collided on
+  repeated headings with identical first-200-chars (table headers/boilerplate; 6 of 14
+  docs failed). Fixed by adding the chunk **ordinal** to the id — still deterministic
+  across re-ingests. Related: re-ingest now **deletes the doc's old chunks first**
+  (`store.delete_source`), else content changes leave stale chunks behind.
+- **`\b` never fires at `_`** (underscore is a regex word char) — filename-stem MPN
+  matching silently failed / left trailing-`-` artifacts until stems got `_`→space
+  treatment (`enrich.mpn_from_filename`). Every corpus PDF's MPN now resolves from
+  content regex (12 new vendor patterns) with filename fallback.
+- **LlamaParse flattens merged table cells & drifts columns** (user-caught): a value
+  spanning multiple part-number columns lands under ONE column (CD0603 VRRM), and wide
+  multi-variant pin tables shift values across columns (NVT2008) — silent spec
+  misattribution with a confident citation. Layered fix: merged-cell replication rule in
+  `DATASHEET_INSTRUCTION` (fixed CD0603), `parse(..., premium=True)` escalation for docs
+  the instruction can't fix (fixed NVT2008's pin table), permanent suspect scanner
+  `ee_agent_rag/eval/table_fidelity.py` (notebook Step 2b; reports *suspects* — sparse
+  triangular matrices are legit), and a "Parsed-table caveats" section in the
+  `rag_search` skill. **Related trap:** `ingest --force` used to also bust the parse
+  cache and silently clobbered a premium parse with a standard one — re-ingest (`force`)
+  and re-parse (`--reparse`) are now separate flags.
+- **Flavor 3 of the LlamaParse table defects — column shift from split/merged body
+  cells — is invisible to cell-count checks and unfixable by instruction.** A header
+  column whose body cells split/merge per row (CD0603 EC table's test-condition/variant
+  column) shifts every later value one column left; rows stay well-formed, so the
+  flavor-1/2 scanner passed it, and the merged-cell instruction kept the shift. Premium
+  parse fixed the alignment but replicated the **section title into every header cell**
+  via `<br/>`. Per the "synthesize what you can't trust the instruction to do" rule, the
+  pollution is stripped in code (`parse._strip_header_title_pollution`, applied on every
+  `parse()` return incl. cache hits — cache files stay raw, fix retroactive, zero new
+  parse jobs) and the flavor is now caught by a scanner heuristic
+  (`column_shift_suspect`: header has Min+Max, ≥4 rows, Min ≥80% filled, Max 100% empty).
+  **Even premium can leave individual rows shifted** (user-caught: CD0603's two
+  last-per-variant VF rows kept `Min 0.43/0.47` that are really `Typ`, with `Max 0.5`
+  dropped — verified against the PDF via a pdfminer column dump; row-level partial
+  shifts are below the table-level heuristic's radar). Last-resort rung:
+  `parse._apply_sidecar_patch` — a manual `<hash>.patch.json` beside the cache file
+  (`{find, replace, note}` list, applied on every read; an entry not matching exactly
+  once is skipped with a warning, so a `--reparse` invalidates patches safely). The
+  escalation ladder is: instruction → premium → sidecar patch.
+- **Cohere trial keys: 10 calls/min** → 429 mid-eval. `_cohere_rerank` now has 20/40/60 s
+  backoff *and* a lossless disk cache (deterministic in model|query|docs|top_n); query
+  embeddings are disk-cached too (`data/.embed_cache`, `.rerank_cache`). The cache files
+  double as the paid-call ledger; repeated evals are free.
 - **`uv add` stale-cache trap struck again** for the RAG deps (landed in `pyproject` but not
-  `uv.lock`); `uv lock --refresh` then `uv sync` fixed it, as before.
+  `uv.lock`); `uv lock --refresh` then `uv sync` fixed it, as before. **And again for
+  `pyspice` (M5)** — same fix. NB the `uv lock --refresh` re-resolution also *pruned* stale
+  transitive entries (`sqlalchemy`/`tiktoken`/`nltk`/`tinytag`/`regex`) from the env; none are
+  imported anywhere in `src/`/`test/` (grep-checked) and atopile+agent still import clean, so
+  it's harmless lock hygiene, not breakage.
+- **`02_SIMULATION.md`'s premise is wrong: atopile emits no SPICE netlist.** Grep-verified —
+  no `.cir`, no ngspice integration, no SPICE models on any library part (the only "ngspice"
+  hit is an unused field in the KiCad-netlist schema). So M5 is *not* "wrap PySpice around an
+  existing `build/<target>/netlist.cir`." Decision (user-locked): **agent authors the SPICE
+  netlist text** (the analog subcircuit it wants to verify, not the whole board); the tool
+  signature gained a `netlist` string param alongside `netlist_path`. No graph→SPICE generator
+  built (deferred). The schematic emitter's `extract_components()` remains the template if one
+  is ever wanted.
+- **libngspice isn't on macOS's default dyld path.** PySpice's `NgSpiceShared` dlopens
+  `libngspice.dylib` by bare name → `OSError` on a brew install (`/opt/homebrew/lib`). Fix:
+  `runner._ngspice_library_path()` discovers the abs path (brew dirs + `HOMEBREW_PREFIX` +
+  `EE_SPICE_NGSPICE_LIB` override + `ctypes.util.find_library` fallback) and sets
+  `NgSpiceShared.LIBRARY_PATH` (a `'…/libngspice{}.dylib'` template — the `{}` is the
+  instance-id slot, '' for id 0). Needs a one-time `brew install ngspice` (libngspice 46).
+- **ngspice's C core is a non-thread-safe process singleton, and PySpice needs a distinctly
+  *named* shared lib per simultaneous instance (`libngspiceN.dylib`).** So don't
+  `new_instance()` per call — keep **one** instance (id 0 → plain `libngspice`) behind a
+  `threading.Lock`, reset with `exec_command("destroy all")` between runs. The agent wrapper
+  already serialises via `asyncio.to_thread`; the lock makes concurrent tool calls safe.
+- **Reading results out of `NgSpiceShared`.** After `load_circuit(deck)` + `run()`: vector keys
+  are **bare node names** for voltages (`out`, not `v(out)`), `<src>#branch` for source currents
+  (`v1#branch` for `i(v1)`), and the sweep axis is `time`/`frequency`/`v-sweep`. The `Vector`
+  has **no `as_ndarray()`** — use `vec._data` (numpy array). Pick the newest non-`const` entry
+  in `plot_names` (ngspice lists current-first). `runner._resolve` maps the agent's probe
+  spelling onto these keys. PySpice prints a benign "Unsupported Ngspice version 46" warning.
+- **PySpice raises its *own* exceptions, not just empty plots.** A bad/insoluble deck makes
+  `run()` raise `NgSpiceCommandError` (e.g. singular matrix), *not* return an empty result.
+  `_run_ngspice` catches any non-`NgspiceError` from `load_circuit`/`run`, classifies the
+  captured ngspice log (`errors.classify_log`), and re-raises as a structured `NgspiceError`.
+  Log capture is via a `send_char` override on the `NgSpiceShared` subclass.
 
 ---
 
@@ -252,13 +375,165 @@ Fills in the M4 tool body. Stack locked (no LangChain): **Chroma · LlamaParse �
 
 ---
 
+### M5 — `pyspice_run` runner ✅ committed
+Fills in the M5 tool body. Stack (user-locked): **PySpice 1.5 + libngspice 46**,
+agent-authored netlist, passives + sources + **discretes** (bundled model lib). New
+framework-agnostic package **`src/ee_agent_spice/`** (knows nothing about the runner) + a
+thin agent wrapper — the M4 shape exactly.
+- **Pipeline.** `simulate(netlist, analysis, params, probes, project_root)` → `build_deck`
+  (title + agent body with trailing `.end` stripped + auto-`.include` bundled models +
+  `.save` probes + analysis control card) → `_run_ngspice` (locked singleton
+  `NgSpiceShared.load_circuit`/`run`, vectors via `vec._data`) → persist **all** vectors
+  (probes + axis) to `build/sim/<run_id>.npz`, return **per-probe min/max/mean** only
+  (context-safety, `02_SIMULATION` §5). Analyses: `op` / `dc` (sweep or → op) / `ac`
+  (mag+phase via magnitude) / `tran` (`uic` supported).
+- **Bundled models** (`models/ee_agent.lib`, auto-included): `Dgen`/`Dschottky`/`DLED`,
+  `Q2N3904`/`Q2N3906`, `NMOS_GEN`/`PMOS_GEN` — first-order, topology-accurate not
+  vendor-accurate; the schema tells the agent these names + to inline a vendor `.model` for
+  accuracy. Lib path discovery + singleton/lock + result-key naming: see Lessons.
+- **Wiring.** `_ee/tools_pyspice.py::run_pyspice` (async, `asyncio.to_thread`) resolves
+  `netlist` text **or** `netlist_path`, degrades every failure (no netlist, `ImportError` =
+  no PySpice, `OSError` = no libngspice, convergence) to `{success:false, errors:[…]}`;
+  `_ee/tools_ee.py` M5 stub swapped to delegate (passes `project_root` as `project_path`).
+  Schema in `tool_definitions_ee.py` updated: added `netlist`, made `netlist_path` optional,
+  added `op` to the enum, required only `analysis`, documented the model names. Package added
+  to `pyproject` wheel `packages`.
+- **Tests.** `test/ee_agent_spice/test_runner.py` (offline pure logic: deck assembly, control
+  cards, save targets, probe resolution, summaries, error classification) +
+  `test/ee_agent_spice/test_sim_live.py` (live, `skipif` no libngspice — asserts real
+  physics: divider bias 3.33 V, RC τ, RC low-pass passband, diode drop, convergence-failure
+  handling) + `test/server/agent/test_ee_pyspice_tool.py` (wrapper degradation/pass-through);
+  M3 stub test updated (`pyspice_run` now live). **Agent suite 70 pass / 4 skip** (the 4 are
+  Anthropic live-integration), ruff clean.
+- **Verified end-to-end** through the real `execute_tool('pyspice_run', …)` dispatch path: a
+  2-transistor **astable multivibrator** (bundled `Q2N3904`, ~68k/10µF) oscillates at
+  **1.13 Hz** — inside the M5 done-def 0.8–1.3 Hz band — railing 0.03↔5.01 V, `.npz`
+  persisted. (Astables need a tiny C asymmetry + `uic` to start in SPICE.)
+- **Deps:** `pyspice` (pulls scipy/cffi/ply) + system `brew install ngspice`. All on 3.14.
+- **Dev surface.** `notebooks/pyspice_testbed.ipynb` (gitignored via `*.ipynb`): paste a
+  netlist → deck preview → all-parameter summary table (`probes=[]` = every vector) →
+  waveform plots from the persisted `.npz` (Bode for `ac`, traces for `tran`/`dc`, bars
+  for `op`) → optional `execute_tool('pyspice_run', …)` pass. Sim outputs under
+  `notebooks/sim_runs/` (also git-invisible). Includes a paste-ready examples gallery
+  (divider/RC/rectifier/NMOS-sweep/astable). Verified by full `nbconvert --execute`.
+
+### Skill-discovery tools (`skills_list` + `skill_read`) ✅ committed
+On-demand agent skill library + per-tool guidance, so the agent can pull *how/when/scope*
+guidance just-in-time instead of always-loading it (token-efficient) — and so we can nudge
+proper tool use (e.g. don't simulate digital/datasheet-answerable/whole-board with
+`pyspice_run`).
+- **The gap.** The agent only ever loads the **3** `fixed_skill_ids` (`agent`/`ato`/
+  `planning`) into context every turn (`context.py:load_required_skill_docs`); it **never
+  scans `skills_dir`**, so the other 18 skill dirs were invisible and there was no on-demand
+  fetch / guidance tool. Putting a doc in `.claude/skills/` does **nothing** for the agent by
+  itself — discoverability comes only from a tool that reads it. (`.claude/skills/` is also
+  *Claude Code's* skill dir, so new dirs there also show up as IDE-invokable skills — harmless.)
+- **Tools (additive, `_ee/`):** `skills_list()` scans `config.skills_dir` → `[{id,
+  description, always_loaded}]` (frontmatter `description`, fallback to first heading; the 3
+  fixed ids flagged); `skill_read(skill_id)` returns the SKILL.md body (truncated via
+  `_truncate_middle`, ~12 KB), degrading to `{ok:false, available:[…]}` on unknown id.
+  `skill_read` rejects ids outside `^[A-Za-z0-9_-]+$` (path-traversal guard). Config via a
+  bare `AgentConfig()` (all defaults; no dotenv/provider side-effects). Lives in
+  `_ee/tools_skills.py`; handlers in `tools_ee.py`; schemas in `tool_definitions_ee.py`;
+  directory entries in `mediator_catalog.py` (category `research`, `discovery`).
+- **Per-tool guidance docs (real deliverable)** as ordinary skills in the same dir:
+  `.claude/skills/{pyspice_run,rag_search,ipc_check}/SKILL.md`. `pyspice_run` is the governor
+  (when/when-NOT/scope=minimal-subcircuit, models, params, probing, astable start-up tip,
+  "a failed sim is feedback not a build failure"); `rag_search` (ground vs web_search,
+  citations, datasheets-only caveat); `ipc_check` is a **seed** (M6 forthcoming, returns a
+  stub). **Hook for future tools = drop `.claude/skills/<tool>/SKILL.md`** — auto-discovered,
+  no code change.
+- **Always-on nudge** (the bit that makes it fire): `# Tool Usage Recipes` in
+  `.claude/skills/agent/SKILL.md` gained `## Skill Library` ("call `skills_list`, then
+  `skill_read('<id>')` before a specialized task") + `## Verification & Simulation` (the
+  pyspice gate). **Three reinforcing awareness layers** (the agent never scans a folder):
+  (1) the runner sends *all* tool definitions+descriptions to the model every turn
+  (`runner.py:440,565`) so it always sees `skills_list`/`skill_read`; (2) the always-loaded
+  `agent/SKILL.md` Skill-Library nudge; (3) each guidance-bearing tool's **own description**
+  ends with `call skill_read('<tool>') before first use` — added to **all three**
+  (`pyspice_run`/`rag_search`/`ipc_check`) so they self-advertise their skill identically.
+- **Verified:** `test/server/agent/test_ee_skills.py` (7 offline: discovery, fixed-flagging,
+  body fetch, unknown→available, traversal-reject, frontmatter parse) + `test_ee_tools.py`
+  consistency set updated. Agent suite **44 pass / 4 skip**, ruff clean. End-to-end via
+  `execute_tool`: `skills_list`→24 skills (3 flagged), `skill_read('pyspice_run')`→5 KB body,
+  and `build_system_prompt` renders the new recipes. **`pyspice_run` is not a build step**
+  (grep-confirmed) — a wrong sim never fails `ato build`; worst case is wasted turns, which
+  the guidance curbs.
+
+### Agent run-log viewer (Logs tab "Agent" mode) ✅ committed
+Surfaces the agent's **own run log** (`agent_events`) in the existing build-server Logs
+viewer, so you can watch planning / tool calls / `run_failed` live alongside build & test
+logs. Motivated by the silent-"thinking…" debug session: the run error was only in the DB,
+never in the UI.
+- **The gap.** The Logs viewer's `/ws/logs` only read **build** (`Logs`) and **test**
+  (`TestLogs`) DBs; the agent's run events live in a *separate* DB (`agent_events` in
+  **`agent_logs.db`**, `~/Library/Logs/atopile/`) the viewer couldn't reach. The viewer *did*
+  have an "agent" choice — but that's the **audience** dropdown (`user|developer|agent`), a
+  strict `WHERE audience='agent'` filter on build logs; **nothing ever emits an
+  agent-audience build log** (all 76k build rows are `developer`), so picking it just showed
+  an empty pane. (That audience filter is unrelated to this feature and is still effectively
+  a dead option for build logs.)
+- **Design.** New **`agent` `LogMode`** beside build/test. Agent rows are mapped onto the
+  **shared entry shape** server-side (`Log.agent_row_to_entry`: `summary`→message,
+  `tool_name`/`phase`→stage column, level/timestamp passthrough, grouped under
+  `agent.<event>` loggers), so the **existing `LogDisplay` renders them with zero new row
+  UI**. Session id is **optional**: blank → **follow-latest** mode. Level filter + live
+  cursor reuse the build/test machinery.
+- **Follow-latest auto-switch (backend-only).** In follow-latest mode `_push_agent_stream`
+  **re-resolves `latest_session_id()` every poll** (cheap rowid-ordered `LIMIT 1`), so a
+  viewer left open across runs always tracks the newest session — including a run that
+  *starts after* the panel was opened. On a session change (incl. the first push) it sends
+  the new session's full batch as an **`agent_logs_result` (viewer *replaces*)**; steady-state
+  new rows for the same session go as **`agent_logs_stream` (*append*)**. The client stays
+  dumb (no reset signal): the existing onmessage already replaces on `*_result` / appends on
+  `*_stream`. Switch detection uses a `PrivateAttr _followed_session` on `AgentStreamQuery`;
+  an **explicit** `agent_session_id` pins one session (no auto-switch). +2 tests (fake-WS
+  drives replace→append→switch and the pinned-no-switch path). **Gotcha that motivated this:**
+  every window reload/extension reinstall restarts the backend on a **new port**, dropping the
+  panel's WS; the panel then showed a stale snapshot. Auto-follow + a fresh reconnect now
+  re-replace with the current session.
+- **Server.** `model/sqlite.py`: `AgentLogs.latest_session_id()` (`fetch_chunk` already
+  existed, incl. `levels`/`after_id`). `dataclasses.py`: `Log.AgentQuery`/`AgentStreamQuery`/
+  `AgentStreamEntryPydantic`/`AgentResult`/`AgentStreamResult` + the `agent_row_to_entry`
+  mapper. `routes/logs.py`: `_push_agent_stream` + an `agent` dispatch branch (one-shot DESC +
+  streaming ASC) selected by an explicit `agent: true` in the WS payload.
+- **Frontend** (`src/ui-server/.../log-viewer/` + `LogViewer.tsx`): `'agent'` `LogMode`,
+  agent entry/request/result types, `agent_logs_result`/`agent_logs_stream` handling in
+  `useLogWebSocket` (+ `startAgentStream`/`buildAgentLogRequest`), the **"Agent" mode button**
+  + optional `Session ID (latest)` input, and agent cases in the auto-stream effect / stage
+  header.
+- **Verified.** `test/server/test_logs_agent.py` (6: latest-session, level+session filter, row
+  mapping incl. summary→event fallback, result serialization, idempotent init); agent suite 48
+  pass, ruff clean; frontend `tsc --noEmit` clean + 15 existing log/ws tests pass + prod `vite
+  build` succeeds. Data path exercised against the **real** `agent_logs.db`. **Webview rebuilt
+  & deployed** to `src/vscode-atopile/resources/webviews/` (the path the installed extension
+  loads) — **reload the VS Code window** to pick it up (Python is editable; webview needs the
+  rebuilt bundle).
+- **Deferred:** no server-side tool/stage *filter* for agent rows yet (tool shows in the stage
+  column but isn't a query filter); the audience dropdown's dead `agent` option could be hidden
+  in agent mode. (Follow-latest auto-switch — previously deferred — is now **done**, see above.)
+
 ## Open items
 
-- **M5–M6 — implement the remaining tool bodies (next):** `pyspice_run` (M5),
-  `ipc_check` (M6) are registered, schema'd, and model-callable as graceful stubs in
-  `_ee/tools_ee.py` — fill in the logic there (M4's `_ee/tools_rag.py` → `ee_agent_rag/` is
-  the template: real logic in a framework-agnostic package, thin wrapper delegates). The
+- **Table-fidelity suspects left for review (low priority).** The new
+  `column_shift_suspect` scanner flags 5 suspects in 2 docs (both reviewed, left as-is):
+  SPX3819's JEDEC package-outline table is a **genuine** shift (`A`: 1.75 = the JEDEC MAX
+  sits under NOM, MAX empty — mechanical dims, low retrieval stakes; premium re-parse if
+  it ever matters); RM46's timing tables are mostly **legit min-only** rows (setup/cycle
+  times are minimums) with a couple of ambiguous rows. This is the human-review queue the
+  scanner is meant to produce, not a regression.
+
+- **M6 — implement `ipc_check` (next):** still a registered, schema'd, model-callable
+  graceful stub in `_ee/tools_ee.py` — fill in the logic there. **Template is now M4 *and*
+  M5**: real logic in a framework-agnostic package (`ee_agent_rag/`, `ee_agent_spice/`), thin
+  `_ee/tools_*.py` wrapper that delegates + degrades. M6 leans on the **standards corpus**
+  (IPC-2221B/2152), which is the RAG expansion still pending (datasheets-only today). The
   `ee_ping` smoke tool can be removed once a real tool proves the path in production.
+- **`pyspice_run` follow-ups (deferred):** graph→SPICE auto-generation (agent authors decks
+  for now; `extract_components()` is the template); Monte Carlo / temp sweeps / noise; the
+  `sim_inspect(result_file, expr)` post-processing tool (`02_SIMULATION` §7); the
+  "when to simulate" skill/prompt guidance (`02_SIMULATION` §6) — kept M5 to body+tests like
+  M4, runtime skill update can follow.
 - **M4 RAG — expand beyond datasheets (the main follow-up).** v1 is **datasheets-only**, one
   deterministic retrieval path. The pipeline is built for more corpora but they're not wired:
   - **Add data + corpus-specific parsers/chunkers.** `classify.py` already routes
@@ -279,10 +554,11 @@ Fills in the M4 tool body. Stack locked (no LangChain): **Chroma · LlamaParse �
     `summary` field, the `get_standard_clause` direct-lookup tool, byte-stable chunk-id
     determinism. Build the eval set per corpus (`RECALL_BASELINES` already has baselines).
 - **Deferred deps** for later milestones, re-add with `uv lock --refresh` + a 3.14-wheel
-  check: pyspice (M5 sim). (M4 RAG deps are **in**: chromadb, cohere, rank-bm25,
-  pdfminer-six. `voyageai`/`qdrant`/`llama-parse` were **not** used — we went OpenAI embed /
-  Chroma / LlamaParse-REST instead; do not re-add them.)
-- **Schematic — hierarchical real-symbol mode (DONE, working tree).** Goal was
+  check: *(none left for the 3 tools)*. **pyspice is now IN** (M5; needs system `brew install
+  ngspice`). M4 RAG deps are **in**: chromadb, cohere, rank-bm25, pdfminer-six.
+  `voyageai`/`qdrant`/`llama-parse` were **not** used — we went OpenAI embed / Chroma /
+  LlamaParse-REST instead; do not re-add them.
+- **Schematic — hierarchical real-symbol mode (DONE, pushed `51b75613`).** Goal was
   human-readable schematics from `.ato` code. KiCad has **no** schematic autorouter /
   autoplacer / autoclean (`kicad-cli sch` = erc/export/upgrade only), so the chosen design
   is a **polished human-cleanup base**: real cached symbols placed on **one sheet per
@@ -302,7 +578,7 @@ Fills in the M4 tool body. Stack locked (no LangChain): **Chroma · LlamaParse �
   examples/i2c` → ERC **0 errors**, netlist exact (hv=6, lv=4, SDA/SCL/Alert=2) across the
   `temp_sensor` sub-sheet. Format was locked first with a kicad-cli spike (the 2-sheet
   `NET_SHARED` cross-sheet proof).
-- **Schematic — power symbols (M3b, DONE, working tree).** Rail pins now render as real
+- **Schematic — power symbols (M3b, DONE, pushed `51b75613`).** Rail pins now render as real
   KiCad **power symbols** (GND triangle / power up-arrow) instead of labels; signal pins
   keep labels. `build_power_symbol` / `build_pwr_flag_symbol` in `generic_symbol.py`;
   `render_sheet_tree` gained a `net_roles` arg and a `_place_power` branch
@@ -316,7 +592,7 @@ Fills in the M4 tool body. Stack locked (no LangChain): **Chroma · LlamaParse �
   netlist still exact, hv→arrows / lv→triangles, one PWR_FLAG per rail. (Real-symbol pins
   are typed `Unspecified` in the cached `.kicad_sym`, so a handful of benign `pin_to_pin`
   *warnings* remain — pin-metadata only, not connectivity.)
-- **Schematic — deterministic filenames + cleanup (M3c, DONE, working tree).** Child sheet
+- **Schematic — deterministic filenames + cleanup (M3c, DONE, pushed `51b75613`).** Child sheet
   files were named `<root>-<module>-<8 hex>` where the hex was a fresh `uuid4()` **per
   build**, so rebuilds piled up duplicate files for the same module. Fixed in `schematic.py`:
   `render_sheet_tree._assign` now derives `file_stem` from the module's **sanitized name
@@ -372,13 +648,97 @@ Fills in the M4 tool body. Stack locked (no LangChain): **Chroma · LlamaParse �
 - Session 13 — schematic **M3c**: deterministic child-sheet filenames (no per-build hex)
   + stale-file cleanup, fixing duplicate `<module>` files piling up across builds; i2c
   double-build → stable two files, ERC-clean; +3 tests (26 total), ruff clean. **Schematic
-  work (sessions 11–13) still not committed/pushed.**
+  work (sessions 11–13) was committed later as `51b75613` (pushed).**
 - Session 14 — **M4 `rag_search` retriever** built end-to-end: framework-agnostic
   `ee_agent_rag/` package (Chroma + LlamaParse-REST + OpenAI embed + Cohere rerank, no
   LangChain), agent wrapper `_ee/tools_rag.py`, eval runner, step-by-step tuning notebook
   (gitignored) + local `16_RAG_NOTEBOOK_AND_TUNING.md`. Cleared the LlamaParse-SDK-on-3.14
   blocker (REST workaround). 40 pass / 4 skip, ruff clean; **committed `fe5517d2`**
   (datasheets-only v1; needs keys + PDFs + a ~30-Q eval to tune for real).
-- **Next** — tune M4 on a real datasheet corpus (keys + ~10 PDFs + expand eval), **and/or**
-  expand RAG to standards/app_notes/textbooks corpora (see Open items), **then** M5
-  (`pyspice_run` body). Q2 schematic image export still optional.
+- Session 15 — **M5 `pyspice_run` runner** built end-to-end: framework-agnostic
+  `ee_agent_spice/` (PySpice + libngspice, agent-authored netlist, bundled discrete models),
+  agent wrapper `_ee/tools_pyspice.py`, schema updated, M5 stub swapped. Cleared two real
+  gaps: atopile emits no SPICE netlist (→ agent-authored decks) and libngspice isn't on the
+  macOS dyld path (→ abs-path discovery). Astable multivibrator oscillates 1.13 Hz via the
+  real tool path (M5 done-def met). 70 pass / 4 skip, ruff clean. **Working tree only.**
+- Session 16 — **on-demand skill tools** `skills_list`/`skill_read` (`_ee/tools_skills.py`)
+  exposing the whole `.claude/skills/` library just-in-time (only the 3 fixed skills were ever
+  loaded before), + per-tool guidance docs `pyspice_run`/`rag_search`/`ipc_check`(seed) as
+  skills, + always-on nudge in `agent/SKILL.md` recipes (simulation gate) + a localized
+  `skill_read('<tool>')` pointer in **all three** EE tool descriptions
+  (`pyspice_run`/`rag_search`/`ipc_check`) so each self-advertises its skill. Future tools get
+  guidance by dropping one `SKILL.md`. 7 tests; agent suite 44 pass / 4 skip, ruff clean;
+  verified end-to-end via `execute_tool` + `build_system_prompt`. **Working tree only.**
+  (Also: local gitignored `SESSION_SUMMARY_2026-06-09.md` written for quick human review;
+  `.gitignore` glob `ee_agent_docs_5_21/SESSION_SUMMARY_*.md` added.)
+- Session 17 — **agent debug + run-log viewer**. Diagnosed the silent-"thinking…" freeze:
+  the backend's cwd is the *opened project* (outside the fork), so `find_dotenv(usecwd=True)`
+  missed the repo-root `.env` → provider fell back to `openai` with no key → instant
+  `run_failed` the UI never surfaced. Fixed `config.from_env()` to also load the source-tree
+  repo-root `.env` (cwd still wins). Then built the **Logs-tab "Agent" mode** (`agent_events`
+  via `/ws/logs`, latest-session default, mapped onto the shared entry shape; +6 tests, agent
+  suite 48 pass, frontend typechecks/builds, webview deployed). Both working-tree only.
+  (Corrected post-mortem path: agent log is `agent_logs.db` under `~/Library/Logs/atopile/`,
+  not `~/.atopile/agent_logs.sqlite`.)
+- Session 18 — **M4 tuned & validated on a real corpus.** 50-question user-approved eval
+  (`RAG_VALIDATION_SET.md` + `datasheets.jsonl`; 30 core approved, +20 implementation-
+  focused on request), 14 datasheets ingested (1156 chunks), **recall@5 = 0.98** with all
+  retrieval knobs at defaults — every win was ingest fidelity: synthesized page markers
+  (LlamaParse ignores the marker instruction), chunk-id ordinal (Chroma dup-id rejects),
+  12 new MPN patterns + filename fallback (`\b`-vs-`_` trap), stale-chunk deletion on
+  re-ingest, embed/rerank disk caches + Cohere 429 backoff. Sole miss = LlamaParse
+  equation-region prose drop (documented, not knob-fixable). Budget kept: ~17 LlamaParse
+  jobs / ~80 OpenAI / ~60 Cohere (<100 each). Suite 95 pass / 4 skip, ruff clean. Full
+  detail: `RAG_TUNING_SUMMARY.md`. Working tree only.
+- Session 19 — **schematic human-ready mode** (user-requested): real symbols + manual
+  signal wiring as the workflow, power/ground **auto-wired** (per rail pin: straight
+  5.08 mm stub wire outward + rotation-mapped GND/PWR glyph + horizontal net-name text;
+  PWR_FLAG perpendicular at the stub end). New `placement.py`: connectivity clustering
+  (anchors >4 pins; satellites orbit by Σ1/deg(net) affinity; lattice-valued cells,
+  disjointness = the no-shorts invariant). `SymbolDef` grew `pin_geo` (angle/length) +
+  `bbox` (real + generic); labels orient by pin outward direction; ref/value anchored to
+  bbox; per-sheet content-aware paper + title block. Verified: 37 exporter tests (11 new),
+  ruff clean; `examples/i2c` ERC 0 + exact netlist (hv=6, lv=4, SDA/SCL/Alert=2);
+  `led_badge grid10x10` (111 sheets, real WS2812 symbols) ERC 0; SVG renders eyeballed;
+  double-build file set deterministic (uuid bytes still random — known deferred).
+  led_badge `badge` target fails in **part picking** (solver contradiction, pre-existing,
+  unrelated). Working tree only.
+- Session 20 — **table-fidelity hardening** (user-driven): three LlamaParse defect flavors
+  found in the corpus. (1) **Flattened merged cells** (CD0603 abs-max VRRM under one part
+  column) → fixed by a merged-cell replication rule in `DATASHEET_INSTRUCTION`. (2)
+  **Column drift** in wide multi-variant pin tables (NVT2008) → fixed by new
+  `parse(..., premium=True)` / `EE_PARSE_PREMIUM` escalation knob. (3) **Column shift**
+  from split/merged body cells under a single header column (CD0603 EC table, Min/Typ/Max
+  all shifted) → premium parse verified correct alignment but **re-ingest + eval re-check
+  + scanner heuristic still pending** (see IN FLIGHT in Open items). Also built
+  `ee_agent_rag/eval/table_fidelity.py` scanner (+5 tests, notebook Step 2b), fixed
+  `ingest --force` clobbering premium parses (`--reparse` is now the explicit paid path),
+  added "Parsed-table caveats" to the rag_search skill. Eval after flavors 1–2: affected
+  7/7, regression sample 9/10 (only the known #30 miss). Suite 59 pass / 4 skip, ruff
+  clean. **Session ended at limit mid-flavor-3; resumed and finished in session 21.**
+- Session 21 — **flavor-3 column shift finished** (the session-20 IN FLIGHT item):
+  header-title pollution from the premium parse stripped **in code**
+  (`parse._strip_header_title_pollution`, runs on every `parse()` return incl. cache
+  hits — cache stays raw, no new parse jobs) instead of another paid instruction
+  attempt; CD0603 re-ingested with `--force` (premium parse reused, old shifted chunks
+  deleted, 15 clean chunks); eval 0/1/46 → 3/3, stored-chunk spot-check shows VF Typ
+  0.35 + IRRM test conditions/Max correct; scanner gained `column_shift_suspect`
+  (Min+Max header, ≥4 rows, Min ≥80% filled, Max empty) + 4 unit tests + 2 normalizer
+  tests (RAG suite 21 pass, ruff clean). Corpus scan: CD0603 clean; 5 new suspects in
+  SPX3819 (genuine, mechanical dims) / RM46 (mostly legit min-only timing) recorded in
+  Open items. `RAG_TUNING_SUMMARY.md` updated with the flavor-3 section. Follow-up
+  (user-caught): premium still left CD0603's two last-per-variant VF rows shifted →
+  added the **sidecar-patch layer** (`_apply_sidecar_patch`, `<hash>.patch.json`, +2
+  tests, RAG suite 23 pass) + the CD0603 patch; re-ingested, eval 3/3, stored rows
+  verified against the PDF. Notebook Step 2b updated (third kind in the summary loop +
+  caveats). Also: **`OPAMP_IDEAL` added to the bundled spice lib** (`ee_agent.lib`
+  subckt: `X1 inp inn out OPAMP_IDEAL`, single-pole A0 100k / GBW ~1 MHz, Rin 10 Meg,
+  Rout 10, NO rails → never clips; advertised in the tool description +
+  `pyspice_run` skill; live test `test_ideal_opamp_inverting_gain` asserts gain −10,
+  AC sweep through the agent wrapper shows 9.999 passband + GBW/f rolloff). And the
+  **`DATA_ROOT` cwd-trap fix** (see Lessons) + `.env.example` comment updated; verified
+  from a foreign cwd: store resolves to `<repo>/data`, 1065 chunks visible. Suites
+  101 pass / 4 skip.
+- **Next** — M6 (`ipc_check` body; pairs with the standards-corpus RAG expansion),
+  **and/or** expand RAG corpora (see Open items), **then** M7 (end-to-end design using
+  all 3 tools). Q2 schematic image export still optional.

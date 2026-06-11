@@ -240,3 +240,6 @@ src/vscode-atopile/resources/layout-editor/editor.js.map
 
 # Local-only RAG notebook/tuning reference (not committed)
 ee_agent_docs_5_21/16_RAG_NOTEBOOK_AND_TUNING.md
+
+# Local-only per-session summaries (not committed)
+ee_agent_docs_5_21/SESSION_SUMMARY_*.md

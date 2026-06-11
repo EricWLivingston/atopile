@@ -322,6 +322,43 @@ def test_pick_resistor_by_params():
 
 
 @pytest.mark.usefixtures("setup_project_config")
+def test_pick_diode_by_params():
+    from faebryk.libs.picker.picker import get_pick_tree, pick_topologically
+
+    solver = Solver()
+
+    g = graph.GraphView.create()
+    tg = fbrk.TypeGraph.create(g=g)
+
+    E = BoundExpressions(g=g, tg=tg)
+
+    class _App(fabll.Node):
+        d1 = F.Diode.MakeChild()
+
+    app = _App.bind_typegraph(tg=tg).create_instance(g=g)
+
+    # Constrain forward voltage (the auto-picking example's constraint)
+    vf_op = E.lit_op_range(((0.5, E.U.V), (0.8, E.U.V)))
+    E.is_subset(
+        app.d1.get().forward_voltage.get().can_be_operand.get(), vf_op, assert_=True
+    )
+
+    tree = get_pick_tree(app)
+    pick_topologically(tree, solver)
+    assert app.d1.get().has_trait(F.Pickable.has_part_picked)
+    assert (
+        app.d1.get()
+        .forward_voltage.get()
+        .force_extract_subset()
+        .op_setic_is_subset_of(
+            F.Literals.Numbers(vf_op.get_obj_raw().instance),
+            g=g,
+            tg=tg,
+        )
+    )
+
+
+@pytest.mark.usefixtures("setup_project_config")
 def test_skip_self_pick():
     g = graph.GraphView.create()
     tg = fbrk.TypeGraph.create(g=g)

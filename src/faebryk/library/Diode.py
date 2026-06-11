@@ -45,6 +45,20 @@ class Diode(fabll.Node):
 
     can_bridge = fabll.Traits.MakeEdge(F.can_bridge.MakeChild(["anode"], ["cathode"]))
 
+    # Param keys mirror the API's /v0/query/diodes request fields exactly
+    # (`current` is a functional design parameter, not an API filter).
+    _is_pickable = fabll.Traits.MakeEdge(
+        F.Pickable.is_pickable_by_type.MakeChild(
+            endpoint=F.Pickable.is_pickable_by_type.Endpoint.DIODES,
+            params={
+                "forward_voltage": forward_voltage,
+                "reverse_working_voltage": reverse_working_voltage,
+                "reverse_leakage_current": reverse_leakage_current,
+                "max_current": max_current,
+            },
+        ),
+    )
+
     S = F.has_simple_value_representation.Spec
     _simple_repr = fabll.Traits.MakeEdge(
         F.has_simple_value_representation.MakeChild(

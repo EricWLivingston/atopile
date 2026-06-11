@@ -750,6 +750,17 @@ class AgentLogs:
                 results.append(AgentLogs._from_row(row))
             return results, last_id
 
+    @staticmethod
+    def latest_session_id() -> str | None:
+        """Session id of the most recently logged agent event, or None."""
+        if not AGENT_LOGS_DB.exists():
+            return None
+        with _get_connection(AGENT_LOGS_DB) as conn:
+            row = conn.execute(
+                "SELECT session_id FROM agent_events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            return row[0] if row else None
+
 
 # agent_logs.db -> tracked_messages + tracked_checklist_items
 class MessageLog:

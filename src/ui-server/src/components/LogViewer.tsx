@@ -19,6 +19,7 @@ import {
   useLogWebSocket,
   buildBuildLogRequest,
   buildTestLogRequest,
+  buildAgentLogRequest,
   LogDisplay,
   ChevronDown,
   getStoredSetting,
@@ -108,6 +109,10 @@ export function LogViewer() {
   const [testRunId, setTestRunId] = useState(initialParams.testRunId);
   const [testName, setTestName] = useState(initialParams.testName);
 
+  // Agent run-log parameters. Session id is optional: empty follows the most
+  // recent agent session (resolved server-side).
+  const [agentSessionId, setAgentSessionId] = useState('');
+
   // Get queued/active builds for auto-selection
   const queuedBuilds = useStore((state) => state.queuedBuilds);
   const builds = useStore((state) => state.builds);
@@ -152,6 +157,7 @@ export function LogViewer() {
     connect: connectWs,
     startBuildStream,
     startTestStream,
+    startAgentStream,
     stopStream,
   } = useLogWebSocket();
 
@@ -190,10 +196,14 @@ export function LogViewer() {
   useEffect(() => {
     if (connectionState !== 'connected') return;
 
-    const id = mode === 'build' ? buildId.trim() : testRunId.trim();
-    if (!id) {
-      stopStream();
-      return;
+    // Agent mode allows an empty id (server follows the latest session);
+    // build/test require an id before streaming.
+    if (mode !== 'agent') {
+      const id = mode === 'build' ? buildId.trim() : testRunId.trim();
+      if (!id) {
+        stopStream();
+        return;
+      }
     }
 
     const timer = setTimeout(() => {
@@ -202,14 +212,16 @@ export function LogViewer() {
 
       if (mode === 'build') {
         startBuildStream(buildBuildLogRequest(buildId, stage, logLevels, audience));
-      } else {
+      } else if (mode === 'test') {
         startTestStream(buildTestLogRequest(testRunId, testName, logLevels, audience));
+      } else {
+        startAgentStream(buildAgentLogRequest(agentSessionId, logLevels));
       }
       setAutoScroll(true);
     }, 150);
 
     return () => clearTimeout(timer);
-  }, [mode, buildId, stage, testRunId, testName, logLevels, audience, connectionState, stopStream, startBuildStream, startTestStream, setLogs]);
+  }, [mode, buildId, stage, testRunId, testName, agentSessionId, logLevels, audience, connectionState, stopStream, startBuildStream, startTestStream, startAgentStream, setLogs]);
 
   // Populate build_id from the latest active build when none is set
   useEffect(() => {
@@ -395,6 +407,12 @@ export function LogViewer() {
               >
                 Test
               </button>
+              <button
+                className={`lv-mode-btn ${mode === 'agent' ? 'active' : ''}`}
+                onClick={() => setMode('agent')}
+              >
+                Agent
+              </button>
             </div>
 
             {/* Mode-specific ID input */}
@@ -406,12 +424,21 @@ export function LogViewer() {
                 placeholder="Build ID"
                 className="lv-input"
               />
-            ) : (
+            ) : mode === 'test' ? (
               <input
                 type="text"
                 value={testRunId}
                 onChange={(e) => setTestRunId(e.target.value)}
                 placeholder="Test Run ID"
+                className="lv-input"
+              />
+            ) : (
+              <input
+                type="text"
+                value={agentSessionId}
+                onChange={(e) => setAgentSessionId(e.target.value)}
+                placeholder="Session ID (latest)"
+                title="Agent session id — leave empty to follow the most recent run"
                 className="lv-input"
               />
             )}
@@ -510,10 +537,20 @@ export function LogViewer() {
           </div>
           <div className="lv-col-header lv-col-stage lv-col-header-resizable">
             <HeaderSearchBox
-              value={mode === 'build' ? stage : testName}
-              onChange={(value) => (mode === 'build' ? setStage(value) : setTestName(value))}
-              placeholder={mode === 'build' ? 'Stage' : 'Test Name'}
-              title={mode === 'build' ? 'Filter by build stage' : 'Filter by test name'}
+              value={mode === 'build' ? stage : mode === 'test' ? testName : ''}
+              onChange={(value) => {
+                if (mode === 'build') setStage(value);
+                else if (mode === 'test') setTestName(value);
+                // Agent rows carry the tool/phase in this column; no server-side filter.
+              }}
+              placeholder={mode === 'build' ? 'Stage' : mode === 'test' ? 'Test Name' : 'Tool'}
+              title={
+                mode === 'build'
+                  ? 'Filter by build stage'
+                  : mode === 'test'
+                    ? 'Filter by test name'
+                    : 'Tool / phase'
+              }
               inputClassName="lv-col-search-stage"
             />
             <div

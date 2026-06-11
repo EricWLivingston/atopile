@@ -102,6 +102,77 @@ async def _push_test_stream(
     return after_id
 
 
+async def _push_agent_stream(
+    websocket: WebSocket,
+    query: Log.AgentStreamQuery,
+    after_id: int,
+) -> int:
+    """Push agent run-log updates to client. Returns new last_id.
+
+    Two modes, by whether the client pinned ``agent_session_id``:
+
+    - **Pinned** (explicit id): stream that one session incrementally.
+    - **Follow latest** (id unset): re-resolve the newest session every poll so a
+      viewer opened before a run starts — or left open across runs — always
+      tracks the most recent session.
+
+    On a session switch (incl. the very first push) the new session's batch is
+    sent as an ``agent_logs_result`` (which the viewer *replaces* its list with)
+    rather than an ``agent_logs_stream`` (*append*); steady-state new rows for the
+    same session go out as ``agent_logs_stream``. This keeps the client dumb: no
+    reset signal needed.
+    """
+    from atopile.model.sqlite import AgentLogs
+
+    pinned = query.agent_session_id
+    if pinned:
+        session_id: str | None = pinned
+    else:
+        # Follow-latest: re-resolve each poll so newer runs are picked up.
+        session_id = AgentLogs.latest_session_id()
+    if not session_id:
+        return after_id
+
+    levels = [str(level) for level in query.log_levels] if query.log_levels else None
+    switched = session_id != query._followed_session
+
+    if switched:
+        # New session (or first push): replace the view with its full batch.
+        rows, new_last_id = AgentLogs.fetch_chunk(
+            session_id,
+            run_id=query.run_id,
+            levels=levels,
+            after_id=0,
+            count=_clamp(query.count),
+            order="ASC",
+        )
+        query._followed_session = session_id
+        entries = [Log.agent_row_to_entry(r) for r in rows]
+        await websocket.send_json(
+            Log.AgentResult(logs=entries, session_id=session_id).model_dump()
+        )
+        return new_last_id
+
+    # Same session: append only the new rows.
+    rows, new_last_id = AgentLogs.fetch_chunk(
+        session_id,
+        run_id=query.run_id,
+        levels=levels,
+        after_id=after_id,
+        count=_clamp(query.count),
+        order="ASC",
+    )
+    if rows:
+        entries = [Log.agent_row_to_entry(r) for r in rows]
+        await websocket.send_json(
+            Log.AgentStreamResult(
+                logs=entries, last_id=new_last_id, session_id=session_id
+            ).model_dump()
+        )
+        return new_last_id
+    return after_id
+
+
 @router.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket):
     """
@@ -135,9 +206,12 @@ async def websocket_logs(websocket: WebSocket):
 
     # Streaming state
     streaming = False
-    stream_query: Log.BuildStreamQuery | Log.TestStreamQuery | None = None
+    stream_query: (
+        Log.BuildStreamQuery | Log.TestStreamQuery | Log.AgentStreamQuery | None
+    ) = None
     last_id = 0
     is_test_mode = False
+    is_agent_mode = False
 
     try:
         while True:
@@ -155,7 +229,13 @@ async def websocket_logs(websocket: WebSocket):
             except asyncio.TimeoutError:
                 # No new message during streaming - push any new logs
                 if streaming and stream_query:
-                    if is_test_mode:
+                    if is_agent_mode:
+                        last_id = await _push_agent_stream(
+                            websocket,
+                            stream_query,  # type: ignore
+                            last_id,
+                        )
+                    elif is_test_mode:
                         last_id = await _push_test_stream(
                             websocket,
                             stream_query,  # type: ignore
@@ -178,6 +258,72 @@ async def websocket_logs(websocket: WebSocket):
                 stream_query = None
                 log.debug("Client unsubscribed from log streaming")
                 continue
+
+            # Agent run-log mode (separate source: agent_events). Selected by an
+            # explicit `agent: true`; session id is optional (defaults to latest).
+            if data.get("agent"):
+                is_agent_mode = True
+                is_test_mode = False
+                if subscribe:
+                    try:
+                        stream_query = Log.AgentStreamQuery.model_validate(data)
+                    except ValidationError as exc:
+                        err = Log.Error(error=str(exc)).model_dump()
+                        await websocket.send_json(err)
+                        continue
+
+                    streaming = True
+                    last_id = stream_query.after_id
+                    log.debug(
+                        "Client subscribed to agent logs: %s",
+                        stream_query.agent_session_id or "(latest)",
+                    )
+                    # Send initial batch immediately
+                    last_id = await _push_agent_stream(websocket, stream_query, last_id)
+                else:
+                    # One-shot query
+                    streaming = False
+                    stream_query = None
+                    try:
+                        query = Log.AgentQuery.model_validate(data)
+                    except ValidationError as exc:
+                        err = Log.Error(error=str(exc)).model_dump()
+                        await websocket.send_json(err)
+                        continue
+
+                    from atopile.model.sqlite import AgentLogs
+
+                    session_id = (
+                        query.agent_session_id or AgentLogs.latest_session_id()
+                    )
+                    if not session_id:
+                        await websocket.send_json(
+                            Log.AgentResult(logs=[], session_id=None).model_dump()
+                        )
+                        continue
+
+                    levels = (
+                        [str(level) for level in query.log_levels]
+                        if query.log_levels
+                        else None
+                    )
+                    rows, _ = AgentLogs.fetch_chunk(
+                        session_id,
+                        run_id=query.run_id,
+                        levels=levels,
+                        after_id=0,
+                        count=_clamp(query.count),
+                        order="DESC",
+                    )
+                    entries = [Log.agent_row_to_entry(r) for r in rows]
+                    await websocket.send_json(
+                        Log.AgentResult(
+                            logs=entries, session_id=session_id
+                        ).model_dump()
+                    )
+                continue
+
+            is_agent_mode = False
 
             # Guard: reject requests with both build_id and test_run_id
             has_build_id = "build_id" in data

@@ -7,7 +7,7 @@ export const AUDIENCES = ['user', 'developer', 'agent'] as const;
 
 export type LogLevel = typeof LOG_LEVELS[number];
 export type Audience = typeof AUDIENCES[number];
-export type LogMode = 'build' | 'test';
+export type LogMode = 'build' | 'test' | 'agent';
 export type TimeMode = 'delta' | 'wall';
 export type SourceMode = 'source' | 'logger';
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected';
@@ -72,7 +72,17 @@ export interface TestLogEntry extends BaseLogEntry {
   test_name?: string | null;
 }
 
-export type LogEntry = BuildLogEntry | TestLogEntry;
+// The agent's own run log (planning / tool calls / errors), a separate source
+// from build/test logs. Mapped onto the shared entry shape server-side so the
+// existing LogDisplay renders it; the extra fields are kept for detail/grouping.
+export interface AgentLogEntry extends BaseLogEntry {
+  event?: string | null;
+  phase?: string | null;
+  tool_name?: string | null;
+  run_id?: string | null;
+}
+
+export type LogEntry = BuildLogEntry | TestLogEntry | AgentLogEntry;
 
 // Streaming entries include id for cursor tracking
 export interface StreamLogEntry extends BaseLogEntry {
@@ -80,6 +90,10 @@ export interface StreamLogEntry extends BaseLogEntry {
 }
 
 export interface TestStreamLogEntry extends TestLogEntry {
+  id: number;
+}
+
+export interface AgentStreamLogEntry extends AgentLogEntry {
   id: number;
 }
 
@@ -107,12 +121,32 @@ export interface TestStreamResult {
   last_id: number;
 }
 
+export interface AgentLogResult {
+  type: 'agent_logs_result';
+  logs: AgentStreamLogEntry[];
+  session_id: string | null;
+}
+
+export interface AgentStreamResult {
+  type: 'agent_logs_stream';
+  logs: AgentStreamLogEntry[];
+  last_id: number;
+  session_id: string | null;
+}
+
 export interface LogError {
   type: 'logs_error';
   error: string;
 }
 
-export type LogResult = BuildLogResult | TestLogResult | StreamResult | TestStreamResult | LogError;
+export type LogResult =
+  | BuildLogResult
+  | TestLogResult
+  | StreamResult
+  | TestStreamResult
+  | AgentLogResult
+  | AgentStreamResult
+  | LogError;
 
 // --- Tree Types ---
 
@@ -145,6 +179,17 @@ export interface TestLogRequest {
   test_name?: string | null;
   log_levels?: LogLevel[] | null;
   audience: Audience;
+  after_id?: number;
+  count?: number;
+  subscribe?: boolean;
+}
+
+export interface AgentLogRequest {
+  agent: true;
+  // Optional: omit to follow the most recent agent session.
+  agent_session_id?: string | null;
+  run_id?: string | null;
+  log_levels?: LogLevel[] | null;
   after_id?: number;
   count?: number;
   subscribe?: boolean;

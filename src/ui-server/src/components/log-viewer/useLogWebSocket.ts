@@ -13,6 +13,7 @@ import {
   Audience,
   BuildLogRequest,
   TestLogRequest,
+  AgentLogRequest,
 } from './logTypes';
 
 export interface UseLogWebSocketOptions {
@@ -30,8 +31,9 @@ export interface UseLogWebSocketReturn {
   connect: () => void;
   startBuildStream: (request: BuildLogRequest) => void;
   startTestStream: (request: TestLogRequest) => void;
+  startAgentStream: (request: AgentLogRequest) => void;
   stopStream: () => void;
-  sendRequest: (payload: BuildLogRequest | TestLogRequest) => void;
+  sendRequest: (payload: BuildLogRequest | TestLogRequest | AgentLogRequest) => void;
 }
 
 export function useLogWebSocket(options: UseLogWebSocketOptions = {}): UseLogWebSocketReturn {
@@ -110,12 +112,20 @@ export function useLogWebSocket(options: UseLogWebSocketOptions = {}): UseLogWeb
       try {
         const data = JSON.parse(event.data) as LogResult;
 
-        if (data.type === 'logs_result' || data.type === 'test_logs_result') {
+        if (
+          data.type === 'logs_result' ||
+          data.type === 'test_logs_result' ||
+          data.type === 'agent_logs_result'
+        ) {
           // One-shot response - replace logs
           setLogs(data.logs);
           setError(null);
           options.onLogsReceived?.(data.logs, false);
-        } else if (data.type === 'logs_stream' || data.type === 'test_logs_stream') {
+        } else if (
+          data.type === 'logs_stream' ||
+          data.type === 'test_logs_stream' ||
+          data.type === 'agent_logs_stream'
+        ) {
           // Streaming response - append logs
           if (data.logs.length > 0) {
             setLogs(prev => [...prev, ...data.logs]);
@@ -178,7 +188,7 @@ export function useLogWebSocket(options: UseLogWebSocketOptions = {}): UseLogWeb
     }
   }, [connect]);
 
-  const sendRequest = useCallback((payload: BuildLogRequest | TestLogRequest) => {
+  const sendRequest = useCallback((payload: BuildLogRequest | TestLogRequest | AgentLogRequest) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       setError('Not connected');
       return;
@@ -253,6 +263,33 @@ export function useLogWebSocket(options: UseLogWebSocketOptions = {}): UseLogWeb
     }
   }, []);
 
+  const startAgentStream = useCallback((request: AgentLogRequest) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setError('Not connected');
+      return;
+    }
+
+    // No id required: the server follows the most recent session when omitted.
+    setLogs([]);
+    lastIdRef.current = 0;
+    setStreaming(true);
+    setError(null);
+
+    const payload: AgentLogRequest = {
+      ...request,
+      after_id: 0,
+      count: request.count ?? 1000,
+      subscribe: true,
+    };
+
+    try {
+      wsRef.current.send(JSON.stringify(payload));
+    } catch (e) {
+      setStreaming(false);
+      setError(`Failed to start streaming: ${e}`);
+    }
+  }, []);
+
   const stopStream = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ unsubscribe: true }));
@@ -271,6 +308,7 @@ export function useLogWebSocket(options: UseLogWebSocketOptions = {}): UseLogWeb
     connect: ensureConnected,
     startBuildStream,
     startTestStream,
+    startAgentStream,
     stopStream,
     sendRequest,
   };
@@ -302,5 +340,16 @@ export function buildTestLogRequest(
     test_name: testName?.trim() || null,
     log_levels: logLevels.length > 0 ? logLevels : null,
     audience,
+  };
+}
+
+export function buildAgentLogRequest(
+  agentSessionId: string | null | undefined,
+  logLevels: LogLevel[]
+): AgentLogRequest {
+  return {
+    agent: true,
+    agent_session_id: agentSessionId?.trim() || null,
+    log_levels: logLevels.length > 0 ? logLevels : null,
   };
 }

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional, TypedDict
 
 from fastapi import WebSocket
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 # =============================================================================
 # Enums and Type Aliases
@@ -438,6 +438,92 @@ class Log:
         type: Literal["test_logs_stream"] = "test_logs_stream"
         logs: list["Log.TestStreamEntryPydantic"]
         last_id: int
+
+    # -------------------------------------------------------------------------
+    # Agent run-log models (agent_events table in agent_logs.db). The agent's
+    # own run log (planning / tool calls / errors) is a separate source from
+    # build/test logs; these rows are mapped onto the shared entry shape so the
+    # existing log viewer renders them with no new row UI.
+    # -------------------------------------------------------------------------
+
+    class AgentQuery(_BaseQuery):
+        """Query parameters for fetching agent run logs.
+
+        ``agent_session_id`` is optional: when omitted the server uses the most
+        recent session, so the viewer "just works" on the latest run.
+        """
+
+        agent: bool = True
+        agent_session_id: str | None = None
+        run_id: str | None = None
+
+    class AgentStreamQuery(_BaseStreamQuery):
+        """Streaming query parameters for agent run logs."""
+
+        agent: bool = True
+        agent_session_id: str | None = None
+        run_id: str | None = None
+
+        # Connection-local: the session currently being streamed. When
+        # ``agent_session_id`` is unset ("follow latest"), the server re-resolves
+        # the newest session each poll and uses this to detect a switch.
+        _followed_session: str | None = PrivateAttr(default=None)
+
+    class AgentStreamEntryPydantic(_BaseStreamEntryPydantic):
+        """Agent event mapped onto the shared streaming entry shape.
+
+        ``stage`` carries the tool/phase so the viewer's stage column is useful;
+        ``event``/``phase``/``tool_name``/``run_id`` are kept for detail views.
+        """
+
+        stage: str | None = None
+        event: str | None = None
+        phase: str | None = None
+        tool_name: str | None = None
+        run_id: str | None = None
+
+    class AgentResult(BaseModel):
+        """One-shot response containing agent run-log entries."""
+
+        type: Literal["agent_logs_result"] = "agent_logs_result"
+        logs: list["Log.AgentStreamEntryPydantic"]
+        session_id: str | None = None
+
+    class AgentStreamResult(BaseModel):
+        """Streaming response for agent run logs."""
+
+        type: Literal["agent_logs_stream"] = "agent_logs_stream"
+        logs: list["Log.AgentStreamEntryPydantic"]
+        last_id: int
+        session_id: str | None = None
+
+    @staticmethod
+    def agent_row_to_entry(row: dict[str, Any]) -> "Log.AgentStreamEntryPydantic":
+        """Map an ``agent_events`` row dict onto the shared entry shape.
+
+        ``message`` prefers the human ``summary`` and falls back to the raw
+        event name; ``stage`` shows the tool (or phase) so the viewer's stage
+        column stays meaningful; ``logger_name`` groups rows under ``agent.*``.
+        """
+        event = row.get("event") or ""
+        summary = row.get("summary")
+        tool_name = row.get("tool_name")
+        phase = row.get("phase")
+        message = summary or event or ""
+        return Log.AgentStreamEntryPydantic(
+            id=int(row.get("id") or 0),
+            timestamp=row.get("timestamp") or "",
+            level=row.get("level") or "INFO",
+            audience=str(Log.Audience.AGENT),
+            logger_name=f"agent.{event}" if event else "agent",
+            message=message,
+            stage=tool_name or phase,
+            event=event or None,
+            phase=phase,
+            tool_name=tool_name,
+            run_id=row.get("run_id"),
+            objects=row.get("payload"),
+        )
 
 
 # Set default values for dataclass fields after Log class is fully defined

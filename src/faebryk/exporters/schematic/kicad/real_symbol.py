@@ -19,7 +19,11 @@ import logging
 import math
 from pathlib import Path
 
-from faebryk.exporters.schematic.kicad.generic_symbol import SymbolDef, escape
+from faebryk.exporters.schematic.kicad.generic_symbol import (
+    PinGeo,
+    SymbolDef,
+    escape,
+)
 from faebryk.libs.kicad.fileformats import kicad
 
 logger = logging.getLogger(__name__)
@@ -109,15 +113,50 @@ def build_real_symbol(lib_id: str, sym_file) -> SymbolDef | None:
     header_bits.append("(in_bom yes) (on_board yes)")
 
     pin_xy: dict[str, tuple[float, float]] = {}
+    pin_geo: dict[str, PinGeo] = {}
     unit_blocks: list[str] = []
+    xs: list[float] = []
+    ys: list[float] = []
+
+    def _extend(*points: tuple[float, float]) -> None:
+        for px, py in points:
+            xs.append(px)
+            ys.append(py)
+
     for unit in top.symbols:
         body: list[str] = []
-        body += [_rectangle(r) for r in unit.rectangles]
-        body += [_polyline(p) for p in unit.polylines]
-        body += [_circle(c) for c in unit.circles]
-        body += [_arc(a) for a in unit.arcs]
+        for r in unit.rectangles:
+            _extend((r.start.x, r.start.y), (r.end.x, r.end.y))
+            body.append(_rectangle(r))
+        for p in unit.polylines:
+            _extend(*((pt.x, pt.y) for pt in p.pts.xys))
+            body.append(_polyline(p))
+        for c in unit.circles:
+            radius = math.hypot(c.end.x - c.center.x, c.end.y - c.center.y)
+            _extend(
+                (c.center.x - radius, c.center.y - radius),
+                (c.center.x + radius, c.center.y + radius),
+            )
+            body.append(_circle(c))
+        for a in unit.arcs:
+            _extend((a.start.x, a.start.y), (a.mid.x, a.mid.y), (a.end.x, a.end.y))
+            body.append(_arc(a))
         for pin in unit.pins:
+            angle = pin.at.r if pin.at.r is not None else 0
+            length = pin.length or 0.0
             pin_xy[pin.number.number] = (pin.at.x, pin.at.y)
+            pin_geo[pin.number.number] = PinGeo(
+                x=pin.at.x, y=pin.at.y, angle=angle, length=length
+            )
+            # Connection point and the body-side end of the drawn pin.
+            rad = math.radians(angle)
+            _extend(
+                (pin.at.x, pin.at.y),
+                (
+                    pin.at.x + length * math.cos(rad),
+                    pin.at.y + length * math.sin(rad),
+                ),
+            )
             body.append(_pin(pin))
         unit_blocks.append(
             f'      (symbol "{escape(unit.name)}"\n' + "\n".join(body) + "\n      )"
@@ -125,6 +164,8 @@ def build_real_symbol(lib_id: str, sym_file) -> SymbolDef | None:
 
     if not pin_xy:
         return None
+
+    bbox = (min(xs), min(ys), max(xs), max(ys)) if xs else None
 
     text = (
         f'    (symbol "{lib_id}" {" ".join(header_bits)}\n'
@@ -134,7 +175,12 @@ def build_real_symbol(lib_id: str, sym_file) -> SymbolDef | None:
         + "\n    )"
     )
     return SymbolDef(
-        lib_id=lib_id, lib_symbol_text=text, pin_xy=pin_xy, is_fallback=False
+        lib_id=lib_id,
+        lib_symbol_text=text,
+        pin_xy=pin_xy,
+        is_fallback=False,
+        pin_geo=pin_geo,
+        bbox=bbox,
     )
 
 

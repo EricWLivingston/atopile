@@ -15,13 +15,28 @@ the caller), the lib-symbol name equals the instance ``lib_id``, and child unit 
 use the bare (library-less) name prefix.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 PIN_LENGTH = 2.54
 GRID = 2.54
 # Lane spacing for wire-mode bottom-edge pins. The ladder renderer assigns global
 # x-lanes at this same pitch, so each pin lands in its own lane.
 WIRE_PIN_PITCH = 5.08
+
+
+@dataclass(frozen=True)
+class PinGeo:
+    """Full pin geometry in symbol coordinates (Y up).
+
+    ``(x, y)`` is the electrical connection point; ``angle`` is the direction the pin
+    extends *toward the symbol body* (KiCad convention — a left-edge pin has angle 0),
+    so the outward direction is ``angle + 180``. ``length`` is the drawn pin length.
+    """
+
+    x: float
+    y: float
+    angle: float
+    length: float
 
 
 @dataclass
@@ -39,6 +54,20 @@ class SymbolDef:
 
     is_fallback: bool = False
     """True if this is a synthesised generic box rather than a real symbol."""
+
+    pin_geo: dict[str, PinGeo] = field(default_factory=dict)
+    """Pin number -> full geometry (connection point, body angle, length)."""
+
+    bbox: tuple[float, float, float, float] | None = None
+    """Symbol-space extent ``(min_x, min_y, max_x, max_y)`` of body + pins (Y up)."""
+
+    @property
+    def width(self) -> float:
+        return (self.bbox[2] - self.bbox[0]) if self.bbox else 0.0
+
+    @property
+    def height(self) -> float:
+        return (self.bbox[3] - self.bbox[1]) if self.bbox else 0.0
 
 
 def escape(s: str) -> str:
@@ -65,10 +94,12 @@ def build_generic_symbol(lib_id: str, pin_numbers: list[str]) -> SymbolDef:
     half_h = (rows - 1) * GRID / 2 + GRID
 
     pin_xy: dict[str, tuple[float, float]] = {}
+    pin_geo: dict[str, PinGeo] = {}
     pin_blocks: list[str] = []
 
     def add_pin(num: str, x: float, y: float, rot: int) -> None:
         pin_xy[num] = (x, y)
+        pin_geo[num] = PinGeo(x=x, y=y, angle=rot, length=PIN_LENGTH)
         pin_blocks.append(
             f"        (pin passive line (at {x} {y} {rot}) (length {PIN_LENGTH})\n"
             f'          (name "~" (effects (font (size 1.27 1.27))))\n'
@@ -101,7 +132,12 @@ def build_generic_symbol(lib_id: str, pin_numbers: list[str]) -> SymbolDef:
     )
 
     return SymbolDef(
-        lib_id=lib_id, lib_symbol_text=text, pin_xy=pin_xy, is_fallback=True
+        lib_id=lib_id,
+        lib_symbol_text=text,
+        pin_xy=pin_xy,
+        is_fallback=True,
+        pin_geo=pin_geo,
+        bbox=(-(half_w + PIN_LENGTH), -half_h, half_w + PIN_LENGTH, half_h),
     )
 
 
@@ -152,7 +188,12 @@ def build_power_symbol(lib_id: str, net_name: str, *, ground: bool) -> SymbolDef
         f"    )"
     )
     return SymbolDef(
-        lib_id=lib_id, lib_symbol_text=text, pin_xy={"1": (0.0, 0.0)}, is_fallback=True
+        lib_id=lib_id,
+        lib_symbol_text=text,
+        pin_xy={"1": (0.0, 0.0)},
+        is_fallback=True,
+        pin_geo={"1": PinGeo(x=0.0, y=0.0, angle=pin_rot, length=0.0)},
+        bbox=(-1.27, -2.54, 1.27, 0.0) if ground else (-0.762, 0.0, 0.762, 2.54),
     )
 
 
@@ -184,7 +225,12 @@ def build_pwr_flag_symbol(lib_id: str) -> SymbolDef:
         f"    )"
     )
     return SymbolDef(
-        lib_id=lib_id, lib_symbol_text=text, pin_xy={"1": (0.0, 0.0)}, is_fallback=True
+        lib_id=lib_id,
+        lib_symbol_text=text,
+        pin_xy={"1": (0.0, 0.0)},
+        is_fallback=True,
+        pin_geo={"1": PinGeo(x=0.0, y=0.0, angle=90, length=0.0)},
+        bbox=(-1.016, 0.0, 1.016, 2.54),
     )
 
 
@@ -206,10 +252,12 @@ def build_wire_box(lib_id: str, pin_numbers: list[str]) -> SymbolDef:
     pin_y = -(half_h + PIN_LENGTH)  # connection point below the body
 
     pin_xy: dict[str, tuple[float, float]] = {}
+    pin_geo: dict[str, PinGeo] = {}
     pin_blocks: list[str] = []
     for k, num in enumerate(nums):
         x = (k - (n - 1) / 2) * WIRE_PIN_PITCH
         pin_xy[num] = (x, pin_y)
+        pin_geo[num] = PinGeo(x=x, y=pin_y, angle=90, length=PIN_LENGTH)
         pin_blocks.append(
             f"        (pin passive line (at {x} {pin_y} 90) (length {PIN_LENGTH})\n"
             f'          (name "~" (effects (font (size 1.27 1.27))))\n'
@@ -237,5 +285,10 @@ def build_wire_box(lib_id: str, pin_numbers: list[str]) -> SymbolDef:
     )
 
     return SymbolDef(
-        lib_id=lib_id, lib_symbol_text=text, pin_xy=pin_xy, is_fallback=True
+        lib_id=lib_id,
+        lib_symbol_text=text,
+        pin_xy=pin_xy,
+        is_fallback=True,
+        pin_geo=pin_geo,
+        bbox=(-half_w, -(half_h + PIN_LENGTH), half_w, half_h),
     )

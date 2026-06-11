@@ -30,12 +30,17 @@ import faebryk.core.node as fabll
 import faebryk.library._F as F
 from faebryk.exporters.schematic.kicad.generic_symbol import (
     WIRE_PIN_PITCH,
+    PinGeo,
     SymbolDef,
     build_generic_symbol,
     build_power_symbol,
     build_pwr_flag_symbol,
     build_wire_box,
     escape,
+)
+from faebryk.exporters.schematic.kicad.placement import (
+    place_components,
+    sheet_extent,
 )
 from faebryk.exporters.schematic.kicad.real_symbol import real_symbol_from_file
 from faebryk.libs.util import sanitize_filepath_part
@@ -71,6 +76,52 @@ SHEET_Y0 = 25.4
 SHEET_DY = 20.32
 SHEET_W = 33.02
 SHEET_H = 12.7
+
+# Power-glyph stub: short wire drawn from a rail pin outward to its power symbol.
+POWER_STUB = 5.08
+
+# Paper sizes (landscape, mm) tried smallest-first for hierarchical sheets.
+_PAPER_SIZES = [("A4", 297.0, 210.0), ("A3", 420.0, 297.0), ("A2", 594.0, 420.0)]
+
+
+def _pick_paper(extent: tuple[float, float]) -> str:
+    ex, ey = extent
+    for name, w, h in _PAPER_SIZES:
+        if ex + 12.7 <= w and ey + 12.7 <= h:
+            return name
+    return _PAPER_SIZES[-1][0]
+
+
+# --- pin direction math (screen space: x right, y down) -------------------------------
+# A symbol pin's ``angle`` points toward the body, so outward = angle + 180 (symbol
+# space, y up). Instantiation flips y, so the screen direction negates the y component.
+_OUTWARD_SCREEN: dict[float, tuple[int, int]] = {
+    0.0: (1, 0),  # outward right
+    90.0: (0, -1),  # outward up (screen)
+    180.0: (-1, 0),  # outward left
+    270.0: (0, 1),  # outward down (screen)
+}
+
+
+def _screen_outward(pin: PinGeo) -> tuple[int, int] | None:
+    """Outward unit direction of a pin on screen, or None for off-axis pins."""
+    return _OUTWARD_SCREEN.get((pin.angle + 180.0) % 360.0)
+
+
+# Instance rotation r is applied CCW in symbol space, then y flips:
+# body_screen = (bx*cos r - by*sin r, -(bx*sin r + by*cos r)).
+# GND's body extends to symbol -y (screen down at r=0); PWR/PWR_FLAG to symbol +y
+# (screen up at r=0). These tables map desired screen body direction -> rotation.
+_GND_ROT = {(0, 1): 0, (1, 0): 90, (0, -1): 180, (-1, 0): 270}
+_PWR_ROT = {(0, -1): 0, (-1, 0): 90, (0, 1): 180, (1, 0): 270}
+
+# Oriented global labels: (rotation, justify) so text reads outward from the pin.
+_LABEL_ORIENT = {
+    (1, 0): (0, "left"),
+    (0, -1): (90, "left"),
+    (-1, 0): (180, "right"),
+    (0, 1): (270, "right"),
+}
 
 
 def _u() -> str:
@@ -404,14 +455,21 @@ def _instance_block(comp: ComponentIR, sym: SymbolDef, ix: float, iy: float) -> 
     pin_lines = "\n".join(
         f'    (pin "{escape(num)}" (uuid {_u()}))' for num in sym.pin_xy
     )
+    # Anchor ref above / value below the symbol's real extent (legacy fixed offsets
+    # collide on anything bigger or smaller than the old one-size grid cell).
+    bb = sym.bbox or (-7.62, -12.7, 7.62, 12.7)
+    ref_y = iy - bb[3] - 1.27
+    val_y = iy - bb[1] + 1.27
     return (
         f'  (symbol (lib_id "{sym.lib_id}") (at {ix} {iy} 0) (unit 1)\n'
         f"    (in_bom yes) (on_board yes) (fields_autoplaced)\n"
         f"    (uuid {comp.inst_uuid})\n"
-        f'    (property "Reference" "{escape(comp.ref)}" (id 0) (at {ix} {iy - 12.7} 0)'
-        f" (effects (font (size 1.27 1.27))))\n"
-        f'    (property "Value" "{escape(comp.value)}" (id 1) (at {ix} {iy + 12.7} 0)'
-        f" (effects (font (size 1.27 1.27))))\n"
+        f'    (property "Reference" "{escape(comp.ref)}" (id 0)'
+        f" (at {ix + bb[0]} {ref_y} 0)"
+        f" (effects (font (size 1.27 1.27)) (justify left)))\n"
+        f'    (property "Value" "{escape(comp.value)}" (id 1)'
+        f" (at {ix + bb[0]} {val_y} 0)"
+        f" (effects (font (size 1.27 1.27)) (justify left)))\n"
         f'    (property "Footprint" "" (id 2) (at {ix} {iy} 0)'
         f" (effects (font (size 1.27 1.27)) hide))\n"
         f'    (property "Datasheet" "" (id 3) (at {ix} {iy} 0)'
@@ -422,17 +480,34 @@ def _instance_block(comp: ComponentIR, sym: SymbolDef, ix: float, iy: float) -> 
 
 
 def _power_instance_block(
-    lib_id: str, value: str, ref: str, x: float, y: float, inst_uuid: str
+    lib_id: str,
+    value: str,
+    ref: str,
+    x: float,
+    y: float,
+    inst_uuid: str,
+    rot: int = 0,
+    value_at: tuple[float, float, str] | None = None,
 ) -> str:
-    """A single-pin power-symbol (or PWR_FLAG) instance at ``(x, y)``, hidden ref."""
+    """A single-pin power-symbol (or PWR_FLAG) instance at ``(x, y)``, hidden ref.
+
+    ``value_at`` overrides the net-name text position/justify (kept horizontal at
+    angle 0 regardless of ``rot`` so rotated glyphs never get vertical text).
+    """
+    vx, vy, vjust = value_at if value_at else (x, y - 3.81, "")
+    vj = f" (justify {vjust})" if vjust else ""
+    veffects = f"(effects (font (size 1.27 1.27)){vj})"
+    # Property text angle is relative to the instance rotation; compensate so the
+    # net-name text stays horizontal whatever way the glyph points.
+    vrot = (360 - rot) % 360
     return (
-        f'  (symbol (lib_id "{lib_id}") (at {x} {y} 0) (unit 1)\n'
+        f'  (symbol (lib_id "{lib_id}") (at {x} {y} {rot}) (unit 1)\n'
         f"    (in_bom yes) (on_board yes) (fields_autoplaced)\n"
         f"    (uuid {inst_uuid})\n"
         f'    (property "Reference" "{escape(ref)}" (id 0) (at {x} {y - 5.08} 0)'
         f" (effects (font (size 1.27 1.27)) hide))\n"
-        f'    (property "Value" "{escape(value)}" (id 1) (at {x} {y - 3.81} 0)'
-        f" (effects (font (size 1.27 1.27))))\n"
+        f'    (property "Value" "{escape(value)}" (id 1) (at {vx} {vy} {vrot})'
+        f" {veffects})\n"
         f'    (property "Footprint" "" (id 2) (at {x} {y} 0)'
         f" (effects (font (size 1.27 1.27)) hide))\n"
         f'    (property "Datasheet" "" (id 3) (at {x} {y} 0)'
@@ -442,11 +517,13 @@ def _power_instance_block(
     )
 
 
-def _label_block(net: str, x: float, y: float) -> str:
+def _label_block(
+    net: str, x: float, y: float, rot: int = 180, justify: str = "right"
+) -> str:
     return (
-        f'  (global_label "{escape(net)}" (shape bidirectional) (at {x} {y} 180)'
+        f'  (global_label "{escape(net)}" (shape bidirectional) (at {x} {y} {rot})'
         f" (fields_autoplaced)\n"
-        f"    (effects (font (size 1.27 1.27)) (justify right))\n"
+        f"    (effects (font (size 1.27 1.27)) (justify {justify}))\n"
         f"    (uuid {_u()}))"
     )
 
@@ -722,6 +799,14 @@ def render_sheet_tree(
     n_components = sum(len(s.components) for s in root.walk())
     summary = SchematicSummary(components=n_components, nets=len(net_names))
 
+    # Global net degree (pin count per net) for placement affinity scoring.
+    net_degree: dict[str, int] = {}
+    for s in root.walk():
+        for comp in s.components:
+            for p in comp.pins:
+                if p.net:
+                    net_degree[p.net] = net_degree.get(p.net, 0) + 1
+
     # Pass 1: assign each non-root sheet a uuid + filename and its root->sheet path. The
     # filename is **deterministic** — derived from the module's sanitized name path, not
     # the (per-build random) uuid — so rebuilds reuse the same files. ``seen_stems``
@@ -769,10 +854,22 @@ def render_sheet_tree(
         path = path_by_sheet[id(sheet)]
         instances: list[str] = []
         labels: list[str] = []
+        wires: list[str] = []
         used: set[str] = set()
 
-        def _place_power(net: str, ground: bool, lx: float, ly: float) -> None:
-            """Drop a power glyph on a rail pin (+ one shared PWR_FLAG per net)."""
+        def _place_power(
+            net: str,
+            ground: bool,
+            lx: float,
+            ly: float,
+            outward: tuple[int, int] | None,
+        ) -> None:
+            """Auto-wire a rail pin: stub wire outward to an oriented power glyph
+            (+ one shared PWR_FLAG per net at the first stub end).
+
+            With no usable direction (off-axis pin) the glyph sits directly on the
+            pin point — the legacy, still-correct form (connection is by pin name).
+            """
             lib_id = (
                 f"{LIB_PREFIX}:{'GND' if ground else 'PWR'}_"
                 f"{sanitize_filepath_part(net) or 'net'}"
@@ -783,10 +880,37 @@ def render_sheet_tree(
                 power_sym_cache[lib_id] = psym
             registry.add(psym)
             used.add(lib_id)
+
+            sx, sy, rot, value_at = lx, ly, 0, None
+            flag_rot, flag_value_at = 0, None
+            if outward is not None:
+                dx, dy = outward
+                sx, sy = lx + dx * POWER_STUB, ly + dy * POWER_STUB
+                rot = (_GND_ROT if ground else _PWR_ROT)[outward]
+                wires.append(_wire_block(lx, ly, sx, sy))
+                summary.wires += 1
+                # Net-name text just past the glyph tip, horizontal, reading outward
+                # (adjacent 2.54-pitch rail pins would otherwise collide vertically).
+                glyph = 2.54
+                tx, ty = sx + dx * (glyph + 0.64), sy + dy * (glyph + 1.6)
+                value_at = (tx, ty, "left" if dx > 0 else ("right" if dx < 0 else ""))
+                # PWR_FLAG body sits perpendicular to the stub so it never overlaps
+                # the glyph; its text goes at the flag tip.
+                fdx, fdy = ((0, -1) if dy == 0 else (1, 0))
+                flag_rot = _PWR_ROT[(fdx, fdy)]
+                ftx, fty = sx + fdx * (glyph + 0.64), sy + fdy * (glyph + 1.6)
+                flag_value_at = (
+                    ftx,
+                    fty,
+                    "left" if fdx > 0 else ("right" if fdx < 0 else ""),
+                )
+
             pwr_n[0] += 1
             inst = _u()
             instances.append(
-                _power_instance_block(lib_id, net, f"#PWR{pwr_n[0]:04d}", lx, ly, inst)
+                _power_instance_block(
+                    lib_id, net, f"#PWR{pwr_n[0]:04d}", sx, sy, inst, rot, value_at
+                )
             )
             symbol_instances.append(
                 f'    (path "/{"/".join(path + [inst])}"'
@@ -804,7 +928,14 @@ def render_sheet_tree(
             finst = _u()
             instances.append(
                 _power_instance_block(
-                    flag_def.lib_id, "PWR_FLAG", f"#FLG{flg_n[0]:04d}", lx, ly, finst
+                    flag_def.lib_id,
+                    "PWR_FLAG",
+                    f"#FLG{flg_n[0]:04d}",
+                    sx,
+                    sy,
+                    finst,
+                    flag_rot,
+                    flag_value_at,
                 )
             )
             symbol_instances.append(
@@ -813,13 +944,20 @@ def render_sheet_tree(
                 f' (value "PWR_FLAG") (footprint ""))'
             )
 
-        for i, comp in enumerate(sheet.components):
-            sym = registry.resolve(comp)
+        # Resolve symbols first, then place the whole sheet by connectivity:
+        # ICs anchor, passives orbit the anchor they share the most nets with.
+        sym_by_ref = {c.ref: registry.resolve(c) for c in sheet.components}
+        # Keep clear of the child-sheet reference column when one exists.
+        place_origin = (58.42, 25.4) if sheet.children else (25.4, 25.4)
+        positions = place_components(
+            sheet.components, sym_by_ref, net_degree, origin=place_origin
+        )
+
+        for comp in sheet.components:
+            sym = sym_by_ref[comp.ref]
             used.add(sym.lib_id)
             comp.inst_uuid = _u()
-            col, row = i % DEFAULT_COLS, i // DEFAULT_COLS
-            ix = ORIGIN_X + col * COL_PITCH
-            iy = ORIGIN_Y + row * ROW_PITCH
+            ix, iy = positions[comp.ref]
             instances.append(_instance_block(comp, sym, ix, iy))
 
             net_by_num = {p.number: p.net for p in comp.pins}
@@ -828,11 +966,14 @@ def render_sheet_tree(
                 if net is None:
                     continue
                 lx, ly = ix + px, iy - py
+                geo = sym.pin_geo.get(num)
+                outward = _screen_outward(geo) if geo else None
                 role = roles.get(net, NetRole.SIGNAL)
                 if role is NetRole.POWER or role is NetRole.GROUND:
-                    _place_power(net, role is NetRole.GROUND, lx, ly)
+                    _place_power(net, role is NetRole.GROUND, lx, ly, outward)
                 else:
-                    labels.append(_label_block(net, lx, ly))
+                    rot, justify = _LABEL_ORIENT.get(outward, (180, "right"))
+                    labels.append(_label_block(net, lx, ly, rot, justify))
                     summary.labels += 1
             summary.unmapped_pads += sum(
                 1 for num in net_by_num if num not in sym.pin_xy
@@ -853,17 +994,30 @@ def render_sheet_tree(
         for ch in sheet.children:
             _emit(ch, False)
 
+        # Content-aware paper size: component extent + the child-sheet ref column.
+        ex, ey = sheet_extent(positions, sym_by_ref)
+        if sheet.children:
+            ex = max(ex, SHEET_X + SHEET_W)
+            ey = max(ey, SHEET_Y0 + len(sheet.children) * SHEET_DY)
+        paper = _pick_paper((ex, ey))
+        title_block = (
+            f'  (title_block (title "{escape(sheet.name)}")'
+            f' (comment 1 "generated by atopile"))\n'
+        )
+
         body = (
             f"  (lib_symbols\n{registry.lib_symbols_text_for(used)}\n  )\n"
             f"{chr(10).join(instances)}\n"
             f"{chr(10).join(sheet_refs)}\n"
+            f"{chr(10).join(wires)}\n"
             f"{chr(10).join(labels)}\n"
         )
         if is_root:
             doc = (
                 f"(kicad_sch (version {SCH_VERSION}) (generator eeschema)\n"
                 f"  (uuid {_u()})\n"
-                f'  (paper "{PAPER}")\n'
+                f'  (paper "{paper}")\n'
+                f"{title_block}"
                 f"{body}"
                 f"  (sheet_instances\n{chr(10).join(sheet_instances)}\n  )\n"
                 f"  (symbol_instances\n{chr(10).join(symbol_instances)}\n  )\n"
@@ -873,7 +1027,8 @@ def render_sheet_tree(
             doc = (
                 f"(kicad_sch (version {SCH_VERSION}) (generator eeschema)\n"
                 f"  (uuid {_u()})\n"
-                f'  (paper "{PAPER}")\n'
+                f'  (paper "{paper}")\n'
+                f"{title_block}"
                 f"{body}"
                 f")\n"
             )

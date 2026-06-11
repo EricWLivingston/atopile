@@ -42,6 +42,14 @@ class AgentConfig:
     base_url: str = "https://api.openai.com/v1"
     model: str = "gpt-5.4"
     summary_model: str = "gpt-4.1-nano"
+    # Dynamic complexity routing (EE addition; anthropic-only, opt-in). When
+    # ``dynamic_model`` is true the runner classifies each user turn and picks
+    # ``model_simple`` / ``model`` / ``model_complex``; the classifier itself runs
+    # on ``router_model``. Off by default so upstream behavior is untouched.
+    dynamic_model: bool = False
+    model_simple: str = ""
+    model_complex: str = ""
+    router_model: str = ""
     api_key: str | None = None
     timeout_s: float = 120.0
     summary_timeout_s: float = 8.0
@@ -127,6 +135,8 @@ class AgentConfig:
             # Reuse the (known-valid) main model for summaries; override with
             # ATOPILE_AGENT_SUMMARY_MODEL for a cheaper summarizer.
             default_summary_model = "claude-sonnet-4-6"
+            default_model_simple = "claude-haiku-4-5-20251001"
+            default_model_complex = "claude-opus-4-8"
         else:
             api_key = os.getenv("ATOPILE_AGENT_OPENAI_API_KEY") or os.getenv(
                 "OPENAI_API_KEY"
@@ -134,6 +144,20 @@ class AgentConfig:
             base_url = _env("ATOPILE_AGENT_BASE_URL", "https://api.openai.com/v1")
             default_model = "gpt-5.4"
             default_summary_model = "gpt-4.1-nano"
+            default_model_simple = ""
+            default_model_complex = ""
+
+        # Dynamic complexity routing is anthropic-only in v1: the Anthropic
+        # provider is stateless-emulated (full transcript rebuilt per call), so a
+        # per-call model switch is provably safe; the OpenAI Responses chain
+        # references server-side state created under one model and is unverified.
+        dynamic_model = (
+            provider == "anthropic"
+            and _env("EE_AGENT_DYNAMIC_MODEL", "0").strip().lower()
+            not in _TRACE_DISABLE_VALUES | {""}
+        )
+        model_simple = _env("ATOPILE_AGENT_MODEL_SIMPLE", default_model_simple)
+        model_complex = _env("ATOPILE_AGENT_MODEL_COMPLEX", default_model_complex)
 
         fixed_skill_ids = ["agent", "ato", "planning"]
         return cls(
@@ -141,6 +165,10 @@ class AgentConfig:
             base_url=base_url,
             model=_env("ATOPILE_AGENT_MODEL", default_model),
             summary_model=_env("ATOPILE_AGENT_SUMMARY_MODEL", default_summary_model),
+            dynamic_model=dynamic_model,
+            model_simple=model_simple,
+            model_complex=model_complex,
+            router_model=_env("ATOPILE_AGENT_ROUTER_MODEL", model_simple),
             api_key=api_key,
             timeout_s=_env_float("ATOPILE_AGENT_TIMEOUT_S", "120"),
             summary_timeout_s=_env_float(

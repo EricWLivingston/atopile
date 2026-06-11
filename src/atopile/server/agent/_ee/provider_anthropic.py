@@ -86,6 +86,7 @@ class AnthropicProvider:
         skill_state: dict[str, Any],
         project_path: Any,
         previous_response_id: str | None = None,
+        model: str | None = None,
     ) -> LLMResponse:
         # 1) Translate this turn's delta (OpenAI-format) → Anthropic-format.
         delta = _convert_messages_openai_to_anthropic(messages)
@@ -98,8 +99,11 @@ class AnthropicProvider:
         anthropic_tools = [_convert_tool_def(t) for t in tools]
         system_blocks = _build_system_with_caching(instructions, skill_state)
 
+        # Per-call model override (dynamic complexity routing). Safe mid-chain:
+        # the transcript store doesn't condition on model, and every request
+        # rebuilds the full conversation anyway.
         payload: dict[str, Any] = {
-            "model": self._config.model,
+            "model": model or self._config.model,
             "max_tokens": _ANTHROPIC_MAX_OUTPUT_TOKENS,
             "system": system_blocks,
             "messages": conversation,

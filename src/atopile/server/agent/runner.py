@@ -398,6 +398,40 @@ class AgentRunner:
         selected = selected_targets or []
         include_primer = previous_response_id is None and len(history) == 0
 
+        # Dynamic complexity routing (EE, opt-in via EE_AGENT_DYNAMIC_MODEL):
+        # classify this user turn once and pick a tier-matched model, threaded
+        # through every provider call below as a per-call override. The provider
+        # singleton is shared across sessions, so the model must never be set by
+        # mutating config/provider state.
+        effective_model = cfg.model
+        routed_tier: str | None = None
+        # getattr: tests drive run_turn with minimal duck-typed configs.
+        if getattr(cfg, "dynamic_model", False):
+            from atopile.server.agent._ee.model_router import (
+                classify_turn,
+                tier_to_model,
+            )
+
+            routed_tier = await classify_turn(
+                user_message,
+                has_active_design=previous_response_id is not None
+                or bool(prior_skill_state),
+                history_len=len(history),
+                config=cfg,
+            )
+            effective_model = tier_to_model(routed_tier, cfg)
+            await self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "thinking",
+                    "step_kind": "model_routed",
+                    "model": effective_model,
+                    "tier": routed_tier,
+                    "status_text": f"Routed turn to the {routed_tier} tier",
+                    "detail_text": effective_model,
+                },
+            )
+
         # Build system prompt + skill state
         instructions, skill_state = build_system_prompt(
             config=cfg,
@@ -519,7 +553,8 @@ class AgentRunner:
             active_trace,
             "turn_started",
             {
-                "model": cfg.model,
+                "model": effective_model,
+                "routed_tier": routed_tier,
                 "project_root": str(project_path),
                 "selected_targets": list(selected),
                 "history_items": len(history),
@@ -550,7 +585,7 @@ class AgentRunner:
                     "phase": "thinking",
                     "step_kind": "model_request_started",
                     "loop": loop,
-                    "model": cfg.model,
+                    "model": effective_model,
                     "previous_response_id": previous_response_id_for_call,
                     "duration_ms": decision_duration_ms,
                     "status_text": status_text,
@@ -566,6 +601,7 @@ class AgentRunner:
                 skill_state=skill_state,
                 project_path=project_path,
                 previous_response_id=previous_response_id_for_call,
+                model=effective_model,
             )
 
             response_received_at = time.monotonic()
@@ -615,7 +651,7 @@ class AgentRunner:
                     "phase": "thinking",
                     "step_kind": "model_response_received",
                     "loop": loop,
-                    "model": cfg.model,
+                    "model": effective_model,
                     "response_id": response.id,
                     "previous_response_id": previous_response_id_for_call,
                     "duration_ms": model_duration_ms,
@@ -1028,6 +1064,7 @@ class AgentRunner:
                         skill_state=skill_state,
                         project_path=project_path,
                         previous_response_id=last_response_id,
+                        model=effective_model,
                     )
                     last_response_id = response.id or last_response_id
                     if turn_state.checklist is not None:
@@ -1035,7 +1072,7 @@ class AgentRunner:
                     return AgentTurnResult(
                         text=response.text or "Stopped.",
                         tool_traces=traces,
-                        model=cfg.model,
+                        model=effective_model,
                         response_id=last_response_id,
                         skill_state=skill_state,
                         context_metrics=telemetry,
@@ -1092,7 +1129,7 @@ class AgentRunner:
                 return AgentTurnResult(
                     text=text,
                     tool_traces=traces,
-                    model=cfg.model,
+                    model=effective_model,
                     response_id=last_response_id,
                     skill_state=skill_state,
                     context_metrics=telemetry,
@@ -1301,6 +1338,7 @@ class AgentRunner:
                     active_trace=active_trace,
                     loops=loops,
                     reason="force_turn_end",
+                    model=effective_model,
                 )
                 if turn_state.checklist is not None:
                     turn_state.checklist.save_to_skill_state(skill_state)
@@ -1325,7 +1363,7 @@ class AgentRunner:
                 return AgentTurnResult(
                     text="",
                     tool_traces=traces,
-                    model=cfg.model,
+                    model=effective_model,
                     response_id=last_response_id,
                     skill_state=skill_state,
                     context_metrics=telemetry,
@@ -1363,6 +1401,7 @@ class AgentRunner:
                     active_trace=active_trace,
                     loops=loops,
                     reason="turn_time_budget_exceeded",
+                    model=effective_model,
                 )
                 return self._stop(
                     reason="turn_time_budget_exceeded",
@@ -1410,6 +1449,7 @@ class AgentRunner:
                     skill_state=skill_state,
                     project_path=project_path,
                     previous_response_id=last_response_id,
+                    model=effective_model,
                 )
                 last_response_id = response.id or last_response_id
                 if turn_state.checklist is not None:
@@ -1417,7 +1457,7 @@ class AgentRunner:
                 return AgentTurnResult(
                     text=response.text or "Stopped.",
                     tool_traces=traces,
-                    model=cfg.model,
+                    model=effective_model,
                     response_id=last_response_id,
                     skill_state=skill_state,
                     context_metrics=telemetry,
@@ -1454,7 +1494,7 @@ class AgentRunner:
                     "phase": "thinking",
                     "step_kind": "loop_summary",
                     "loop": loops,
-                    "model": cfg.model,
+                    "model": effective_model,
                     "duration_ms": max(
                         0, int((time.monotonic() - loop_started_at) * 1000)
                     ),
@@ -1596,6 +1636,7 @@ class AgentRunner:
         active_trace: TraceCallback | None,
         loops: int,
         reason: str,
+        model: str | None = None,
     ) -> str | None:
         if not outputs:
             return previous_response_id
@@ -1607,6 +1648,7 @@ class AgentRunner:
             skill_state=skill_state,
             project_path=project_path,
             previous_response_id=previous_response_id,
+            model=model,
         )
         next_response_id = closing_response.id or previous_response_id
         if closing_response.tool_calls:
@@ -2069,6 +2111,7 @@ class _StubProvider:
         skill_state,
         project_path,
         previous_response_id=None,
+        model=None,
     ) -> LLMResponse:
         self.calls.append(
             {
@@ -2078,6 +2121,7 @@ class _StubProvider:
                 "skill_state": dict(skill_state),
                 "project_path": str(project_path),
                 "previous_response_id": previous_response_id,
+                "model": model,
             }
         )
         if len(self.calls) == 1:
@@ -2289,6 +2333,7 @@ class TestRunner:
                 skill_state,
                 project_path,
                 previous_response_id=None,
+                model=None,
             ) -> LLMResponse:
                 self.calls += 1
                 if self.calls == 1:
@@ -2403,6 +2448,7 @@ class TestRunner:
                 skill_state,
                 project_path,
                 previous_response_id=None,
+                model=None,
             ) -> LLMResponse:
                 self.calls.append(
                     {
@@ -2518,6 +2564,7 @@ class TestRunner:
                 skill_state,
                 project_path,
                 previous_response_id=None,
+                model=None,
             ) -> LLMResponse:
                 self.calls.append(
                     {
@@ -2636,6 +2683,7 @@ class TestRunner:
                 skill_state,
                 project_path,
                 previous_response_id=None,
+                model=None,
             ) -> LLMResponse:
                 self.calls.append(
                     {
@@ -2754,6 +2802,7 @@ class TestRunner:
                 skill_state,
                 project_path,
                 previous_response_id=None,
+                model=None,
             ) -> LLMResponse:
                 _ = (
                     messages,

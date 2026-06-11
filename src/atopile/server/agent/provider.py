@@ -69,6 +69,7 @@ class LLMProvider(Protocol):
         skill_state: dict[str, Any],
         project_path: Any,
         previous_response_id: str | None = None,
+        model: str | None = None,
     ) -> LLMResponse: ...
 
 
@@ -103,12 +104,14 @@ class OpenAIProvider:
         skill_state: dict[str, Any],
         project_path: Any,
         previous_response_id: str | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         from pathlib import Path
 
+        effective_model = model or self._config.model
         pp = project_path if isinstance(project_path, Path) else Path(str(project_path))
         payload: dict[str, Any] = {
-            "model": self._config.model,
+            "model": effective_model,
             "input": messages,
             "instructions": instructions,
             "tools": tools,
@@ -118,7 +121,7 @@ class OpenAIProvider:
                 project_path=pp,
                 tool_defs=tools,
                 skill_state=skill_state,
-                model=self._config.model,
+                model=effective_model,
             ),
             "prompt_cache_retention": self._config.prompt_cache_retention,
         }
@@ -135,6 +138,7 @@ class OpenAIProvider:
         skill_state: dict[str, Any],
         project_path: Any,
         previous_response_id: str | None = None,
+        model: str | None = None,
     ) -> LLMResponse:
         payload = self._build_payload(
             messages=messages,
@@ -143,6 +147,7 @@ class OpenAIProvider:
             skill_state=skill_state,
             project_path=project_path,
             previous_response_id=previous_response_id,
+            model=model,
         )
         body = await self._request_with_retries(payload)
         return self._normalize_response(body)

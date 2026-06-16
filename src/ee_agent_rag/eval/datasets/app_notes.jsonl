@@ -1,0 +1,4 @@
+{"query": "What determines the transient response of an LDO regulator to a load current step?", "must_source_contain": "slva079"}
+{"query": "Why can an LDO regulator become unstable depending on the output capacitor ESR?", "must_source_contain": "slva079"}
+{"query": "How is dropout voltage defined for a low-dropout regulator?", "must_source_contain": "slva079"}
+{"query": "What is the difference between line regulation and load regulation?", "must_source_contain": "slva079"}

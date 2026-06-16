@@ -313,6 +313,7 @@ The goal is to **front-load all questions and decisions**, then implement withou
 Do steps 1-5 in a SINGLE turn — do not end your turn after announcing you will plan.
 
 1. **Read** existing project files to understand current state.
+   - **Research the topology before specifying it**: for any circuit/subsystem you haven't designed recently in this session, call `rag_search` for design guidance first (app notes, white papers, textbook chapters — e.g. "buck converter compensation", "USB ESD protection placement"). Carry the cited guidance into the spec's docstrings and constraints. Use `web_search` only if the knowledge base has nothing on the topic, and only against reputable sources (vendor sites/app notes, established references — see the `rag_search` skill's preferred-sites list).
 2. **Set up project structure** — create the project-level `ato.yaml` and `packages/` directories. Do not add manual package-wrapper build targets for generated local packages.
 3. **Write the spec** as `main.ato` — architecture with sub-modules, requirements in docstrings, interface connections, and formal constraints. Use standard library interfaces (CAN, I2C, SPI, SWD, USB2_0, ElectricPower, ElectricLogic, ElectricSignal) in the spec instead of inventing local interfaces unless there is a real reusable boundary not covered by stdlib.
 4. **Create checklist** with items for each package wrapper + integration + build.
@@ -326,8 +327,8 @@ Use `design_questions` any time you have multiple design decisions to gather. It
 
 ## Phase 3: Implement end-to-end (do not stop)
 
-7. **Create package wrappers** — one per IC. Install parts, inspect vendor datasheets/design guides with `web_search`, map pins to interfaces.
-   - Before committing to an unfamiliar IC, motor driver, PMIC, RF part, or other high-risk part, do a brief `web_search` pass to inspect the vendor datasheet/design guide, compare families, confirm the typical topology, and find reference-circuit guidance.
+7. **Create package wrappers** — one per IC. Install parts, look up vendor datasheets/design guides (`rag_search` first, `web_search` on reputable sites for what the corpus lacks), map pins to interfaces.
+   - Before committing to an unfamiliar IC, motor driver, PMIC, RF part, or other high-risk part, do a brief research pass: `rag_search` the knowledge base for the part/topology (datasheets, app notes, design guides are indexed with citations), then fill gaps with `web_search` — compare families, confirm the typical topology, and find reference-circuit guidance.
    - Keep wrappers reusable across projects. Expose generic chip capabilities and keep board-specific grouping and role naming in `main.ato` or project modules above the wrapper.
    - Start each wrapper as a basic reusable boundary with the minimum standard interfaces needed to validate the package target and integrate the design. Add more interfaces or alternate pin mappings later only if integration proves they are needed.
    - If a wrapper needs new supporting passives, crystals, or connectors while you are validating that package target, install them into the package project itself with `parts_install(project_path="packages/<name>")`.

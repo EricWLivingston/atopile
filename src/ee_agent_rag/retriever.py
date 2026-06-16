@@ -105,6 +105,8 @@ def _build_citation(metadata: dict) -> dict:
         "section": metadata.get("section"),
         "clause": metadata.get("clause"),
         "mpn": metadata.get("mpn"),
+        "book": metadata.get("book"),
+        "chapter": metadata.get("chapter"),
     }
 
 

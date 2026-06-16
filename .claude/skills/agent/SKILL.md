@@ -132,6 +132,7 @@ Do not repeat identical read/search calls. After sufficient context, execute or 
 - Use `web_search` for external/current web facts when project files do not contain the answer.
 - Use `web_search` for component-family research, application notes, reference designs, and topology validation before locking unfamiliar or high-risk parts.
 - Use `web_search` when a component datasheet or hardware design guide is needed. Search for the vendor datasheet, application notes, and support-circuit guidance before locking wrapper details.
+- For design-relevant research, prefer `rag_search` (the knowledge base: app notes, textbooks, datasheets — cited) first, and restrict `web_search` to **reputable sources** — vendor sites/app notes and established engineering references. `skill_read('rag_search')` lists the preferred sites to check first.
 
 ## Build Diagnostics
 - Prefer `build_logs_search` with explicit `log_levels`/`stage` filters when logs are noisy.
@@ -146,6 +147,11 @@ Do not repeat identical read/search calls. After sufficient context, execute or 
 ## Skill Library (on-demand guidance)
 - Beyond the always-loaded skills you have a wider skill library. Call `skills_list` to see what's available, then `skill_read('<id>')` to load one before a specialized or unfamiliar task instead of guessing.
 - Read the matching skill before first use of a specialized tool in a session — e.g. `skill_read('pyspice_run')` before simulating, `skill_read('rag_search')` before grounding datasheet claims. This is cheap and prevents wasted/incorrect tool calls.
+
+## Research Before Design
+- **Before authoring a new circuit or subsystem, search the knowledge base first**: call `rag_search` for design guidance on the topology you're about to build (app notes, white papers, textbook chapters, datasheets) — e.g. "LDO output capacitor ESR stability", "buck converter inductor selection", "RS-485 termination and biasing". Do this during planning, before writing `.ato`.
+- Carry retrieved guidance (with citations) into your plan and design decisions. One or two focused queries are enough; don't exhaustively search.
+- The knowledge base is the best source for **application guidance, theory, and worked examples**. `web_search` is still a valid complement for finding *designs* (reference circuits, proven implementations) — but only from reputable sources (vendor sites/app notes, established engineering references); `skill_read('rag_search')` lists the preferred sites to check first. Never base a design on an unattributed forum post or content-farm page.
 
 ## Verification & Simulation
 - Use `pyspice_run` ONLY to verify an analog subcircuit against a definable spec (oscillator frequency, switching-reg/LDO/RC transient, filter cutoff, bias point). Read `skill_read('pyspice_run')` first.

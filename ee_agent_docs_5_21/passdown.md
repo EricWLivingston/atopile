@@ -582,8 +582,18 @@ never in the UI.
   `sim_inspect(result_file, expr)` post-processing tool (`02_SIMULATION` §7); the
   "when to simulate" skill/prompt guidance (`02_SIMULATION` §6) — kept M5 to body+tests like
   M4, runtime skill update can follow.
-- **M4 RAG — expand beyond datasheets (the main follow-up).** v1 is **datasheets-only**, one
-  deterministic retrieval path. The pipeline is built for more corpora but they're not wired:
+- **M4 RAG — expand beyond datasheets (the main follow-up).** ~~v1 is datasheets-only~~ —
+  **app_notes/white papers are now LIVE** (session 24): the chunker already covered
+  `app_note` (reuses the datasheet chunker), so the path needed only data + prompts.
+  SLVA079 ingested (31 chunks, corpus `app_notes`), seed eval
+  `eval/datasets/app_notes.jsonl` (4 Qs, recall@5 = 1.0, gate 0.70 — expand alongside
+  the corpus). **Research-before-design prompting** added in the same session so the
+  agent consults the KB *before* authoring circuits: `agent/SKILL.md` gained a
+  "Research Before Design" recipe; `planning/SKILL.md` Phase-1 step 1 + step 7 now
+  put `rag_search` ahead of `web_search`; the `rag_search` tool description + skill
+  carry the pre-design trigger. Adding more white papers = drop PDFs in
+  `data/app_notes/` + `python -m ee_agent_rag.ingest data/app_notes/*.pdf` (+ a couple
+  of eval Qs). Remaining corpora still not wired:
   - **Add data + corpus-specific parsers/chunkers.** `classify.py` already routes
     standards / app_notes / textbooks / internal by folder + first-page regex, and
     `config.DOC_TYPE_TO_CORPUS` maps them — but `chunk._CHUNKERS` only has datasheets/
@@ -816,6 +826,16 @@ never in the UI.
   suite 32 pass / 1 skip, ruff clean. MOSFET/LED/actives expansion deliberately
   deferred (manual-pick preferred) — see Open items FOLLOW-UP. Two adjacent findings
   recorded as Open items (silent-ghost UX, symbol-dirname mismatch).
+- Session 24 — **research-before-design + app_notes corpus live** (user-requested):
+  the agent's rag_search awareness was entirely reactive/datasheet-framed (and the
+  planning skill steered pre-design research to `web_search`), so it would never
+  consult white papers/textbooks before designing. Prompt-side fix across all four
+  awareness surfaces (agent SKILL recipe "Research Before Design", planning Phase-1
+  + step-7 rag-first ordering, tool description, rag_search skill). Data-side:
+  app_notes path proven end-to-end — TI SLVA079 ingested (31 chunks), design-guidance
+  query returns cited app-note chunks through the real tool wrapper, seed
+  `app_notes.jsonl` eval 4/4 (gate 0.70), fidelity scan clean. Suites 85 pass /
+  5 skip, ruff clean. Textbook corpus still needs its chunker (see Open items).
 - **Next** — M7 (end-to-end design + eval) and/or expand RAG corpora (see Open
   items); M6 `ipc_check` is tabled (stub stays registered + degrades gracefully).
   Q2 schematic image export still optional.

@@ -12,6 +12,7 @@ import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .chunk import RawChunk
 from .config import SUMMARIES_ENABLED, SUMMARY_MODEL
@@ -70,8 +71,6 @@ def mpn_from_filename(source_path: str) -> tuple[str | None, str | None]:
     and uppercased), else fall back to the first ``_``-delimited token when it looks
     like a part number (has a digit, >= 4 chars).
     """
-    from pathlib import Path
-
     # "_" is a regex word char, so \b never fires at it — swap for spaces first.
     stem = Path(source_path).stem.replace("_", " ")
     for candidate in (stem, stem.upper()):
@@ -158,6 +157,10 @@ def enrich(
                 mpn, manufacturer = mpn_from_filename(source_path)
             metadata["mpn"] = mpn
             metadata["manufacturer"] = manufacturer
+        elif doc_type == "textbook":
+            # Corpus convention: <book_title>.pdf with underscores for spaces.
+            # The chapter heading arrives via raw.extras from the chunker.
+            metadata["book"] = Path(source_path).stem.replace("_", " ")
         metadata.update(raw.extras)
         enriched.append({"content": raw.content, "metadata": metadata})
     return enriched

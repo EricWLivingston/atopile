@@ -36,9 +36,15 @@ def get_ee_tool_definitions() -> list[dict[str, Any]]:
             "type": "function",
             "name": "rag_search",
             "description": (
-                "Search the engineering knowledge base (datasheets, standards, app "
-                "notes, atopile examples/docs) and return ranked, cited chunks. Use to "
-                "ground design decisions in sources rather than guessing. Call "
+                "Search the engineering knowledge base (datasheets, app notes/white "
+                "papers, textbooks) and return ranked, cited chunks. It is the best "
+                "source for application guidance, theory, and worked examples. Use it "
+                "(1) BEFORE designing a circuit/subsystem — look up design guidance "
+                "for the topology (e.g. 'LDO output capacitor ESR stability') during "
+                "planning; (2) to ground any spec/claim in a source instead of "
+                "guessing. Prefer it over web_search for anything the corpus may "
+                "cover; web_search may still be used to find designs, but only on "
+                "reputable sites (see the rag_search skill). Call "
                 "skill_read('rag_search') before first use for scope/when-to-use rules."
             ),
             "parameters": {

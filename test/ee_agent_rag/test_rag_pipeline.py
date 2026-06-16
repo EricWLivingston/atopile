@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from ee_agent_rag.chunk import approx_tokens, chunk_datasheet
+from ee_agent_rag.chunk import (
+    approx_tokens,
+    chunk_datasheet,
+    chunk_dispatch,
+    chunk_textbook,
+)
 from ee_agent_rag.enrich import (
     enrich,
     extract_mpn_and_manufacturer,
@@ -66,6 +71,73 @@ def test_enrich_offline_no_summary():
     assert m["corpus"] == "datasheets"
     assert m["summary"] is None
     assert "mpn" in m  # datasheet enrichment ran
+
+
+TEXTBOOK_MD = """\
+# The Art of Electronics
+<!-- page 1 -->
+cover noise
+## Chapter 2: Bipolar Transistors
+<!-- page 61 -->
+### 2.1 Introduction
+The transistor is our most important example of an active component.
+### 2.2 Emitter Follower
+{body}
+## Chapter 3: Field-Effect Transistors
+<!-- page 131 -->
+Short chapter body.
+"""
+
+
+def test_chunk_textbook_keeps_small_sections_whole():
+    md = TEXTBOOK_MD.format(body="Vout follows Vin minus a diode drop.")
+    chunks = chunk_textbook(md)
+    paths = [c.section_path for c in chunks]
+    # Small chapters stay whole; no windowing suffixes anywhere.
+    assert "Chapter 3: Field-Effect Transistors" in paths
+    assert all("[" not in p for p in paths)
+    ch2 = next(c for c in chunks if "Chapter 2" in c.section_path)
+    assert ch2.extras == {"chapter": "Chapter 2: Bipolar Transistors"}
+
+
+def test_chunk_textbook_windows_oversized_section_with_overlap():
+    paragraphs = [f"Paragraph {i}: " + "emitter follower analysis " * 20
+                  for i in range(30)]
+    md = TEXTBOOK_MD.format(body="\n\n".join(paragraphs))
+    chunks = chunk_textbook(md)
+    windows = [c for c in chunks
+               if c.section_path.startswith("Chapter 2: Bipolar Transistors > 2.2")]
+    assert len(windows) > 1
+    assert all("/" in c.section_path for c in windows)  # "[i/n]" suffix
+    assert all(approx_tokens(c.content) < 2 * 600 for c in windows)
+    # Overlap: each window starts with the tail of the previous one.
+    for prev, cur in zip(windows, windows[1:]):
+        last_para = prev.content.split("\n\n")[-1]
+        assert last_para in cur.content
+    # Chapter heading still carried in extras for metadata.
+    assert all(c.extras == {"chapter": "Chapter 2: Bipolar Transistors"}
+               for c in windows)
+
+
+def test_chunk_dispatch_routes_textbook():
+    md = TEXTBOOK_MD.format(body="short")
+    assert chunk_dispatch(md, "textbook")
+
+
+def test_enrich_textbook_metadata():
+    md = TEXTBOOK_MD.format(body="Vout follows Vin minus a diode drop.")
+    out = enrich(
+        chunk_textbook(md),
+        corpus="textbooks",
+        source_path="data/textbooks/The_Art_of_Electronics.pdf",
+        source_hash="hash",
+        doc_type="textbook",
+        with_summaries=False,
+    )
+    m = next(o["metadata"] for o in out if "Chapter 2" in o["metadata"]["section"])
+    assert m["book"] == "The Art of Electronics"
+    assert m["chapter"] == "Chapter 2: Bipolar Transistors"
+    assert "mpn" not in m  # datasheet-only enrichment must not run
 
 
 def test_rrf_rewards_agreement():

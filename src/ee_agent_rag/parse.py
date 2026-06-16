@@ -47,10 +47,31 @@ Required behavior:
   especially recommended component values.
 """
 
+TEXTBOOK_INSTRUCTION = """\
+You are parsing an electronics/engineering textbook. Output well-structured markdown.
+
+Required behavior:
+- Render chapter titles as ## headings and section/subsection titles as ### headings,
+  keeping chapter/section numbers (e.g. "## Chapter 4: Diode Circuits",
+  "### 4.2 Rectifier Topologies").
+- Transcribe ALL equations and formulas in LaTeX. Never replace an equation, formula,
+  or its surrounding prose with a placeholder; keep recommended component values and
+  rules of thumb verbatim.
+- Keep worked examples intact under their own heading: problem statement, solution
+  steps, and result.
+- Tables MUST be preserved as markdown tables with all column headers intact. Never
+  shift values between columns; every row must have exactly as many cells as the header.
+- For figures/schematics, describe as "[Figure <n>: <description>]" — ONLY for actual
+  graphics, never for text or equations.
+- Skip running page headers/footers and the index; inline footnotes as italicized
+  notes where they are referenced.
+"""
+
 # app_notes reuse the datasheet instruction (lighter content, same structure rules).
 _INSTRUCTIONS: dict[DocType, str] = {
     "datasheet": DATASHEET_INSTRUCTION,
     "app_note": DATASHEET_INSTRUCTION,
+    "textbook": TEXTBOOK_INSTRUCTION,
 }
 
 

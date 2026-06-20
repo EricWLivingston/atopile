@@ -29,6 +29,10 @@
 | **Agent run-log viewer** (Logs-tab "Agent" mode; streams `agent_events`) — *off-roadmap; built on request* | ✅ done & committed |
 | **Dynamic model routing** (per-turn complexity classifier → Haiku/Sonnet/Opus tiers; `EE_AGENT_DYNAMIC_MODEL=1`, anthropic-only, off by default) | ✅ done & committed |
 | **Diode auto-picking** (DIODES endpoint + `is_pickable_by_type` on `Diode`; fixes the silent "ghost component" drop) — *off-roadmap; user-reported* | ✅ done & committed |
+| **Hero-prompt hardening** (parallel-tool 400 fix; run-failure UX — spinner liveness + stall watchdog; routing floor + mid-turn escalation; token/failure spend budgets; `ato` pitfalls) — *session 26, user-driven* | ✅ done (working tree) |
+| **Cost-control + build-reliability (session 27)** (complex tier Opus→**Sonnet** default, Opus opt-in; diode `.package` doc bug; `scorecard --trace`; hero target now **builds clean** — auto-picks `D1=1N5817WS`, emits 6 sheets+BOM; `ato` skill under-constrain rules) — *user-driven* | ✅ done (working tree) |
+| **Hero addendum + buck/RS-485 integration (session 28)** (`SHOWCASE_PROMPT_ADDENDUM.md`; agent-built TPS563201 12V→5V buck + SP3485 RS-485 wrappers integrated into `dac-buffer.ato`, builds clean) — *user-driven* | ✅ done (working tree) |
+| **Net-naming overhaul (session 28)** (voltage-aware rails `+5V`/`+3V3`/`+12V`, shared `GND` + fragment warning, IC-pin fallback, passive-`.power` skip; `ato` skill guidance + tests) — *user-driven* | ✅ done (working tree) |
 | M6 — `ipc_check` — *registered stub; body TBD* | ⏸ tabled (user call, session 22) |
 | M7 — end-to-end design + eval | ⬜ not started |
 
@@ -58,13 +62,24 @@ backend restart, no reinstall. `ato` is **not** on PATH — use `uv run ato …`
 **Agent runner seams** (`src/atopile/server/agent/`): runner is provider-agnostic;
 `LLMProvider` is a `Protocol` — the provider is the extension point. Runner is a
 **module-level singleton** built in `routes/agent/utils.py` from `AgentConfig.from_env()`
-at import time → env changes after server start don't propagate, and **tests must not
-import `routes.agent.utils`**. Every turn logs to `~/.atopile/agent_logs.sqlite`
-(`model/sqlite.py::AgentLogs`) — primary post-mortem.
+at import time → env changes after server start don't propagate (**restart the backend /
+reload the VS Code window after any `.env` edit**), and **tests must not import
+`routes.agent.utils`**. Every turn logs to **`~/Library/Logs/atopile/agent_logs.db`**
+(macOS; `get_log_dir()`, `model/sqlite.py::AgentLogs`, table `agent_events`) — primary
+post-mortem (`sqlite3 "file:$DB?mode=ro" "SELECT … FROM agent_events ORDER BY id DESC"`).
 
 **Provider switch.** `EE_AGENT_PROVIDER=openai|anthropic` (default `openai`, so upstream
 behavior is preserved). Anthropic creds from `ATOPILE_AGENT_ANTHROPIC_API_KEY` /
 `ANTHROPIC_API_KEY`; default model `claude-sonnet-4-6`.
+
+**Model tiers (dynamic routing).** simple→Haiku, standard→Sonnet, **complex→Sonnet**
+(session 27 change; was Opus). The agent runs a whole design as *one turn*, so a
+per-turn route to the complex tier pins **every** call in that turn to that tier — with
+complex=Opus a single hero run burned the entire API balance (`run_failed: credit
+balance too low`). **Opus is now opt-in** via `ATOPILE_AGENT_MODEL_COMPLEX=claude-opus-4-8`,
+which also restores Opus as the `_escalate_model` ceiling (the build-failure escalation
+ladder tops out at `cfg.model_complex`). Tier→model mapping and the ladder both key off
+`cfg.model_complex`, so no runner/router code changed.
 
 **Tests.** Agent tests at `test/server/agent/`; exporter tests at `test/exporters/`.
 `test/` is already in `pyproject` `testpaths` — don't add new top-level test roots.
@@ -101,6 +116,15 @@ Live Anthropic tests are behind a `integration` marker and auto-skip without a k
   failed right after the checklist (the "freeze"). Fix: the provider keeps its **own
   transcript store** keyed by response id and rebuilds the full conversation each call (see
   Completed work → M2). This is the model for any future stateless provider.
+  - **Sibling 400 fixed session 26 (orphaned tool_*use*, parallel calls).** Anthropic also
+    requires every `tool_result` block to **lead** the user turn (contiguous, before any
+    text). `orchestrator_helpers._build_function_call_outputs_for_model` injects a
+    `{role:user}` nudge right after a successful `parts_install` result; with two parallel
+    `parts_install` the delta became `[tool_result, text, tool_result, text]` in one user
+    turn → 400 "`tool_use` ids found without `tool_result` blocks immediately after". Fix:
+    `_flush_user` stable-partitions tool_result blocks to the front; defensive
+    `_repair_orphaned_tool_uses` injects a synthetic `[no result captured]` result for any
+    unmatched `tool_use` so a stray drop degrades to one missing result, never a dead run.
 - **API key delivery to the non-interactive shell.** Keys set in the user's interactive
   shell aren't visible to the tool shell. Resolved with a gitignored project-root **`.env`**
   sourced explicitly (`set -a; . ./.env; set +a; uv run pytest …`). `conftest.py` reads
@@ -116,8 +140,72 @@ Live Anthropic tests are behind a `integration` marker and auto-skip without a k
   (`override=False`, so a project-local `.env` still wins). Post-mortem path correction: the
   agent log is **`agent_logs.db`** (not `.sqlite`) under **`get_log_dir()`** =
   `~/Library/Logs/atopile/` on macOS — `sqlite3 … "SELECT timestamp,level,event,summary FROM
-  agent_events ORDER BY id DESC"`. (Separate latent UX bug, not yet fixed: a `run_failed`
-  shows as a perpetual "thinking…" instead of surfacing the error to the chat.)
+  agent_events ORDER BY id DESC"`. (Separate latent UX bug, **FIXED session 26**: a
+  `run_failed`/stalled run showed as a perpetual "thinking…" — the checklist spinner was
+  keyed on `item.status=='doing'`, not run liveness. Now the spinner only animates while
+  `message.pending`, the checklist head shows an Errored/Stopped chip, and a stall watchdog
+  surfaces "No activity for Ns — may be stuck" after ≥60 s of progress silence.)
+- **Config is read once at import → stale-env runs look like routing bugs (session 26).**
+  A hero run executed all 37 turns on Haiku with **zero `model_routed` events** — dynamic
+  routing never fired because the backend was started before the `.env` was set up (and
+  `.env` had `ATOPILE_AGENT_MODEL` pinned). `config.from_env()` runs at import via
+  `load_dotenv`, so **any `.env` change needs a backend restart / VS Code window reload**.
+  Diagnose routing from the log: no `model_routed` rows, or only one model tier across
+  `model_request_started`, ⇒ routing isn't engaged. Belt-and-suspenders added so a misroute
+  can't silently grind on the weakest model: (1) a content-based **floor** in
+  `model_router._min_floor` clamps long/design-keyword-dense prompts up — needed because the
+  **first** turn has `has_active_design=False`, so the no-downshift rule doesn't protect it
+  and the Haiku classifier under-rated a board-design prompt as `simple`; (2) **mid-turn
+  escalation** + a **failure budget** (below).
+- **The routing floor inverted into an all-Opus cost blowout (session 27).** The session-26
+  floor (added to stop all-Haiku) over-corrected: the next hero run (session `d3e13b4b`)
+  classified the long "design a … board" prompt as **complex → Opus** and ran **every** call
+  on Opus, because **the agent executes a whole design as ONE turn** (`trace.turn_started`=1,
+  65 tool-loops, ~59 API calls) and routing classifies **once per turn**. ~2.6M Opus tokens
+  in 8.7 min **exhausted the API balance** → `run_failed: 400 "credit balance too low"`.
+  Per-turn token/failure budgets didn't bite (non-cached input ~1.3M < 1.5M; 1.5M Opus still
+  ≈ $25). Fix (user pick): **default `model_complex` Opus→Sonnet**, Opus opt-in via
+  `ATOPILE_AGENT_MODEL_COMPLEX=claude-opus-4-8` (which also restores Opus as the
+  `_escalate_model` ceiling — the ladder tops at `cfg.model_complex`). Tier→model and the
+  ladder both key off `cfg.model_complex`, so no runner/router code changed. Lesson for any
+  future tiering: **per-turn routing == per-run model here**, because the design is one turn.
+- **`.package` is an `SMDSize` size code, NOT a footprint name (session 27).** The build died
+  at `init-build-context` with `Invalid package: SOD-123` — and the agent had copied
+  `diode.package = "SOD-123"` **verbatim from `Diode`'s `usage_example`** (and the `ato`
+  skill). `.package` is parsed by `compiler/overrides.py::_parse_smd_size` into `SMDSize`
+  (passive size codes: `I0402`/`M1005`/`SMD…mm`); a diode footprint can't be expressed there.
+  Fixed the wrong example in `src/faebryk/library/Diode.py` (`usage_example`) and documented
+  it in `ato/SKILL.md`. For auto-picked parts, **omit `.package`** and let the picker choose.
+- **Over-specifying picked parts blocks the picker (session 27).** Getting the hero target to
+  build clean exposed a pattern, now codified in the `ato` skill (4c "Constrain loosely" +
+  three 5b error rows): (a) **never hand-pin `.lcsc_id`/MPN on a passive** — a pinned part
+  can have no LCSC footprint/symbol → `LCSC has no footprint/symbol for any candidate` (the
+  agent's `c1.lcsc_id="C49326616"` killed the build; auto-pick from value+package fixed it);
+  (b) **picking params must be intervals, not exact** (`x = 20V` → "assigned to an exact value
+  instead of … an interval" — use `>=`/`<=`/`within`); (c) **bound direction matters** —
+  datasheet *maximums* (Vf, leakage) use `<=` (a lower-bounded range drops parts spec'd only
+  as a max), *ratings* (reverse V, current) use `>=`; (d) **constrain only what's required** —
+  an extra `max_current >= 1A` left **zero** matches (`No matching component found`). Final
+  working diode block: `forward_voltage <= 0.55V`, `reverse_working_voltage >= 20V`, no
+  `max_current`, no `.package` → auto-picks **`1N5817WS`** (D1).
+- **`build_run` is async-queue → build failures are invisible to the circuit breaker
+  (session 26).** `build_run` returns `{success:true,"Build queued",buildId}` immediately;
+  the actual ERROR/ALERT logs only appear later via `build_logs_search`. So a failing
+  build→edit→rebuild loop never trips the identical-tool-failure breaker (each `build_run`
+  "succeeds") and can grind to the loop/time caps. The runner now detects failure from a
+  `build_logs_search` result carrying `"level":"ERROR"/"ALERT"`, counts it per turn, and
+  escalates the model one tier at ≥2 failures, then graceful-stops at `max_build_failures`
+  (default 4). The loose default caps were also tightened (`max_tool_loops` 240→80,
+  `max_turn_seconds` 7200→1800) and a **per-turn token budget** added
+  (`ATOPILE_AGENT_MAX_TURN_TOKENS`, default 1.5M, 0=off) — there was previously **no**
+  cumulative spend cap (the dead `context_hard_max_tokens` field was never a budget).
+- **Recurring `.ato` authoring pitfalls a weak model trips on (session 26).** Three distinct
+  build errors from one Haiku run, now in the `ato` skill's "Common build errors → fixes":
+  `within` is only valid inside `assert <field> within A to B` (not a bare expression);
+  `for` loops need `#pragma experiment("FOR_LOOP")` at the file top; referencing a
+  non-existent pin yields `Field '<pkg>.<PIN>' could not be resolved` (verify the package
+  interface first). The correct syntax was already documented — the fix is making it
+  scannable + escalating off the weak tier when builds repeat.
 - **`kicad.dumps` for schematics is broken** (`07_ATOPILE_GAPS.md` §2.11, proven with
   kicad-cli 10.0.3): re-dumping a known-good `.kicad_sch` fixture yields a file KiCad
   refuses to load (drops `(symbol_instances)`/`(sheet_instances)`, mis-emits `(symbol …)`).
@@ -276,6 +364,36 @@ Live Anthropic tests are behind a `integration` marker and auto-skip without a k
   `_run_ngspice` catches any non-`NgspiceError` from `load_circuit`/`run`, classifies the
   captured ngspice log (`errors.classify_log`), and re-raises as a structured `NgspiceError`.
   Log capture is via a `send_char` override on the `NgSpiceShared` subclass.
+- **Net naming lives in `src/faebryk/libs/net_naming.py::attach_net_names()` (session 28).**
+  Called from `build_steps.py:684` inside `prepare_nets`, *after* pick + `attach_random_designators`
+  → solved voltages, picked parts, footprints/pads, and designators are all available there.
+  Priority: explicit `has_net_name` > EXPECTED suggestion > **voltage rail name** > SUGGESTED
+  suggestion / implicit > **device-pin fallback** > conflict-resolution (prefix→LCA→numeric).
+  `check_net_names` (line 685) forbids two nets sharing a final name — so "all grounds = GND"
+  can't literally name two distinct nets `GND`; secondaries de-conflict and a warning fires.
+  The schematic emitter consumes names verbatim (`classify_nets`, `build_power_symbol(net)`),
+  so cleaning the names cleans the schematic labels for free.
+- **`Capacitor`/`Resistor`/`Inductor` carry a convenience `.power` interface auto-bonded to
+  their two pins (`power.lv ~ unnamed[1]`) — it is a *pin alias, not a rail* (session 28).**
+  This bit hard: the bootstrap cap's `power.lv` lands on the buck **SW** node, so a naive
+  "any `ElectricPower.lv` ⇒ ground" classifier mislabels SW as ground (`cboot-power-GND`), and
+  the *real* 20-node system ground got demoted to `rs485-power-GND`. Fix: skip rail markers
+  whose owning component is a passive (`has_designator_prefix` ∈ {R,C,L,FB,…}) in both rail-role
+  and rail-voltage detection (`_rail_marker_is_passive`). After the skip the SW node correctly
+  becomes `SW` (IC-pin fallback) and there is one clean `GND`.
+- **Rail voltage = the *tightest-spec* member, not the midpoint of the coupled range (session
+  28).** A rail net bus-aliases many `ElectricPower`s; reading the solved superset (`get_values()`
+  / `solver.try_extract_superset`) gives a range widened by downstream coupling (diode drop, LDO
+  headroom) whose midpoint drifts off-nominal (a `+4V1` for a 5 V rail) — and looser sinks on the
+  same net (e.g. a DAC tolerating 1.7–5.5 V) add stray candidates. Pick the member with the
+  smallest **relative** width (that's the author's `assert … within`), then format with
+  `_format_rail_voltage` (`+5V`, `+3V3`, `+12V`; the `+3V3` vs `+3.3V` spelling is one isolated
+  line). Near-zero/non-finite → no rail name (degrade to pin/generic).
+- **Local file deps need `ato sync` before a build sees them (session 28).** Adding a package to
+  `ato.yaml` `dependencies` is not enough — `ato build` resolves `local/<id>` from the project's
+  `.ato/modules/local/` cache, and a stale cache fails with `Local dependency path
+  packages/<X> does not exist`. Run `ato sync` (in the project dir) to install the new local
+  packages into the cache first; the already-cached deps from a prior build are untouched.
 
 ---
 
@@ -287,247 +405,165 @@ Fork + remotes as above; branch `feature/ee-agent`. Trimmed the roadmap from 4 t
 `.claude/skills/*` changes).
 
 ### M2 — `AnthropicProvider` (dual provider, stateful) ✅ pushed
-- `src/atopile/server/agent/_ee/provider_anthropic.py` — implements the `LLMProvider`
-  protocol; translates OpenAI↔Anthropic message/tool shapes; reuses the real
-  `_extract_text`/`_extract_function_calls`/`_extract_output_phase` from
-  `orchestrator_helpers.py`; client-side compaction (no server-side `responses.compact`).
-- **Stateful emulation of `previous_response_id`:** an LRU transcript store
-  (`_MAX_TRANSCRIPTS=64`) keyed by minted response id; `complete()` rebuilds the full
-  conversation (deep-copied so retries/shrinking don't mutate history) and stores the
-  assistant turn so the next delta's `tool_result` pairs with a real `tool_use`. Unknown
-  `previous_response_id` → raise a message containing `"previous_response_id"` so the
-  existing `run_turn_with_chain_recovery` retries from full local history; empty deltas /
-  assistant-terminated transcripts get a `"Continue."` user turn.
-- **Wiring:** `config.py` gained `provider` + `EE_AGENT_PROVIDER` branch (anthropic
-  `base_url=""` → SDK default, which is what stops Claude from hitting the OpenAI
-  endpoint); `routes/agent/utils.py` `_make_provider()` selects the provider. Default
-  OpenAI path unchanged.
-- **Tests** at `test/server/agent/`: 14 offline unit (translation helpers), 1 parity
-  (both providers, monkeypatched request seam, equal normalized output), 4 offline state
-  (the freeze fix), 3 live integration. Offline 19 pass / 4 skip; live user-confirmed
-  end-to-end (agent proceeds past the checklist into real multi-turn tool use).
+`src/atopile/server/agent/_ee/provider_anthropic.py` implements the `LLMProvider` protocol;
+translates OpenAI↔Anthropic message/tool shapes (reusing
+`orchestrator_helpers._extract_*`); client-side compaction. Provider reference:
+`11_ANTHROPIC_PROVIDER.md`.
+- **Stateful emulation of `previous_response_id`** (the load-bearing design): an LRU
+  transcript store (`_MAX_TRANSCRIPTS=64`) keyed by minted response id; `complete()`
+  rebuilds the full conversation (deep-copied) and stores the assistant turn so the next
+  delta's `tool_result` pairs with a real `tool_use`. Unknown id → raise a message
+  containing `"previous_response_id"` so `run_turn_with_chain_recovery` retries from full
+  local history; empty/assistant-terminated transcripts get a `"Continue."` user turn.
+  (See Lessons for the stateless-vs-stateful 400 class this solves, incl. the session-26
+  parallel-tool sibling.)
+- **Wiring:** `config.py` `EE_AGENT_PROVIDER` branch (anthropic `base_url=""` → SDK default);
+  `routes/agent/utils.py::_make_provider()` selects it. Default OpenAI path unchanged.
 
 ### Schematic emitter ✅ pushed (`src/faebryk/exporters/schematic/`)
-Atopile had **no** Python `.kicad_sch` writer; this adds one. Emits **sexp text**
-(because `kicad.dumps` is broken — see Lessons). Build step `generate_schematic` in
-`build_steps.py` (`@muster.register("schematic", dependencies=[prepare_nets],
-produces_artifact=True)`, in `generate_default`'s deps) writes
-`config.build.paths.output_base.with_suffix(".kicad_sch")` — the exact path
-`domains/manufacturing.py` surfaces as `outputs.kicad_sch`, so it auto-integrates (no
-route/frontend changes).
-
-- **IR extraction:** components = `has_designator` implementors
-  (`Traits.bind(des).get_obj_raw()`); value via `has_simple_value_representation`; pads
-  via `has_associated_footprint.get_footprint().get_pads()` (`pad.pad_number`); net per
-  pad via a reverse map from `F.Net…get_instances(g)` → `get_connected_pads()` (`is_pad`
-  hashes by node uuid, so net-pad and footprint-pad compare equal).
-- **Label mode** (`render`, `draw_wires=False`): grid of symbols with a `global_label`
-  per pin. Uses **real cached symbols where available** — `real_symbol.py` regenerates the
-  `.kicad_sym` into the schematic's native grammar (see Lessons); generic box fallback
-  (`generic_symbol.py`). Symbol located by `is_atomic_part.symbol` or by
-  `has_part_picked` mfr/partno → `<Mfr>_<Partno>/*.kicad_sym`.
-- **Wire mode** (`render_wired`, **the build default**): generic **bottom-pin boxes**, one
-  global x-lane per pin, each net drawn as a horizontal **trunk** + vertical **drops** +
-  **junctions** in the channel below, one net label per trunk. Provably short-free (see
-  Lessons). Real symbols are label-mode only.
-- **Verified:** 11 exporter tests (incl. two `kicad-cli sch export netlist`
-  no-shorts checks); `ato build examples/i2c` → KiCad loads + renders, ERC **0 errors**
-  (only benign `atopile`-nickname warnings), netlist reproduces exact nets
-  (hv=6, lv=4, SDA/SCL/Alert=2).
+Atopile had **no** Python `.kicad_sch` writer; this adds one, emitting **sexp text** (because
+`kicad.dumps` is broken — see Lessons). Design + IR-extraction detail:
+`13_KICAD_SCH_AND_FRONTEND_FILES.md`.
+- **Integration:** build step `generate_schematic` (`build_steps.py`) writes
+  `output_base.with_suffix(".kicad_sch")` — the exact path `domains/manufacturing.py`
+  surfaces as `outputs.kicad_sch`, so it auto-integrates (no route/frontend changes).
+- **Modes** (`export_schematic(mode=…)`): `hierarchical` (build default — one sheet per
+  `.ato` module, global labels = valid netlist, zero wires, human-cleanup base) | `wired`
+  (generic boxes + provably short-free ladder routing) | `labels`. Real cached symbols are
+  regenerated into the schematic's native grammar (`real_symbol.py`); generic-box fallback
+  (`generic_symbol.py`). Rail pins render as KiCad power symbols + one `PWR_FLAG`/rail.
+  Short-free + power-symbol + deterministic-filename invariants are all in Lessons.
 
 ### M3 — tool-registration plumbing ✅ pushed (`src/atopile/server/agent/_ee/`)
-Wires the EE tool surface through atopile's existing machinery; **no tool logic yet**.
-- **How a tool becomes live (the seams):** a handler via `@_register_tool(name)` in
-  `_TOOL_HANDLERS` (dispatched by `execute_tool`, `tools.py:2068`) **and** a schema in
-  `get_tool_definitions()`. The runner sends *all* `ToolRegistry.definitions()` to the
-  model (`runner.py:440,565`) — no mediator gate on exposure. `_ensure_tool_registry_
-  consistency` (`tools.py:569`) enforces schema⇔handler parity at first call, else raises.
-  `mediator_catalog._TOOL_DIRECTORY` is a non-gating discovery/suggestion list. No
-  per-tool policy allowlist (policy gates file paths only).
-- **EE code stays in `_ee/`:** `tools_ee.py` (4 `@_register_tool` handlers) +
-  `tool_definitions_ee.py` (`get_ee_tool_definitions()` schemas). Two one-line core seams:
-  a **bottom-of-`tools.py`** import (`from ._ee import tools_ee`) triggers handler
-  registration (placed last so the back-import of `_register_tool` resolves); a splice of
-  `*get_ee_tool_definitions()` in `tool_definitions.py`. Plus 3 `_TOOL_DIRECTORY` entries
-  in `mediator_catalog.py` for the real tools.
-- **Tools:** `ee_ping(message)→{ok,echo}` (throwaway smoke proof, not in the directory) +
-  `rag_search`/`pyspice_run`/`ipc_check` registered with their **documented schemas**
-  (`05_RAG`/`02_SIMULATION`/`04_VERIFICATION`) but **graceful stub bodies**
-  (`{"ok": False, "error": "… not implemented yet (M4/M5/M6)"}`) so live runs degrade
-  cleanly until the bodies land.
-- **Verified:** `test/server/agent/test_ee_tools.py` (7 offline tests: consistency guard
-  passes, all 4 schema'd+registered, `ee_ping` echoes, stubs return gracefully, real
-  tools in `available_tool_names()`). Full agent suite 26 pass / 4 skip; ruff clean.
+Wires the EE tool surface through atopile's existing machinery.
+- **How a tool becomes live (the reusable seams):** a handler via `@_register_tool(name)` in
+  `_TOOL_HANDLERS` (dispatched by `execute_tool`) **and** a schema in `get_tool_definitions()`.
+  The runner sends *all* `ToolRegistry.definitions()` to the model — no mediator gate on
+  exposure. `_ensure_tool_registry_consistency` enforces schema⇔handler parity at first call.
+  `mediator_catalog._TOOL_DIRECTORY` is a non-gating discovery list. No per-tool policy
+  allowlist (policy gates file paths only).
+- **EE code stays in `_ee/`:** `tools_ee.py` (handlers) + `tool_definitions_ee.py` (schemas).
+  Two one-line core seams: a **bottom-of-`tools.py`** import `from ._ee import tools_ee`
+  (last, so the back-import of `_register_tool` resolves) + a `*get_ee_tool_definitions()`
+  splice in `tool_definitions.py`. New tools follow this shape; `ee_ping` smoke tool can be
+  removed once a real tool proves the path in production.
 
 ### M4 — `rag_search` retriever ✅ committed (`fe5517d2`)
-Fills in the M4 tool body. Stack locked (no LangChain): **Chroma · LlamaParse · OpenAI
-`text-embedding-3-large` · Cohere rerank**. New framework-agnostic package
-**`src/ee_agent_rag/`** (knows nothing about the agent runner) + a thin agent wrapper.
-- **Pipeline.** Ingest: `classify → parse(LlamaParse REST) → chunk(section-aware ##) →
-  enrich(MPN regex + deterministic chunk_id + optional OpenAI summary) → embed(OpenAI,
-  dim-tunable) → Chroma + rank-bm25 sidecar`. Query (`retriever.rag_search`): dense(Chroma)
-  + sparse(BM25) → **RRF fusion** → **Cohere rerank** → `{text, score, citation}`.
-- **LlamaParse via REST** (`parse.py`), not the SDK — the SDK can't import on 3.14 (see
-  Lessons). Parsed markdown cached by file hash under `data/.parsed_cache/`.
-- **Wiring.** `_ee/tools_rag.py::run_rag_search` calls the sync retriever via
-  `asyncio.to_thread` and degrades to `{ok:false,error}` on any failure (missing keys,
-  empty index, import error) so a live run never crashes; `_ee/tools_ee.py` M4 stub swapped
-  to delegate. Heavy deps imported lazily in the handler → server startup stays light.
-- **Eval.** `eval/runner.py` recall@K gate (datasheets baseline **0.80**); seed dataset
-  `eval/datasets/datasheets.jsonl` (4 Qs — **expand to ~30** for a real signal).
-- **Tests.** `test/ee_agent_rag/test_rag_pipeline.py` (offline pure logic: chunk+pages,
-  MPN, deterministic id, RRF, scrub, where-builder, tokenizer) + `test/server/agent/
-  test_ee_rag_tool.py` (wrapper: query-validation, exception degradation, format/truncate,
-  pass-through); M3 stub test updated (`rag_search` now live). **40 pass / 4 skip, ruff
-  clean.** End-to-end retrieval quality is validated in the notebook + eval (needs keys).
-- **Dev surface.** `notebooks/rag_pipeline.ipynb` — one cell per stage, `%autoreload`, the
-  retrieval stages shown separately (dense/sparse/fused/reranked) for tuning. **gitignored**
-  (`*.ipynb`). Full how-to/tuning/knob reference in **`16_RAG_NOTEBOOK_AND_TUNING.md`**
-  (also gitignored, local-only). `.env.example` at repo root → copy to `.env` (gitignored):
-  `OPENAI_API_KEY`, `LLAMA_CLOUD_API_KEY`, `COHERE_API_KEY`. Corpus PDFs go in
-  `data/datasheets/` (`data/` gitignored).
-- **Deps added:** `chromadb`, `cohere`, `rank-bm25`, `pdfminer-six` (+ `jupyterlab`,
-  `ipykernel` dev). All resolve on 3.14.
+Framework-agnostic package **`src/ee_agent_rag/`** (no agent-runner coupling) + thin wrapper
+`_ee/tools_rag.py`. Stack (no LangChain): **Chroma · LlamaParse-REST · OpenAI
+`text-embedding-3-large` · Cohere rerank**. Full reference: `05_RAG.md`,
+`16_RAG_NOTEBOOK_AND_TUNING.md`, `RAG_TUNING_SUMMARY.md`.
+- **Pipeline.** Ingest: `classify → parse(LlamaParse REST) → chunk(section-aware) →
+  enrich(MPN + deterministic chunk_id + optional summary) → embed → Chroma + rank-bm25
+  sidecar`. Query (`retriever.rag_search`): dense + sparse(BM25) → **RRF fusion** → **Cohere
+  rerank** → `{text, score, citation}`. Wrapper degrades to `{ok:false,error}` on any failure
+  (missing keys / empty index / import error), heavy deps imported lazily.
+- **Tuned & validated** (session 18): 14-doc datasheet corpus, 50-q eval, **recall@5 = 0.98**
+  with retrieval knobs at defaults — every win was ingest fidelity (see the RAG Lessons:
+  synthesized page markers, ordinal chunk-ids, MPN patterns, table-defect ladder). Corpus
+  expanded to app_notes (session 24); textbooks pending (see Open items).
+- **Dev/data surface (all gitignored):** `notebooks/rag_pipeline.ipynb`; corpus PDFs in
+  `data/<corpus>/`; keys `OPENAI_API_KEY`/`LLAMA_CLOUD_API_KEY`/`COHERE_API_KEY`.
+  Deps (all on 3.14): `chromadb`, `cohere`, `rank-bm25`, `pdfminer-six`.
 
 ---
 
 ### M5 — `pyspice_run` runner ✅ committed
-Fills in the M5 tool body. Stack (user-locked): **PySpice 1.5 + libngspice 46**,
-agent-authored netlist, passives + sources + **discretes** (bundled model lib). New
-framework-agnostic package **`src/ee_agent_spice/`** (knows nothing about the runner) + a
-thin agent wrapper — the M4 shape exactly.
+Framework-agnostic package **`src/ee_agent_spice/`** + wrapper `_ee/tools_pyspice.py` — the
+M4 shape exactly. Stack: **PySpice 1.5 + libngspice 46**, agent-authored netlist, bundled
+discrete models. Reference: `02_SIMULATION.md`, `pyspice_run` skill.
 - **Pipeline.** `simulate(netlist, analysis, params, probes, project_root)` → `build_deck`
-  (title + agent body with trailing `.end` stripped + auto-`.include` bundled models +
-  `.save` probes + analysis control card) → `_run_ngspice` (locked singleton
-  `NgSpiceShared.load_circuit`/`run`, vectors via `vec._data`) → persist **all** vectors
-  (probes + axis) to `build/sim/<run_id>.npz`, return **per-probe min/max/mean** only
-  (context-safety, `02_SIMULATION` §5). Analyses: `op` / `dc` (sweep or → op) / `ac`
-  (mag+phase via magnitude) / `tran` (`uic` supported).
-- **Bundled models** (`models/ee_agent.lib`, auto-included): `Dgen`/`Dschottky`/`DLED`,
-  `Q2N3904`/`Q2N3906`, `NMOS_GEN`/`PMOS_GEN` — first-order, topology-accurate not
-  vendor-accurate; the schema tells the agent these names + to inline a vendor `.model` for
-  accuracy. Lib path discovery + singleton/lock + result-key naming: see Lessons.
-- **Wiring.** `_ee/tools_pyspice.py::run_pyspice` (async, `asyncio.to_thread`) resolves
-  `netlist` text **or** `netlist_path`, degrades every failure (no netlist, `ImportError` =
-  no PySpice, `OSError` = no libngspice, convergence) to `{success:false, errors:[…]}`;
-  `_ee/tools_ee.py` M5 stub swapped to delegate (passes `project_root` as `project_path`).
-  Schema in `tool_definitions_ee.py` updated: added `netlist`, made `netlist_path` optional,
-  added `op` to the enum, required only `analysis`, documented the model names. Package added
-  to `pyproject` wheel `packages`.
-- **Tests.** `test/ee_agent_spice/test_runner.py` (offline pure logic: deck assembly, control
-  cards, save targets, probe resolution, summaries, error classification) +
-  `test/ee_agent_spice/test_sim_live.py` (live, `skipif` no libngspice — asserts real
-  physics: divider bias 3.33 V, RC τ, RC low-pass passband, diode drop, convergence-failure
-  handling) + `test/server/agent/test_ee_pyspice_tool.py` (wrapper degradation/pass-through);
-  M3 stub test updated (`pyspice_run` now live). **Agent suite 70 pass / 4 skip** (the 4 are
-  Anthropic live-integration), ruff clean.
-- **Verified end-to-end** through the real `execute_tool('pyspice_run', …)` dispatch path: a
-  2-transistor **astable multivibrator** (bundled `Q2N3904`, ~68k/10µF) oscillates at
-  **1.13 Hz** — inside the M5 done-def 0.8–1.3 Hz band — railing 0.03↔5.01 V, `.npz`
-  persisted. (Astables need a tiny C asymmetry + `uic` to start in SPICE.)
-- **Deps:** `pyspice` (pulls scipy/cffi/ply) + system `brew install ngspice`. All on 3.14.
-- **Dev surface.** `notebooks/pyspice_testbed.ipynb` (gitignored via `*.ipynb`): paste a
-  netlist → deck preview → all-parameter summary table (`probes=[]` = every vector) →
-  waveform plots from the persisted `.npz` (Bode for `ac`, traces for `tran`/`dc`, bars
-  for `op`) → optional `execute_tool('pyspice_run', …)` pass. Sim outputs under
-  `notebooks/sim_runs/` (also git-invisible). Includes a paste-ready examples gallery
-  (divider/RC/rectifier/NMOS-sweep/astable). Verified by full `nbconvert --execute`.
+  (auto-`.include` bundled models + `.save` probes + analysis control card) → `_run_ngspice`
+  (locked singleton; vectors via `vec._data`) → persist **all** vectors to
+  `build/sim/<run_id>.npz`, return **per-probe min/max/mean** only (context-safety).
+  Analyses: `op`/`dc`/`ac`/`tran`. Wrapper degrades every failure (no netlist / no PySpice /
+  no libngspice / convergence) to `{success:false, errors:[…]}`.
+- **Bundled models** (`models/ee_agent.lib`, incl. `OPAMP_IDEAL`): topology-accurate, not
+  vendor-accurate; schema tells the agent the names + to inline a vendor `.model` for
+  accuracy. Lib-path discovery, the non-thread-safe ngspice singleton/lock, result-key
+  naming, and the wall-clock timeout (`EE_SPICE_TIMEOUT_S`) are all in Lessons.
+- **Deps:** `pyspice` (+ system `brew install ngspice`); all on 3.14. Dev surface:
+  `notebooks/pyspice_testbed.ipynb` (gitignored).
 
 ### Skill-discovery tools (`skills_list` + `skill_read`) ✅ committed
-On-demand agent skill library + per-tool guidance, so the agent can pull *how/when/scope*
-guidance just-in-time instead of always-loading it (token-efficient) — and so we can nudge
-proper tool use (e.g. don't simulate digital/datasheet-answerable/whole-board with
-`pyspice_run`).
-- **The gap.** The agent only ever loads the **3** `fixed_skill_ids` (`agent`/`ato`/
-  `planning`) into context every turn (`context.py:load_required_skill_docs`); it **never
-  scans `skills_dir`**, so the other 18 skill dirs were invisible and there was no on-demand
-  fetch / guidance tool. Putting a doc in `.claude/skills/` does **nothing** for the agent by
-  itself — discoverability comes only from a tool that reads it. (`.claude/skills/` is also
-  *Claude Code's* skill dir, so new dirs there also show up as IDE-invokable skills — harmless.)
-- **Tools (additive, `_ee/`):** `skills_list()` scans `config.skills_dir` → `[{id,
-  description, always_loaded}]` (frontmatter `description`, fallback to first heading; the 3
-  fixed ids flagged); `skill_read(skill_id)` returns the SKILL.md body (truncated via
-  `_truncate_middle`, ~12 KB), degrading to `{ok:false, available:[…]}` on unknown id.
-  `skill_read` rejects ids outside `^[A-Za-z0-9_-]+$` (path-traversal guard). Config via a
-  bare `AgentConfig()` (all defaults; no dotenv/provider side-effects). Lives in
-  `_ee/tools_skills.py`; handlers in `tools_ee.py`; schemas in `tool_definitions_ee.py`;
-  directory entries in `mediator_catalog.py` (category `research`, `discovery`).
-- **Per-tool guidance docs (real deliverable)** as ordinary skills in the same dir:
-  `.claude/skills/{pyspice_run,rag_search,ipc_check}/SKILL.md`. `pyspice_run` is the governor
-  (when/when-NOT/scope=minimal-subcircuit, models, params, probing, astable start-up tip,
-  "a failed sim is feedback not a build failure"); `rag_search` (ground vs web_search,
-  citations, datasheets-only caveat); `ipc_check` is a **seed** (M6 forthcoming, returns a
-  stub). **Hook for future tools = drop `.claude/skills/<tool>/SKILL.md`** — auto-discovered,
-  no code change.
-- **Always-on nudge** (the bit that makes it fire): `# Tool Usage Recipes` in
-  `.claude/skills/agent/SKILL.md` gained `## Skill Library` ("call `skills_list`, then
-  `skill_read('<id>')` before a specialized task") + `## Verification & Simulation` (the
-  pyspice gate). **Three reinforcing awareness layers** (the agent never scans a folder):
-  (1) the runner sends *all* tool definitions+descriptions to the model every turn
-  (`runner.py:440,565`) so it always sees `skills_list`/`skill_read`; (2) the always-loaded
-  `agent/SKILL.md` Skill-Library nudge; (3) each guidance-bearing tool's **own description**
-  ends with `call skill_read('<tool>') before first use` — added to **all three**
-  (`pyspice_run`/`rag_search`/`ipc_check`) so they self-advertise their skill identically.
-- **Verified:** `test/server/agent/test_ee_skills.py` (7 offline: discovery, fixed-flagging,
-  body fetch, unknown→available, traversal-reject, frontmatter parse) + `test_ee_tools.py`
-  consistency set updated. Agent suite **44 pass / 4 skip**, ruff clean. End-to-end via
-  `execute_tool`: `skills_list`→24 skills (3 flagged), `skill_read('pyspice_run')`→5 KB body,
-  and `build_system_prompt` renders the new recipes. **`pyspice_run` is not a build step**
-  (grep-confirmed) — a wrong sim never fails `ato build`; worst case is wasted turns, which
-  the guidance curbs.
+On-demand skill library + per-tool guidance, so the agent pulls *how/when/scope* guidance
+just-in-time instead of always-loading it.
+- **The gap (reusable insight).** The agent only ever loads the **3** `fixed_skill_ids`
+  (`agent`/`ato`/`planning`) every turn (`context.py`); it **never scans `skills_dir`**.
+  Putting a doc in `.claude/skills/` does **nothing** for the agent by itself —
+  discoverability comes only from a tool that reads it.
+- **Tools (`_ee/tools_skills.py`):** `skills_list()` scans `config.skills_dir`;
+  `skill_read(skill_id)` returns the SKILL.md body (truncated ~12 KB), `^[A-Za-z0-9_-]+$`
+  path-traversal guard.
+- **The bit that makes it fire — three reinforcing awareness layers** (the agent never scans
+  a folder): (1) the runner sends *all* tool defs+descriptions every turn; (2) an always-on
+  nudge in `agent/SKILL.md` (`## Skill Library`); (3) each guidance-bearing tool's **own
+  description** ends with `call skill_read('<tool>') before first use`.
+- **Hook for future tools = drop `.claude/skills/<tool>/SKILL.md`** — auto-discovered, no
+  code change. Guidance docs exist for `pyspice_run`/`rag_search`/`ipc_check`(seed).
 
 ### Agent run-log viewer (Logs tab "Agent" mode) ✅ committed
-Surfaces the agent's **own run log** (`agent_events`) in the existing build-server Logs
-viewer, so you can watch planning / tool calls / `run_failed` live alongside build & test
-logs. Motivated by the silent-"thinking…" debug session: the run error was only in the DB,
-never in the UI.
-- **The gap.** The Logs viewer's `/ws/logs` only read **build** (`Logs`) and **test**
-  (`TestLogs`) DBs; the agent's run events live in a *separate* DB (`agent_events` in
-  **`agent_logs.db`**, `~/Library/Logs/atopile/`) the viewer couldn't reach. The viewer *did*
-  have an "agent" choice — but that's the **audience** dropdown (`user|developer|agent`), a
-  strict `WHERE audience='agent'` filter on build logs; **nothing ever emits an
-  agent-audience build log** (all 76k build rows are `developer`), so picking it just showed
-  an empty pane. (That audience filter is unrelated to this feature and is still effectively
-  a dead option for build logs.)
-- **Design.** New **`agent` `LogMode`** beside build/test. Agent rows are mapped onto the
-  **shared entry shape** server-side (`Log.agent_row_to_entry`: `summary`→message,
-  `tool_name`/`phase`→stage column, level/timestamp passthrough, grouped under
-  `agent.<event>` loggers), so the **existing `LogDisplay` renders them with zero new row
-  UI**. Session id is **optional**: blank → **follow-latest** mode. Level filter + live
-  cursor reuse the build/test machinery.
-- **Follow-latest auto-switch (backend-only).** In follow-latest mode `_push_agent_stream`
-  **re-resolves `latest_session_id()` every poll** (cheap rowid-ordered `LIMIT 1`), so a
-  viewer left open across runs always tracks the newest session — including a run that
-  *starts after* the panel was opened. On a session change (incl. the first push) it sends
-  the new session's full batch as an **`agent_logs_result` (viewer *replaces*)**; steady-state
-  new rows for the same session go as **`agent_logs_stream` (*append*)**. The client stays
-  dumb (no reset signal): the existing onmessage already replaces on `*_result` / appends on
-  `*_stream`. Switch detection uses a `PrivateAttr _followed_session` on `AgentStreamQuery`;
-  an **explicit** `agent_session_id` pins one session (no auto-switch). +2 tests (fake-WS
-  drives replace→append→switch and the pinned-no-switch path). **Gotcha that motivated this:**
-  every window reload/extension reinstall restarts the backend on a **new port**, dropping the
-  panel's WS; the panel then showed a stale snapshot. Auto-follow + a fresh reconnect now
-  re-replace with the current session.
-- **Server.** `model/sqlite.py`: `AgentLogs.latest_session_id()` (`fetch_chunk` already
-  existed, incl. `levels`/`after_id`). `dataclasses.py`: `Log.AgentQuery`/`AgentStreamQuery`/
-  `AgentStreamEntryPydantic`/`AgentResult`/`AgentStreamResult` + the `agent_row_to_entry`
-  mapper. `routes/logs.py`: `_push_agent_stream` + an `agent` dispatch branch (one-shot DESC +
-  streaming ASC) selected by an explicit `agent: true` in the WS payload.
-- **Frontend** (`src/ui-server/.../log-viewer/` + `LogViewer.tsx`): `'agent'` `LogMode`,
-  agent entry/request/result types, `agent_logs_result`/`agent_logs_stream` handling in
-  `useLogWebSocket` (+ `startAgentStream`/`buildAgentLogRequest`), the **"Agent" mode button**
-  + optional `Session ID (latest)` input, and agent cases in the auto-stream effect / stage
-  header.
-- **Verified.** `test/server/test_logs_agent.py` (6: latest-session, level+session filter, row
-  mapping incl. summary→event fallback, result serialization, idempotent init); agent suite 48
-  pass, ruff clean; frontend `tsc --noEmit` clean + 15 existing log/ws tests pass + prod `vite
-  build` succeeds. Data path exercised against the **real** `agent_logs.db`. **Webview rebuilt
-  & deployed** to `src/vscode-atopile/resources/webviews/` (the path the installed extension
-  loads) — **reload the VS Code window** to pick it up (Python is editable; webview needs the
-  rebuilt bundle).
-- **Deferred:** no server-side tool/stage *filter* for agent rows yet (tool shows in the stage
-  column but isn't a query filter); the audience dropdown's dead `agent` option could be hidden
-  in agent mode. (Follow-latest auto-switch — previously deferred — is now **done**, see above.)
+Surfaces the agent's own run log (`agent_events` in `agent_logs.db`) in the existing Logs
+viewer, so you can watch planning / tool calls / `run_failed` live. Motivated by the
+silent-"thinking…" debug session (run errors were only in the DB).
+- **Design (reusable).** New **`agent` `LogMode`** beside build/test; agent rows mapped onto
+  the **shared entry shape** server-side (`Log.agent_row_to_entry`) so the existing
+  `LogDisplay` renders them with zero new row UI. Session id optional → blank = **follow-latest**
+  (`_push_agent_stream` re-resolves `latest_session_id()` each poll; sends full batch as
+  `agent_logs_result`=*replace* on session change, `agent_logs_stream`=*append* steady-state).
+- **Gotcha:** every window reload/extension reinstall restarts the backend on a **new port**,
+  dropping the panel's WS → stale snapshot; auto-follow + fresh reconnect re-replace with the
+  current session. Webview must be **rebuilt & deployed** to
+  `src/vscode-atopile/resources/webviews/` + window reload (Python is editable; webview isn't).
+
+### CODE_AUDIT P0–P3 hardening ✅ committed (session 25)
+Implemented **every** P0/P1/P2/P3(Q1–Q8) finding from `ee_agent_docs_5_21/CODE_AUDIT.md` —
+**per-finding landing spots + divergence notes are inline in that doc** (✅ tags + a top
+summary block). Read it there; only the decisions worth carrying forward are kept here:
+- **BM25 sidecar is now JSON, not pickle** (removed the RCE surface), rebuilt into `BM25Okapi`
+  on load + mtime-cached, atomic write (`.json.tmp`+`os.replace`); old `.pkl` ignored.
+- **SPICE wall-clock timeout** `EE_SPICE_TIMEOUT_S` (30s) on both lock-acquire and run; caveat:
+  ngspice's C core can't be force-killed, so a timed-out worker lingers (cleanup skipped while
+  alive). SPICE params validated before interpolation (injection guard).
+- **OpenAI model defaults fixed** → `gpt-4o`/`gpt-4o-mini` (old `gpt-5.4`/`gpt-4.1-nano` were
+  non-existent upstream placeholders; Anthropic stays the primary path).
+- **`approx_tokens`** uses tiktoken if present else **`ceil(len/3)`** (tiktoken is NOT in the
+  env; the `/3` over-count is the safe fallback). `stable_chunk_id` hashes full content.
+- **Prompt-cache instrumentation** (`_log_cache_metrics`) logs read/creation tokens per turn so
+  per-model cache thrash from routing is observable. (NB the routing-cost concern is partly
+  superseded by the session-26 routing floor + spend safeguards.)
+
+### Net-naming overhaul ✅ (session 28, working tree)
+Human-readable net names so the emitted schematic labels are readable; all in
+`src/faebryk/libs/net_naming.py` (+ one-line solver thread in `build_steps.py`, a small emitter
+dedup in `schematic.py`, and `ato`-skill guidance). Four rules, both algorithm + agent guidance:
+- **Voltage-aware power rails** → `+5V` / `+3V3` / `+12V`, from the tightest-spec member's solved
+  voltage (see Lessons for why tightest, not midpoint). Author adds purpose via
+  `override_net_name="+5V_IN"`.
+- **Shared `GND`** — all non-isolated ground-role nets collapse to one `GND`; if ≥2 distinct
+  grounds remain a warning lists them (no silent `GND-2`). Isolated grounds opt out via
+  `override_net_name`.
+- **IC-pin fallback** — a net with no purposeful name takes a connected device's pin name, ICs
+  beating passives (`has_designator_prefix`): bootstrap node → `SW`, etc. Bare pad numbers and
+  single-char lead names are rejected.
+- **Passive `.power` skip** — the load-bearing fix (see Lessons): a passive's auto-bonded
+  `.power` is not a rail, so the SW node stops masquerading as ground and the real ground keeps
+  `GND`.
+- **Guidance + tests:** `.claude/skills/ato/SKILL.md` §2.9 gained a "Net naming convention"
+  block; +4 unit tests in `net_naming.py` (voltage format, tiers, generic names, GND collapse);
+  3 schematic assertions updated for the intentional `lv`→`GND` + deduped `atopile:GND` lib_id.
+  56 net/schematic tests green; demo emits `+12V/+5V/+3V3/GND/SW/VFB/EN/SDA/SCL/A_P/B_N/…`.
+
+### Hero addendum + buck/RS-485 integration ✅ (session 28, working tree)
+- `ee_agent_docs_5_21/SHOWCASE_PROMPT_ADDENDUM.md`: a lean follow-up prompt extending the
+  hero board with a TPS563201 12 V→5 V buck front-end + an SP3485 RS-485 transceiver to an
+  output connector (datasheet-driven/loose; no SPICE requirement; voltage/GND naming).
+- Finished a prior agent session's handoff: integrated the agent-authored `buck`/`rs485`
+  wrappers into `dac-buffer.ato` `App` (12 V input → buck → existing 5 V chain; SP3485 on 3V3,
+  `RS485HalfDuplex` A/B + 120 Ω term to a TE 796636-3 terminal block; logic exposed). Needed
+  `ato sync` first (see Lessons). Builds clean (18/18); FB divider 54.9k/10k → 4.99 V; inductor
+  auto-picked. KiCad-cli ERC violations are all the known cosmetic classes (symbol-lib-not-
+  registered + generic-symbol pin types), not real connectivity errors.
 
 ## Open items
 
@@ -562,14 +598,6 @@ never in the UI.
   `UNI_ROYAL_0603WAF1002T5E`, so those parts get the generic-box fallback instead of
   their cached real symbol (electrically complete, just less pretty). Fix idea: derive
   the dir from the footprint lib-id prefix instead of re-sanitizing the mfr string.
-
-- **Table-fidelity suspects left for review (low priority).** The new
-  `column_shift_suspect` scanner flags 5 suspects in 2 docs (both reviewed, left as-is):
-  SPX3819's JEDEC package-outline table is a **genuine** shift (`A`: 1.75 = the JEDEC MAX
-  sits under NOM, MAX empty — mechanical dims, low retrieval stakes; premium re-parse if
-  it ever matters); RM46's timing tables are mostly **legit min-only** rows (setup/cycle
-  times are minimums) with a couple of ambiguous rows. This is the human-review queue the
-  scanner is meant to produce, not a regression.
 
 - **M6 — implement `ipc_check` (next):** still a registered, schema'd, model-callable
   graceful stub in `_ee/tools_ee.py` — fill in the logic there. **Template is now M4 *and*
@@ -616,51 +644,6 @@ never in the UI.
   ngspice`). M4 RAG deps are **in**: chromadb, cohere, rank-bm25, pdfminer-six.
   `voyageai`/`qdrant`/`llama-parse` were **not** used — we went OpenAI embed / Chroma /
   LlamaParse-REST instead; do not re-add them.
-- **Schematic — hierarchical real-symbol mode (DONE, pushed `51b75613`).** Goal was
-  human-readable schematics from `.ato` code. KiCad has **no** schematic autorouter /
-  autoplacer / autoclean (`kicad-cli sch` = erc/export/upgrade only), so the chosen design
-  is a **polished human-cleanup base**: real cached symbols placed on **one sheet per
-  `.ato` module** (hierarchical sheets), with a `global_label` on every pin. The
-  load-bearing invariant: a KiCad netlist is defined by label *names*, and **global labels
-  connect across the whole sheet hierarchy** — so the schematic is electrically complete
-  with **zero wires**, and a human can rearrange/route it without breaking the netlist
-  (`kicad-cli sch erc`/`export netlist` verify at any point). All in
-  `src/faebryk/exporters/schematic/kicad/schematic.py`: `build_sheet_tree`
-  (groups components by `is_ato_module` via `get_hierarchy`/`get_implementors`),
-  `render_hierarchical` / `render_sheet_tree` (root + child `.kicad_sch` files; instances
-  centralised in the root's `(symbol_instances)` with nested `/<sheet>/<sym>` paths),
-  `classify_nets` (power/ground via `ElectricPower.hv/lv`). `export_schematic` gained a
-  `mode` flag (`hierarchical` default | `wired` | `labels`; legacy `draw_wires` maps on);
-  `build_steps.py:generate_schematic` now selects `hierarchical`. **Verified:** 7 new
-  exporter tests (cross-sheet netlist + classify_nets), ruff clean, and `ato build
-  examples/i2c` → ERC **0 errors**, netlist exact (hv=6, lv=4, SDA/SCL/Alert=2) across the
-  `temp_sensor` sub-sheet. Format was locked first with a kicad-cli spike (the 2-sheet
-  `NET_SHARED` cross-sheet proof).
-- **Schematic — power symbols (M3b, DONE, pushed `51b75613`).** Rail pins now render as real
-  KiCad **power symbols** (GND triangle / power up-arrow) instead of labels; signal pins
-  keep labels. `build_power_symbol` / `build_pwr_flag_symbol` in `generic_symbol.py`;
-  `render_sheet_tree` gained a `net_roles` arg and a `_place_power` branch
-  (`render_hierarchical` feeds it `classify_nets(app)`); `SchematicSummary.power_symbols`.
-  **Key gotchas (kicad-cli-locked, spike `/tmp/pwr_spike/`):** a power symbol connects by
-  the `(power)` flag **+ a `power_in` pin whose `name` is the net** — a `passive` pin
-  *splits* the net (no name connection). A `power_in`-only net then errors
-  `power_pin_not_driven`, so the emitter drops **one `PWR_FLAG`** (a `power_out` driver,
-  pin name `~`, connects by geometry) atop the first pin of each rail net → ERC back to
-  **0 errors**. +4 tests (23 total in the file); `ato build examples/i2c` ERC 0 errors,
-  netlist still exact, hv→arrows / lv→triangles, one PWR_FLAG per rail. (Real-symbol pins
-  are typed `Unspecified` in the cached `.kicad_sym`, so a handful of benign `pin_to_pin`
-  *warnings* remain — pin-metadata only, not connectivity.)
-- **Schematic — deterministic filenames + cleanup (M3c, DONE, pushed `51b75613`).** Child sheet
-  files were named `<root>-<module>-<8 hex>` where the hex was a fresh `uuid4()` **per
-  build**, so rebuilds piled up duplicate files for the same module. Fixed in `schematic.py`:
-  `render_sheet_tree._assign` now derives `file_stem` from the module's **sanitized name
-  path** (`default-temp_sensor.kicad_sch`, no hex; `seen_stems` adds a deterministic `-2` on
-  collision); `sheet.uuid` is still random but only used internally (the `(sheet)` block +
-  `(symbol_instances)` path). `export_schematic` (hierarchical) now **deletes stale**
-  `{stem}-*.kicad_sch` not in the current output (root has no `-`, never matched).
-  **Verified:** `ato build examples/i2c` twice → exactly `default.kicad_sch` +
-  `default-temp_sensor.kicad_sch` both times, ERC 0 errors; +3 tests (26 total), ruff clean.
-  (Deferred: making the internal uuids deterministic for byte-identical rebuilds.)
 - **Schematic follow-ups (optional):** real symbols in *wire* mode; agent
   `schematic_export` tool (deferred; pattern in `tools.py` / `tool_definitions_project.py`);
   **Q2 image export** (`kicad-cli sch export svg/pdf` wrapper — trivial now the schematic is
@@ -678,164 +661,117 @@ never in the UI.
 
 ## Progress log (index)
 
-- Sessions 1–2 — full doc set written. No source modified.
-- Session 3 — local VSIX built/installed; dev-loop table established; AnthropicProvider
-  edit surface mapped against source.
-- Session 4 — M1 fork; pinmux dropped (4→3 tools); `AnthropicProvider` landed additively;
-  uv stale-cache trap resolved (`anthropic==0.105.2` locked).
-- Session 5 — M2 wired + full test suite; live Anthropic green (working tree only).
-- Session 6 — M2 hardened: fixed the multi-turn freeze (stateful transcript); first
-  commits pushed to the fork (+ easyeda 403 picker workaround).
-- Session 7 — schematic emitter investigated; `kicad.dumps` blocker found; text-emitter
-  spike validated; paused (docs only).
-- Session 8 — schematic emitter BUILT (label mode, real-symbol regeneration); i2c loads,
-  ERC-clean; 7 tests; pushed.
-- Session 9 — schematic emitter draws net wires (ladder routing, wire mode default);
-  provably + verifiably short-free; 11 tests; pushed.
-- Session 10 — M3 tool-registration plumbing: `ee_ping` smoke + `rag_search`/
-  `pyspice_run`/`ipc_check` registered as schema'd, model-callable graceful stubs in
-  `_ee/`; 7 tests; pushed.
-- Session 11 — schematic **hierarchical real-symbol mode** (human-cleanup base): sheet per
-  `.ato` module, labels carry connectivity (valid netlist, no wires), now the build
-  default; format locked via kicad-cli 2-sheet spike; i2c ERC-clean + exact netlist; +7
-  tests (18 total), ruff clean. Working tree only.
-- Session 12 — schematic **power symbols (M3b)**: rail pins → GND-triangle / power-arrow
-  glyphs + one `PWR_FLAG` driver per rail (clears `power_pin_not_driven`); grammar locked
-  via kicad-cli spike; i2c ERC-clean + exact netlist; +4 tests (23 total), ruff clean.
-  Working tree only.
-- Session 13 — schematic **M3c**: deterministic child-sheet filenames (no per-build hex)
-  + stale-file cleanup, fixing duplicate `<module>` files piling up across builds; i2c
-  double-build → stable two files, ERC-clean; +3 tests (26 total), ruff clean. **Schematic
-  work (sessions 11–13) was committed later as `51b75613` (pushed).**
-- Session 14 — **M4 `rag_search` retriever** built end-to-end: framework-agnostic
-  `ee_agent_rag/` package (Chroma + LlamaParse-REST + OpenAI embed + Cohere rerank, no
-  LangChain), agent wrapper `_ee/tools_rag.py`, eval runner, step-by-step tuning notebook
-  (gitignored) + local `16_RAG_NOTEBOOK_AND_TUNING.md`. Cleared the LlamaParse-SDK-on-3.14
-  blocker (REST workaround). 40 pass / 4 skip, ruff clean; **committed `fe5517d2`**
-  (datasheets-only v1; needs keys + PDFs + a ~30-Q eval to tune for real).
-- Session 15 — **M5 `pyspice_run` runner** built end-to-end: framework-agnostic
-  `ee_agent_spice/` (PySpice + libngspice, agent-authored netlist, bundled discrete models),
-  agent wrapper `_ee/tools_pyspice.py`, schema updated, M5 stub swapped. Cleared two real
-  gaps: atopile emits no SPICE netlist (→ agent-authored decks) and libngspice isn't on the
-  macOS dyld path (→ abs-path discovery). Astable multivibrator oscillates 1.13 Hz via the
-  real tool path (M5 done-def met). 70 pass / 4 skip, ruff clean. **Working tree only.**
-- Session 16 — **on-demand skill tools** `skills_list`/`skill_read` (`_ee/tools_skills.py`)
-  exposing the whole `.claude/skills/` library just-in-time (only the 3 fixed skills were ever
-  loaded before), + per-tool guidance docs `pyspice_run`/`rag_search`/`ipc_check`(seed) as
-  skills, + always-on nudge in `agent/SKILL.md` recipes (simulation gate) + a localized
-  `skill_read('<tool>')` pointer in **all three** EE tool descriptions
-  (`pyspice_run`/`rag_search`/`ipc_check`) so each self-advertises its skill. Future tools get
-  guidance by dropping one `SKILL.md`. 7 tests; agent suite 44 pass / 4 skip, ruff clean;
-  verified end-to-end via `execute_tool` + `build_system_prompt`. **Working tree only.**
-  (Also: local gitignored `SESSION_SUMMARY_2026-06-09.md` written for quick human review;
-  `.gitignore` glob `ee_agent_docs_5_21/SESSION_SUMMARY_*.md` added.)
-- Session 17 — **agent debug + run-log viewer**. Diagnosed the silent-"thinking…" freeze:
-  the backend's cwd is the *opened project* (outside the fork), so `find_dotenv(usecwd=True)`
-  missed the repo-root `.env` → provider fell back to `openai` with no key → instant
-  `run_failed` the UI never surfaced. Fixed `config.from_env()` to also load the source-tree
-  repo-root `.env` (cwd still wins). Then built the **Logs-tab "Agent" mode** (`agent_events`
-  via `/ws/logs`, latest-session default, mapped onto the shared entry shape; +6 tests, agent
-  suite 48 pass, frontend typechecks/builds, webview deployed). Both working-tree only.
-  (Corrected post-mortem path: agent log is `agent_logs.db` under `~/Library/Logs/atopile/`,
-  not `~/.atopile/agent_logs.sqlite`.)
-- Session 18 — **M4 tuned & validated on a real corpus.** 50-question user-approved eval
-  (`RAG_VALIDATION_SET.md` + `datasheets.jsonl`; 30 core approved, +20 implementation-
-  focused on request), 14 datasheets ingested (1156 chunks), **recall@5 = 0.98** with all
-  retrieval knobs at defaults — every win was ingest fidelity: synthesized page markers
-  (LlamaParse ignores the marker instruction), chunk-id ordinal (Chroma dup-id rejects),
-  12 new MPN patterns + filename fallback (`\b`-vs-`_` trap), stale-chunk deletion on
-  re-ingest, embed/rerank disk caches + Cohere 429 backoff. Sole miss = LlamaParse
-  equation-region prose drop (documented, not knob-fixable). Budget kept: ~17 LlamaParse
-  jobs / ~80 OpenAI / ~60 Cohere (<100 each). Suite 95 pass / 4 skip, ruff clean. Full
-  detail: `RAG_TUNING_SUMMARY.md`. Working tree only.
-- Session 19 — **schematic human-ready mode** (user-requested): real symbols + manual
-  signal wiring as the workflow, power/ground **auto-wired** (per rail pin: straight
-  5.08 mm stub wire outward + rotation-mapped GND/PWR glyph + horizontal net-name text;
-  PWR_FLAG perpendicular at the stub end). New `placement.py`: connectivity clustering
-  (anchors >4 pins; satellites orbit by Σ1/deg(net) affinity; lattice-valued cells,
-  disjointness = the no-shorts invariant). `SymbolDef` grew `pin_geo` (angle/length) +
-  `bbox` (real + generic); labels orient by pin outward direction; ref/value anchored to
-  bbox; per-sheet content-aware paper + title block. Verified: 37 exporter tests (11 new),
-  ruff clean; `examples/i2c` ERC 0 + exact netlist (hv=6, lv=4, SDA/SCL/Alert=2);
-  `led_badge grid10x10` (111 sheets, real WS2812 symbols) ERC 0; SVG renders eyeballed;
-  double-build file set deterministic (uuid bytes still random — known deferred).
-  led_badge `badge` target fails in **part picking** (solver contradiction, pre-existing,
-  unrelated). Working tree only.
-- Session 20 — **table-fidelity hardening** (user-driven): three LlamaParse defect flavors
-  found in the corpus. (1) **Flattened merged cells** (CD0603 abs-max VRRM under one part
-  column) → fixed by a merged-cell replication rule in `DATASHEET_INSTRUCTION`. (2)
-  **Column drift** in wide multi-variant pin tables (NVT2008) → fixed by new
-  `parse(..., premium=True)` / `EE_PARSE_PREMIUM` escalation knob. (3) **Column shift**
-  from split/merged body cells under a single header column (CD0603 EC table, Min/Typ/Max
-  all shifted) → premium parse verified correct alignment but **re-ingest + eval re-check
-  + scanner heuristic still pending** (see IN FLIGHT in Open items). Also built
-  `ee_agent_rag/eval/table_fidelity.py` scanner (+5 tests, notebook Step 2b), fixed
-  `ingest --force` clobbering premium parses (`--reparse` is now the explicit paid path),
-  added "Parsed-table caveats" to the rag_search skill. Eval after flavors 1–2: affected
-  7/7, regression sample 9/10 (only the known #30 miss). Suite 59 pass / 4 skip, ruff
-  clean. **Session ended at limit mid-flavor-3; resumed and finished in session 21.**
-- Session 21 — **flavor-3 column shift finished** (the session-20 IN FLIGHT item):
-  header-title pollution from the premium parse stripped **in code**
-  (`parse._strip_header_title_pollution`, runs on every `parse()` return incl. cache
-  hits — cache stays raw, no new parse jobs) instead of another paid instruction
-  attempt; CD0603 re-ingested with `--force` (premium parse reused, old shifted chunks
-  deleted, 15 clean chunks); eval 0/1/46 → 3/3, stored-chunk spot-check shows VF Typ
-  0.35 + IRRM test conditions/Max correct; scanner gained `column_shift_suspect`
-  (Min+Max header, ≥4 rows, Min ≥80% filled, Max empty) + 4 unit tests + 2 normalizer
-  tests (RAG suite 21 pass, ruff clean). Corpus scan: CD0603 clean; 5 new suspects in
-  SPX3819 (genuine, mechanical dims) / RM46 (mostly legit min-only timing) recorded in
-  Open items. `RAG_TUNING_SUMMARY.md` updated with the flavor-3 section. Follow-up
-  (user-caught): premium still left CD0603's two last-per-variant VF rows shifted →
-  added the **sidecar-patch layer** (`_apply_sidecar_patch`, `<hash>.patch.json`, +2
-  tests, RAG suite 23 pass) + the CD0603 patch; re-ingested, eval 3/3, stored rows
-  verified against the PDF. Notebook Step 2b updated (third kind in the summary loop +
-  caveats). Also: **`OPAMP_IDEAL` added to the bundled spice lib** (`ee_agent.lib`
-  subckt: `X1 inp inn out OPAMP_IDEAL`, single-pole A0 100k / GBW ~1 MHz, Rin 10 Meg,
-  Rout 10, NO rails → never clips; advertised in the tool description +
-  `pyspice_run` skill; live test `test_ideal_opamp_inverting_gain` asserts gain −10,
-  AC sweep through the agent wrapper shows 9.999 passband + GBW/f rolloff). And the
-  **`DATA_ROOT` cwd-trap fix** (see Lessons) + `.env.example` comment updated; verified
-  from a foreign cwd: store resolves to `<repo>/data`, 1065 chunks visible. Suites
-  101 pass / 4 skip.
-- Session 22 — **dynamic model routing** (user-requested; M6 tabled): per-turn
-  complexity classifier (`_ee/model_router.py`, Haiku call, fail-open to standard,
-  parser-enforced no-downshift while a design is in progress) →
-  Haiku 4.5 / Sonnet 4.6 / Opus 4.8 tiers; mechanism = optional `model` kwarg through
-  `LLMProvider.complete()` (both providers; per-call, singleton-safe); runner routes
-  once per `run_turn` and threads `effective_model` through all 4 provider call sites,
-  telemetry (`model_routed` event, progress payloads, `AgentTurnResult.model`) and the
-  agent log viewer for free. Opt-in `EE_AGENT_DYNAMIC_MODEL=1`, anthropic-only
-  (config-gated), defaults off. +19 tests (`test_model_router.py`, incl. live
-  classification: easy→simple, hard board design→complex, 2.8 s); live-verified
-  payload-model == API-served-model for override + default; `claude-opus-4-8` id
-  validated. Suite 62 pass / 4 skip (+1 live), ruff clean. **Deferred:** mid-run
-  escalation on circuit-breaker/chain-recovery signals (the per-call seam now exists),
-  OpenAI-path routing. **NB:** the local `.env` pins `ATOPILE_AGENT_MODEL` to haiku
-  (old cheap-testing choice) — remove it so the standard tier is sonnet when enabling
-  routing.
-- Session 23 — **diode auto-picking** (user-reported "ghost component"): a bare
-  `new Diode` with only constraints was silently dropped from BOM/netlist/PCB/
-  schematic (picker logs `ATTENTION: No pickers and no footprint`, build still
-  green) because `Pickable.Endpoint` only wired resistors/capacitors/inductors —
-  while the live components API already serves `/v0/query/diodes` (probed: returns
-  10 real parts for VF 0.5–0.8 V in the client's own wire format). Fix: `DIODES`
-  endpoint enum entry + `is_pickable_by_type` on `Diode` with params exactly matching
-  the API field spec (~12 lines); + `test_pick_diode_by_params` (live, mirrors the
-  resistor sibling). Verified: auto-pick example now picks **D1 = LRC SM260AF**, in
-  BOM + schematic with its real symbol, ERC 0, netlist connectivity exact; picker
-  suite 32 pass / 1 skip, ruff clean. MOSFET/LED/actives expansion deliberately
-  deferred (manual-pick preferred) — see Open items FOLLOW-UP. Two adjacent findings
-  recorded as Open items (silent-ghost UX, symbol-dirname mismatch).
-- Session 24 — **research-before-design + app_notes corpus live** (user-requested):
-  the agent's rag_search awareness was entirely reactive/datasheet-framed (and the
-  planning skill steered pre-design research to `web_search`), so it would never
-  consult white papers/textbooks before designing. Prompt-side fix across all four
-  awareness surfaces (agent SKILL recipe "Research Before Design", planning Phase-1
-  + step-7 rag-first ordering, tool description, rag_search skill). Data-side:
-  app_notes path proven end-to-end — TI SLVA079 ingested (31 chunks), design-guidance
-  query returns cited app-note chunks through the real tool wrapper, seed
-  `app_notes.jsonl` eval 4/4 (gate 0.70), fidelity scan clean. Suites 85 pass /
-  5 skip, ruff clean. Textbook corpus still needs its chunker (see Open items).
-- **Next** — M7 (end-to-end design + eval) and/or expand RAG corpora (see Open
-  items); M6 `ipc_check` is tabled (stub stays registered + degrades gracefully).
-  Q2 schematic image export still optional.
+Sessions 1–21 are condensed to one line each — the durable *why* is in Lessons & gotchas,
+the *what/where* in Completed work; only carry-forward notes are kept inline.
+- Sessions 1–3 — doc set written; local VSIX + dev-loop established; provider edit surface mapped.
+- Session 4 — M1 fork; 4→3 tools (pinmux dropped); `AnthropicProvider` landed additively.
+- Sessions 5–6 — M2 wired + tested; fixed the multi-turn freeze (stateful transcript); first commits pushed.
+- Sessions 7–9 — schematic emitter: `kicad.dumps` blocker found → text emitter; label mode, then short-free wire mode. Pushed.
+- Session 10 — M3 tool-registration plumbing (`ee_ping` + 3 schema'd graceful stubs). Pushed.
+- Sessions 11–13 — schematic hierarchical real-symbol mode + power symbols + deterministic filenames. Committed `51b75613` (pushed).
+- Session 14 — M4 `rag_search` built end-to-end (`ee_agent_rag/`); cleared LlamaParse-SDK-on-3.14 (REST). Committed `fe5517d2`.
+- Session 15 — M5 `pyspice_run` built (`ee_agent_spice/`); cleared "no SPICE netlist" (agent-authored decks) + libngspice dyld path.
+- Session 16 — `skills_list`/`skill_read` on-demand skill tools + per-tool guidance docs + the 3-layer awareness nudge.
+- Session 17 — diagnosed the silent-"thinking…" freeze (cwd-relative `.env` → openai fallback, no key) + built the Logs-tab "Agent" mode.
+- Session 18 — M4 tuned on a real corpus: 14 datasheets, 50-q eval, **recall@5 = 0.98**; every win was ingest fidelity (see RAG Lessons). `RAG_TUNING_SUMMARY.md`.
+- Session 19 — schematic human-ready mode: connectivity-clustered `placement.py`, auto-wired power, oriented labels/glyphs.
+- Sessions 20–21 — the three LlamaParse table-defect flavors + the instruction→premium→sidecar escalation ladder + `table_fidelity.py` scanner; `OPAMP_IDEAL` added to the spice lib; `DATA_ROOT` cwd-trap fixed. (All in RAG Lessons.)
+- Session 22 — **dynamic model routing**: per-turn classifier → Haiku/Sonnet/Opus via a `model` kwarg through `LLMProvider.complete()`; opt-in `EE_AGENT_DYNAMIC_MODEL=1`, anthropic-only. Routes once per turn; telemetry = `model_routed` event. (Session-26 added the floor + mid-turn escalation deferred here.)
+- Session 23 — **diode auto-picking** (the "ghost component" fix): `DIODES` endpoint + `is_pickable_by_type` on `Diode`. MOSFET/LED expansion deferred (Open items).
+- Session 24 — **research-before-design** prompting across all four awareness surfaces + **app_notes corpus live** (TI SLVA079). Textbook chunker still pending.
+- Session 25 — **branch audit** → `CODE_AUDIT.md` (P0–P3, each with `file:line`+fix; revert baseline `f9bcf3a7`); textbook-notebook fidelity scan (caught raw-`\[…\]` equations); **empty-chunk ingest 400 fixed** in `chunk.py`.
+- Session 26 — **hero-prompt hardening** (user-driven; 2026-06-17→19). Two stuck hero-prompt
+  runs analyzed from `agent_logs.db` (`SHOWCASE_PROMPT.md` against `examples/dac-buffer-demo`),
+  each a different failure; both fixed, plus the test target/env cleaned up.
+  - **Run 1 → parallel-tool 400.** Died at loop 14: `messages.NN: tool_use ids were found
+    without tool_result blocks immediately after` on the 2nd of two parallel `parts_install`.
+    Cause: the post-`parts_install` `{role:user}` nudge interleaved between parallel
+    `function_call_output`s, packed by the provider as `[tool_result, text, tool_result,
+    text]` — Anthropic requires tool_results to lead the turn. Fix in
+    `_ee/provider_anthropic.py`: `_flush_user` partitions tool_results to the front +
+    `_repair_orphaned_tool_uses` injects synthetic `[no result captured]` for any orphan.
+    +4 tests (`test_anthropic_provider.py`).
+  - **Run 1 → run-failure UX (the long-standing "perpetual thinking…").** The checklist
+    spinner was keyed on `item.status=='doing'`, not run liveness, so the dead run still
+    "loaded" at 4/7. Fixes in `ui-server`: doing-spinner only animates while
+    `message.pending`; Errored/Stopped chip on the checklist head (from `message.activity`);
+    **stall watchdog** in `useAgentChatRuntime` (seconds-since-last-progress; ≥60 s on a
+    pending run → "No activity for Ns — may be stuck"). `npm run build` clean.
+  - **Run 2 → routing never fired (all Haiku).** 37 turns, zero `model_routed` events:
+    backend on stale config (env read once at import → must restart after `.env` edits), and
+    the first turn's `has_active_design=False` let the Haiku classifier under-rate a
+    board-design prompt as `simple`. Fix: `model_router._min_floor` clamps long/design-dense
+    prompts up (new-design phrasing → complex), applied over heuristic and classifier.
+    +5 tests.
+  - **Run 2 → non-converging build loop + spend.** Whack-a-mole'd 3 ato errors (`within`
+    bare; `for` without `#pragma experiment("FOR_LOOP")`; bad pin `package.BYP`) and never
+    converged; `build_run` is async so failures were invisible to the circuit breaker.
+    Fixes in `runner.py`: per-turn `build_failures` (from `build_logs_search` ERROR/ALERT)
+    → escalate model one tier at ≥2, graceful `failure_budget_exceeded` stop at
+    `max_build_failures` (4); per-turn token budget `ATOPILE_AGENT_MAX_TURN_TOKENS`
+    (default 1.5M, 0=off) → `token_budget_exceeded` stop; tightened defaults
+    `max_tool_loops` 240→80, `max_turn_seconds` 7200→1800. +7 tests
+    (`test_runner_safeguards.py`). `ato/SKILL.md` gained a "Common build errors → fixes"
+    table.
+  - **Ops.** `.env` rewritten as the documented hero-test config (provider/keys/dynamic
+    routing active, model pin commented, every runner knob present+commented at default with
+    a one-line comment); `examples/dac-buffer-demo/` reset to a bare skeleton `ato.yaml`
+    (removed agent-written `dac-buffer.ato`, `packages/`, `.ato/`, `build/`, `layout/` + the
+    added deps). Agent suites green except the pre-existing `test_dynamic_model_defaults_off`
+    (fails only because the repo `.env` sets `EE_AGENT_DYNAMIC_MODEL=1` and `from_env` calls
+    `load_dotenv`). **All working tree only — not yet committed.**
+- Session 27 — **cost-control + build-reliability** (user-driven; 2026-06-19). Analyzed the
+  re-run hero session `d3e13b4b` from `agent_logs.db` (`scorecard.py` 5/8). Findings + fixes:
+  - **All-Opus cost blowout → credit exhaustion.** Per-turn routing + single-turn execution
+    pinned the whole design to Opus → `run_failed: 400 credit balance too low` (see Lessons).
+    Fix: `config.py` default `model_complex` Opus→**Sonnet**, Opus opt-in via
+    `ATOPILE_AGENT_MODEL_COMPLEX`; updated `.env` comment, passdown, `test_model_router.py`
+    (assertion + new `test_complex_tier_opus_opt_in`).
+  - **Diode `.package="SOD-123"` doc bug** (build died at `init-build-context`). Fixed the
+    wrong `usage_example` in `Diode.py` + `ato/SKILL.md` (`.package` = `SMDSize` only).
+  - **`scorecard.py` upgrades:** new `--trace` flag (per-tool counts + tool-call timeline
+    *with parameters* + skills-read section, parsed from `tool_call_completed` payloads);
+    robust `check_diode` (picker classifies Schottky as BOM type `other` → also match by
+    `forward_voltage` param / `D#` ref); softened `check_rag` wording (logged payloads are
+    truncated). `SHOWCASE_README.md` notes the Opus opt-in.
+  - **Hero target now builds clean** (user ask). Fixed `dac-buffer-demo/dac-buffer.ato`:
+    dropped hand-pinned `lcsc_id` on filter passives (auto-pick), diode constraints →
+    intervals + correct bound direction, dropped over-tight `max_current`. `ato build` →
+    18/18 stages, auto-picks **`D1=1N5817WS`**, emits 6 `.kicad_sch` + BOM. Scorecard 7/8
+    against the project (the one ✗ is the *historical* run's logged `run_failed`).
+  - **`ato` skill under-constrain rules** (so the agent stops over-specifying): 4c
+    "Constrain loosely" block + GOOD/BAD example; three new 5b error-table rows
+    (exact-value-not-interval / `No matching component found` / `LCSC has no footprint`).
+  - **Minor UX:** agent composer textarea `max-height` 50vh→160px (`AgentChatPanel.css`) so a
+    long prompt scrolls internally instead of swallowing the panel.
+  - **All working tree only — not yet committed** (session 26 tree still uncommitted too).
+- Session 28 — **hero addendum + buck/RS-485 + net-naming overhaul** (user-driven; 2026-06-19).
+  - **Opus-vs-Sonnet reconfirm.** Latest `agent_logs.db` session `d3e13b4b` ran every call on
+    Opus (`model_routed: complex` → `claude-opus-4-8`) despite the session-27 Sonnet default —
+    a **stale backend** (config read once at import; `.env`/`config.py` changed after start).
+    After a window reload the next run routed complex→**Sonnet** (15 calls, clean
+    `run_completed`). Reinforces the existing "restart after any `.env`/config edit" lesson; no
+    code change.
+  - **Hero addendum + integration.** Wrote `SHOWCASE_PROMPT_ADDENDUM.md` (TPS563201 12V→5V buck
+    + SP3485 RS-485 to a connector). Finished a prior agent handoff by integrating the
+    agent-built `buck`/`rs485` wrappers into `dac-buffer.ato` `App`; needed `ato sync` to
+    install the new local packages first (see Lessons). Builds clean (18/18); FB 54.9k/10k →
+    4.99 V; ERC-cli violations all cosmetic classes. (Completed work.)
+  - **Net-naming overhaul.** Voltage-aware rails (`+5V`/`+3V3`/`+12V`, tightest-spec member),
+    shared `GND` + fragment warning, IC-pin fallback, and the load-bearing passive-`.power`
+    skip (a bootstrap cap's `power.lv` was mislabeling the buck **SW** node as ground →
+    `cboot-power-GND`, demoting the real ground). `ato` skill guidance + 4 unit tests; 3
+    schematic assertions updated. 56 tests green. (Completed work + Lessons.)
+  - **All working tree only — not yet committed.**
+- **Next** — commit the session-26 + session-27 + session-28 working tree (provider/runner/router/config/
+  ui-server/skills/scorecard/Diode.py + session-28 `net_naming.py`/`build_steps.py`/`schematic.py`/
+  `ato`-skill + the extended demo `dac-buffer.ato` + buck/RS-485 packages + `SHOWCASE_PROMPT_ADDENDUM.md`
+  + new tests); re-run the hero prompt
+  against the clean target after a backend restart and confirm Sonnet-tier routing + a clean
+  `run_completed` (`scorecard.py --trace`); then re-ingest
+  `fundamentals_of_electrical_engineering_1.pdf` (now unblocked) + tighten
+  `TEXTBOOK_INSTRUCTION` (`$…$` not raw `\[…\]`), reparse textbooks `force=True`; work the
+  `CODE_AUDIT.md` P0 items (BM25 pickle→JSON + atomic write, cache the tool defs). Plus M7
+  (end-to-end design + eval) and/or expand RAG corpora (Open items); M6 `ipc_check` tabled;
+  Q2 schematic image export optional. Latent gap (deferred, user did not pick it): the
+  per-turn token budget doesn't count cache reads (`runner.py:778`).

@@ -40,8 +40,11 @@ _TRACE_DISABLE_VALUES = {"0", "false", "no", "off"}
 class AgentConfig:
     provider: str = "openai"  # "openai" | "anthropic"
     base_url: str = "https://api.openai.com/v1"
-    model: str = "gpt-5.4"
-    summary_model: str = "gpt-4.1-nano"
+    # Valid, current OpenAI IDs so the default path works out of the box (the prior
+    # "gpt-5.4"/"gpt-4.1-nano" placeholders don't exist — CODE_AUDIT B9). The Anthropic
+    # path is the primary/supported one for this fork; override either via env.
+    model: str = "gpt-4o"
+    summary_model: str = "gpt-4o-mini"
     # Dynamic complexity routing (EE addition; anthropic-only, opt-in). When
     # ``dynamic_model`` is true the runner classifies each user turn and picks
     # ``model_simple`` / ``model`` / ``model_complex``; the classifier itself runs
@@ -53,8 +56,15 @@ class AgentConfig:
     api_key: str | None = None
     timeout_s: float = 120.0
     summary_timeout_s: float = 8.0
-    max_tool_loops: int = 240
-    max_turn_seconds: float = 7_200.0
+    max_tool_loops: int = 80
+    max_turn_seconds: float = 1_800.0
+    # Cumulative per-turn token-spend cap (input+output across all model calls in the
+    # turn). Bounds spend on a runaway/failing turn that the loop/time caps are too
+    # loose to catch. ``0`` disables the cap (prior behavior). See runner enforcement.
+    max_turn_tokens: int = 1_500_000
+    # Consecutive build failures within a turn before the runner gives up and hands
+    # off gracefully instead of grinding (see runner build-failure ladder).
+    max_build_failures: int = 4
     api_retries: int = 4
     api_retry_base_delay_s: float = 0.5
     api_retry_max_delay_s: float = 8.0
@@ -136,14 +146,23 @@ class AgentConfig:
             # ATOPILE_AGENT_SUMMARY_MODEL for a cheaper summarizer.
             default_summary_model = "claude-sonnet-4-6"
             default_model_simple = "claude-haiku-4-5-20251001"
-            default_model_complex = "claude-opus-4-8"
+            # Default the complex tier to Sonnet, not Opus: the agent runs a whole
+            # design as one turn, so a per-turn route to Opus pins every call in
+            # that turn to the most expensive tier (a single hero run exhausted the
+            # API balance — see ee_agent_docs_5_21/passdown.md). Opus stays opt-in
+            # via ATOPILE_AGENT_MODEL_COMPLEX=claude-opus-4-8, which also restores
+            # Opus as the build-failure escalation ceiling (_escalate_model tops out
+            # at cfg.model_complex).
+            default_model_complex = "claude-sonnet-4-6"
         else:
             api_key = os.getenv("ATOPILE_AGENT_OPENAI_API_KEY") or os.getenv(
                 "OPENAI_API_KEY"
             )
             base_url = _env("ATOPILE_AGENT_BASE_URL", "https://api.openai.com/v1")
-            default_model = "gpt-5.4"
-            default_summary_model = "gpt-4.1-nano"
+            # Valid current OpenAI IDs (the old "gpt-5.4"/"gpt-4.1-nano" defaults don't
+            # exist; CODE_AUDIT B9). Override with ATOPILE_AGENT_MODEL for another.
+            default_model = "gpt-4o"
+            default_summary_model = "gpt-4o-mini"
             default_model_simple = ""
             default_model_complex = ""
 
@@ -174,9 +193,15 @@ class AgentConfig:
             summary_timeout_s=_env_float(
                 "ATOPILE_AGENT_SUMMARY_TIMEOUT_S", "8", lo=1.0, hi=30.0
             ),
-            max_tool_loops=_env_int("ATOPILE_AGENT_MAX_TOOL_LOOPS", "240"),
+            max_tool_loops=_env_int("ATOPILE_AGENT_MAX_TOOL_LOOPS", "80"),
             max_turn_seconds=_env_float(
-                "ATOPILE_AGENT_MAX_TURN_SECONDS", "7200", lo=30.0, hi=7_200.0
+                "ATOPILE_AGENT_MAX_TURN_SECONDS", "1800", lo=30.0, hi=7_200.0
+            ),
+            max_turn_tokens=_env_int(
+                "ATOPILE_AGENT_MAX_TURN_TOKENS", "1500000", lo=0
+            ),
+            max_build_failures=_env_int(
+                "ATOPILE_AGENT_MAX_BUILD_FAILURES", "4", lo=0
             ),
             fixed_skill_ids=fixed_skill_ids,
             fixed_skill_token_budgets=_parse_fixed_skill_token_budgets(

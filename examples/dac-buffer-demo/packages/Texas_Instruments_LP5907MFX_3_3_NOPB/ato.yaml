@@ -1,0 +1,10 @@
+requires-atopile: ^0.14.0
+paths:
+  src: ./
+  layout: ./layouts
+builds:
+  default:
+    entry: Texas_Instruments_LP5907MFX_3_3_NOPB.ato:Texas_Instruments_LP5907MFX_3_3_NOPB
+package:
+  identifier: local/texas-instruments-lp5907mfx-3-3-nopb
+  version: 0.0.1

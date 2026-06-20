@@ -27,12 +27,15 @@ def test_missing_query_is_rejected_gracefully():
 
 def test_retriever_exception_degrades_gracefully(monkeypatch):
     def boom(**kwargs):
-        raise RuntimeError("COHERE_API_KEY is not set.")
+        raise RuntimeError("COHERE_API_KEY is not set: /Users/secret/path/.env")
 
     monkeypatch.setattr("ee_agent_rag.rag_search", boom)
     out = _call({"query": "TLV713P quiescent current"})
     assert out["ok"] is False
-    assert "RuntimeError" in out["error"]
+    # Q1: only the exception type is surfaced — the message body (here a filesystem
+    # path) must not be echoed into the transcript.
+    assert out["error"] == "RuntimeError"
+    assert "secret" not in out["error"]
     assert out["results"] == []
 
 

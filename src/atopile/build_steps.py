@@ -681,7 +681,7 @@ def prepare_nets(ctx: BuildStepContext) -> None:
         loaded_nets = load_net_names(app.tg)
         nets |= loaded_nets
 
-    attach_net_names(nets)
+    attach_net_names(nets, solver=ctx.require_solver())
     check_net_names(app.tg)
 
 
@@ -871,20 +871,39 @@ def build_design(ctx: BuildStepContext) -> None:
 def generate_schematic(ctx: BuildStepContext) -> None:
     """Emit a KiCad connectivity schematic (`<target>.kicad_sch`) with drawn nets."""
     from faebryk.exporters.schematic import SchematicMode, export_schematic
+    from faebryk.libs.kicad.fileformats import C_kicad_project_file
 
     app = ctx.require_app()
     out_path = config.build.paths.output_base.with_suffix(".kicad_sch")
     # Project parts plus dependency parts (under .ato/modules) for symbol embedding
     # (hierarchical/label modes use real cached symbols; wire mode uses generic boxes).
     search_dirs = [config.project.paths.parts, config.project_dir / ".ato"]
-    summary = export_schematic(
-        app,
-        target_name=config.build.name,
-        out_path=out_path,
-        parts_search_dirs=search_dirs,
-        mode=SchematicMode.HIERARCHICAL,
-    )
+
+    def _emit(path: Path):
+        return export_schematic(
+            app,
+            target_name=config.build.name,
+            out_path=path,
+            parts_search_dirs=search_dirs,
+            mode=SchematicMode.HIERARCHICAL,
+        )
+
+    # Build-dir copy: surfaced as the `kicad_sch` artifact.
+    summary = _emit(out_path)
     logger.info(f"Exported schematic to {out_path} ({summary})")
+
+    # Co-located KiCad project: emit the same schematic (deterministic UUIDs => byte
+    # identical) next to the PCB under the board's stem, plus a `.kicad_pro`, so the
+    # board + schematic open as one project and cross-probe (footprints carry the
+    # matching instance paths — see PCB_Transformer._attach_schematic_instance_paths).
+    layout = config.build.paths.layout
+    if layout is not None:
+        _emit(layout.with_suffix(".kicad_sch"))
+        project_path = config.build.paths.kicad_project
+        # Don't clobber an existing project (it holds the user's board settings).
+        if not project_path.exists():
+            C_kicad_project_file().dumps(project_path)
+            logger.info(f"Wrote KiCad project {project_path}")
 
 
 @muster.register(

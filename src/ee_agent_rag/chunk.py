@@ -32,8 +32,36 @@ class RawChunk:
     extras: dict = field(default_factory=dict)
 
 
+_ENCODER: object | None = None
+_ENCODER_TRIED = False
+
+
+def _encoder():
+    """Cached tiktoken encoder, or ``None`` if tiktoken isn't installed."""
+    global _ENCODER, _ENCODER_TRIED
+    if not _ENCODER_TRIED:
+        _ENCODER_TRIED = True
+        try:
+            import tiktoken
+
+            _ENCODER = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # noqa: BLE001 - tiktoken is optional
+            _ENCODER = None
+    return _ENCODER
+
+
 def approx_tokens(text: str) -> int:
-    return len(text) // 4
+    """Token-count estimate shared by the chunker and embed batching.
+
+    Uses tiktoken when available (exact for the OpenAI BPE). Without it, falls back to
+    ``ceil(len/3)`` rather than ``len//4``: dense technical text (part numbers, units,
+    tables) often runs >4 chars/token under BPE, so ``//4`` *under*-counts and can tag a
+    chunk "3000 tok" that actually exceeds the embed/model limit. ``/3`` over-estimates,
+    which is the safe direction (CODE_AUDIT B5)."""
+    enc = _encoder()
+    if enc is not None:
+        return len(enc.encode(text))
+    return -(-len(text) // 3)  # ceil division
 
 
 def _find_page_range(content: str) -> tuple[int | None, int | None]:
@@ -125,7 +153,11 @@ def _window_split(md: str, target: int, overlap: int) -> list[str]:
         current_tokens += para_tokens
     if current:
         windows.append("\n\n".join(current))
-    return windows
+    # Sections often end with a blank line, which re.split yields as a trailing empty
+    # paragraph that can flush into a lone empty final window. Drop whitespace-only
+    # windows so they never reach embed (OpenAI 400s on empty input) and the [i/n]
+    # suffix counts only real windows.
+    return [w for w in windows if w.strip()]
 
 
 def chunk_textbook(parsed_md: str) -> list[RawChunk]:
@@ -185,4 +217,6 @@ def chunk_dispatch(parsed_md: str, doc_type: DocType) -> list[RawChunk]:
             f"No chunker for doc_type={doc_type!r} yet "
             "(have: datasheets/app_notes/textbooks)."
         )
-    return _CHUNKERS[doc_type](parsed_md)
+    # Safety net for every chunker: never emit an empty/whitespace-only chunk — the
+    # OpenAI embeddings API rejects empty input strings ("input cannot be empty").
+    return [c for c in _CHUNKERS[doc_type](parsed_md) if c.content.strip()]

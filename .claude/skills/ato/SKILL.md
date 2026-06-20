@@ -271,6 +271,30 @@ Choose components using generics + constraints wherever possible.
 - Use `parts_install` for parts that need explicit LCSC IDs, and prefer `create_package=true` when the part should become a reusable local wrapper.
 - Use `web_search` after selecting a concrete part to inspect the vendor datasheet, exact pins, limits, and supporting circuitry.
 - Lock only high-risk parts (MCU, PMIC, RF, connectors). Leave commodity passives auto-picked.
+
+**Constrain loosely — let the picker choose. Over-specifying blocks the build.**
+
+- **Passives (`Resistor`/`Capacitor`/`Inductor`): set only the value (`.resistance`/`.capacitance`/`.inductance`) plus an optional `.package` size code, then let auto-pick resolve the part. NEVER hand-set `.lcsc_id`/MPN on a passive** — a pinned passive can have no usable LCSC footprint/symbol and hard-blocks the build (`LCSC has no footprint/symbol for any candidate`), with no upside over auto-pick.
+- **Constrain only what the design actually requires.** Every extra constraint shrinks the candidate set; an unnecessary rating (e.g. a current or voltage spec the design doesn't need) can leave zero matches (`No matching component found`). Start minimal; add a constraint only when a real requirement demands it.
+- **Picking parameters must be intervals, never exact values.** Use `assert x <= <max>`, `assert x >= <min>`, or `assert x within <a> to <b>`. A bare `x = <value>` on a picked parameter fails (`assigned to an exact value … instead of being constrained to an interval`).
+- **Use the correct bound direction.** Datasheet *maximums* (diode `forward_voltage`, leakage) → upper bound `<= X` — a lower-bounded range excludes parts whose spec is given only as a max. *Minimum ratings* (reverse working voltage, current, power) → `>= X`.
+
+```ato
+# GOOD — loose, auto-picked
+c1 = new Capacitor
+c1.capacitance = 15nF +/- 5%
+c1.package = "0603"            # value + size only; picker chooses the part
+
+d1 = new Diode                 # Schottky reverse-protection, constraint-picked
+assert d1.forward_voltage <= 0.55V          # max spec -> upper bound (selects Schottky)
+assert d1.reverse_working_voltage >= 20V    # rating -> lower bound
+
+# BAD — over-specified, blocks the picker
+c1.lcsc_id = "C49326616"       # pinned passive MPN may have no footprint -> build fails
+d1.reverse_working_voltage = 20V            # exact value -> "must be an interval"
+assert d1.forward_voltage within 0.3V to 0.55V   # lower bound drops max-spec'd parts
+assert d1.max_current >= 1A                  # unneeded rating -> "No matching component found"
+```
 - Before inventing a project-local `interface`, check whether the wrapper boundary can be represented as:
   - a stdlib interface (`SPI`, `UART`, `SWD`, `USB2_0_IF`, etc.)
   - an array of stdlib signals/interfaces (`new ElectricLogic[3]`, `new ElectricPower[3]`, `new ElectricSignal[3]`)
@@ -307,6 +331,25 @@ Run builds and fix issues iteratively until everything passes. **Build submodule
 - Use `design_diagnostics` for silent failures.
 - Fix issues using Section 5 troubleshooting.
 - Repeat until build passes cleanly.
+
+### 5b: Common build errors → fixes
+
+These account for most early `init-build-context` failures. Read the actual
+error in `build_logs_search`, then apply the matching fix instead of rebuilding blindly:
+
+| Error message (substring) | Cause | Fix |
+|---|---|---|
+| `no viable alternative at input '… within'` | `within` used as a bare expression | `within` is **only** valid inside an assertion: `assert <field> within <A> to <B>` (or `<X> +/- <tol>`). Never write `foo.bar within …` on its own line. |
+| `Experiment FOR_LOOP is not enabled` | `for` loop without its pragma | Add `#pragma experiment("FOR_LOOP")` at the **top of the file, before imports** — or avoid the loop and instantiate explicitly. (Same pattern for `BRIDGE_CONNECT` `~>`, `TRAITS`, `MODULE_TEMPLATING`.) |
+| `Field '<pkg>.<PIN>' could not be resolved` | Referenced a pin/field that doesn't exist on the package | Verify the real interface first — inspect the package (`report_variables`, the package's `.ato`, or `parts`/datasheet) and use the exact pin/field name. Don't guess pin names. |
+| `Invalid package: '<name>'. Valid packages are: …` | `.package` set to a **footprint name** (e.g. `"SOD-123"`, `"SOT-23"`) | `.package` accepts **only SMD size codes** — imperial `"I0402"`/bare `"0402"`, metric `"M1005"`, or `"SMD<W>x<H>mm"` (source: `compiler/overrides.py::_parse_smd_size`). It is **not** a footprint selector. For a part you are auto-picking by constraints (e.g. a `Diode`), **omit `.package`** entirely and let the picker choose the footprint. |
+| `Parameter … assigned to an exact value (…) instead of being constrained to an interval` | A picked parameter set with `=` | Picking params need an interval: use `assert x <= max`, `assert x >= min`, or `assert x within a to b` — not a bare `x = <value>`. |
+| `No matching component found for …` | Over-constrained, or wrong bound direction | Relax — drop non-essential constraints (one at a time), make sure picking params are intervals (not `=`), and check direction: datasheet *maximums* (Vf, leakage) use `<=`, *ratings* (reverse voltage, current) use `>=`. A lower bound on a max-spec'd param silently excludes valid parts. |
+| `LCSC has no footprint/symbol for any candidate …` | Hand-pinned `lcsc_id`/MPN has no usable footprint | Remove the pin and auto-pick from value + package (always do this for passives), or choose a different in-stock part. |
+
+If the **same** build error repeats after an edit, stop and re-read the failing
+source + the package interface rather than re-running the build — repeated identical
+builds waste turns and tokens.
 
 ## Step 6: Summary
 
@@ -735,6 +778,31 @@ i2c.address.default = 0x20
 # In the integration module:
 assert sensor.i2c.address within 0x21 to 0x21
 ```
+
+### Net naming convention
+
+Nets are named automatically — supply intent only where the build can't infer it. Clean,
+human-readable net names make the schematic readable, so follow this convention.
+
+**What's automatic (don't hand-name these):**
+- **Power rails get their voltage**: `+5V`, `+3V3`, `+12V`. Just assert the rail voltage
+  (`assert power_3v3.voltage within 3.3V +/- 2%`) and it shows up in the net name.
+- **All non-isolated grounds collapse to one `GND`.** **Tie every ground together** (a single
+  reference) so they share `GND`; the build emits a warning if it finds multiple un-tied
+  ground nets — fix the missing tie rather than ignoring it.
+- **Bus/signal lines reuse stdlib names**: I2C → `SDA`/`SCL`, UART → `TX`/`RX`,
+  SPI → `SCLK`/`MISO`/`MOSI`, RS485 → `_A`/`_B`. Use the stdlib interfaces and you get these.
+- Otherwise a net is named after the **pin of the IC it connects to** (`VFB`, `EN`, `VBST`);
+  ICs win over passives, so an IC+resistor net is named for the IC pin.
+
+**Add intent only when the auto name is wrong or ambiguous:**
+```ato
+power_5v.hv.override_net_name = "+5V_IN"     # purpose/direction on a rail (beats auto voltage)
+rs485.A.line.override_net_name = "TX"        # a signal name the build can't guess (or "+TX")
+iso_gnd.lv.override_net_name = "GNDA"        # mark a genuinely isolated ground (excluded from GND)
+```
+`override_net_name` is authoritative (wins over the auto voltage/pin name); `suggest_net_name`
+is a soft hint. Don't fight the automatic voltage/`GND` naming, and don't leave grounds un-tied.
 
 ## 2.10 For Loops
 

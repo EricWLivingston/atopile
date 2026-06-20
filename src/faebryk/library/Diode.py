@@ -96,7 +96,9 @@ class Diode(fabll.Node):
         diode.current = 10mA +/- 5%
         diode.reverse_working_voltage = 50V
         diode.max_current = 100mA
-        diode.package = "SOD-123"
+        # Note: do NOT set diode.package to a footprint like "SOD-123" — `.package`
+        # only accepts SMD size codes (e.g. "I0402", "M1005"). For a constraint-driven
+        # diode, omit `.package` and let the picker choose the part and its footprint.
 
         # Connect as rectifier
         ac_input ~ diode.anode

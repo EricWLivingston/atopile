@@ -32,9 +32,41 @@ def test_missing_netlist_and_path_rejected():
 
 
 def test_missing_netlist_path_file_rejected(tmp_path):
-    out = _call({"analysis": "op", "netlist_path": str(tmp_path / "nope.cir")})
+    out = _call(
+        {
+            "analysis": "op",
+            "netlist_path": str(tmp_path / "nope.cir"),
+            "project_path": str(tmp_path),
+        }
+    )
     assert out["success"] is False
     assert out["errors"][0]["type"] == "missing_netlist"
+
+
+def test_netlist_path_traversal_rejected(tmp_path):
+    # A relative path escaping the project root must be refused (CODE_AUDIT B1),
+    # before any file read or runner import.
+    out = _call(
+        {
+            "analysis": "op",
+            "netlist_path": "../../../../etc/passwd",
+            "project_path": str(tmp_path),
+        }
+    )
+    assert out["success"] is False
+    assert out["errors"][0]["type"] == "invalid_path"
+
+
+def test_absolute_netlist_path_outside_project_rejected(tmp_path):
+    out = _call(
+        {
+            "analysis": "op",
+            "netlist_path": "/etc/hosts",
+            "project_path": str(tmp_path),
+        }
+    )
+    assert out["success"] is False
+    assert out["errors"][0]["type"] == "invalid_path"
 
 
 def test_inline_netlist_passed_through_to_runner(monkeypatch):
@@ -71,7 +103,9 @@ def test_netlist_path_is_read(monkeypatch, tmp_path):
         return {"success": True, "results": []}
 
     monkeypatch.setattr("ee_agent_spice.simulate", fake_simulate)
-    out = _call({"analysis": "op", "netlist_path": str(deck)})
+    out = _call(
+        {"analysis": "op", "netlist_path": str(deck), "project_path": str(tmp_path)}
+    )
     assert out["success"] is True
     assert "R1 in out 1k" in seen["netlist"]
 
@@ -88,9 +122,12 @@ def test_runner_oserror_degrades_to_dependency_missing(monkeypatch):
 
 def test_runner_unexpected_exception_degrades(monkeypatch):
     def boom(**kwargs):
-        raise RuntimeError("kaboom")
+        raise RuntimeError("kaboom at /Users/secret/internal.py")
 
     monkeypatch.setattr("ee_agent_spice.simulate", boom)
     out = _call({"netlist": "R1 a 0 1k", "analysis": "op"})
     assert out["success"] is False
     assert out["errors"][0]["type"] == "unexpected_error"
+    # Q1: only the exception type, not the message body (a path here), is surfaced.
+    assert out["errors"][0]["rationale"] == "RuntimeError"
+    assert "secret" not in out["errors"][0]["rationale"]

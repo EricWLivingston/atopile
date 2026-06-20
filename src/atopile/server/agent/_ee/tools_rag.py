@@ -8,7 +8,10 @@ to a ``{"ok": False, "error": ...}`` payload so a live run never crashes on retr
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 _MAX_TEXT_CHARS = 1500  # trim chunk bodies so the tool result stays prompt-sized
 
@@ -43,8 +46,12 @@ async def run_rag_search(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         return await asyncio.to_thread(_run, arguments)
     except Exception as e:  # noqa: BLE001 - tool must not crash the run
+        # Return only the exception *type* to the model — the message body can carry
+        # filesystem paths / API internals we don't want echoed into the transcript.
+        # Full detail goes to the server log instead (CODE_AUDIT Q1).
+        log.exception("rag_search failed")
         return {
             "ok": False,
-            "error": f"{type(e).__name__}: {e}",
+            "error": type(e).__name__,
             "results": [],
         }

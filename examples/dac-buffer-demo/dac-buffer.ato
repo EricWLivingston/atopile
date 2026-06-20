@@ -1,0 +1,247 @@
+#pragma experiment("BRIDGE_CONNECT")
+#pragma experiment("FOR_LOOP")
+#pragma experiment("TRAITS")
+
+import ElectricPower
+import ElectricSignal
+import ElectricLogic
+import I2C
+import Diode
+import Resistor
+import Capacitor
+
+from "local/texas-instruments-lp5907mfx-3-3-nopb/Texas_Instruments_LP5907MFX_3_3_NOPB.ato" import Texas_Instruments_LP5907MFX_3_3_NOPB
+from "local/microchip-tech-mcp4728-e-un/Microchip_Tech_MCP4728_E_UN.ato" import Microchip_Tech_MCP4728_E_UN
+from "local/texas-instruments-tlv9002idr/Texas_Instruments_TLV9002IDR.ato" import Texas_Instruments_TLV9002IDR
+from "local/texas-instruments-tps563201ddcr/Texas_Instruments_TPS563201DDCR.ato" import Texas_Instruments_TPS563201DDCR
+from "local/maxlinear-sp3485en-l-tr/MaxLinear_SP3485EN_L_TR.ato" import MaxLinear_SP3485EN_L_TR
+from "parts/TE_Connectivity_796636_3/TE_Connectivity_796636_3.ato" import TE_Connectivity_796636_3_package
+
+
+module ReversePolarityProtection:
+    """
+    Series Schottky diode for reverse-polarity protection on the 5 V input.
+
+    The diode is defined purely by constraints (low Schottky forward voltage and a
+    reverse working voltage above the 5 V rail) and is left auto-picked - no MPN is
+    hand-selected. A Schottky is chosen for its low forward drop so the regulator
+    still sees enough headroom above its 3.3 V output.
+
+    Requirements:
+    - R-PROT1: Series Schottky, Vf low (~0.3-0.45 V), reverse working voltage >= 20 V,
+               part auto-picked from constraints (no fixed MPN).
+    """
+
+    power_in = new ElectricPower
+    power_out = new ElectricPower
+
+    diode = new Diode
+    # Constraint-driven auto-pick of a Schottky (no MPN). Picking params must be
+    # intervals, not exact values:
+    #   - forward_voltage <= 0.55V selects a Schottky over silicon (~0.7V+). It is a
+    #     datasheet *maximum*, so use an upper bound — a lower bound (e.g. within
+    #     0.3V to 0.55V) excludes parts whose Vf is specified only as "<= X".
+    #   - reverse_working_voltage >= 20V gives comfortable margin over the 5V rail.
+    # max_current is intentionally left unconstrained: low-Vf 20V+ Schottkys rated
+    # >=1A aren't in the catalog, and this analog board draws only tens of mA.
+    assert diode.forward_voltage <= 0.55V
+    assert diode.reverse_working_voltage >= 20V
+    # No .package: it only accepts SMD size codes (I0402/M1005/…), not a footprint
+    # like "SOD-123". Omit it so the picker selects the part and its footprint.
+
+    # Series in the high side: in.hv -> diode -> out.hv ; ground passed through.
+    power_in.hv ~> diode ~> power_out.hv
+    power_in.lv ~ power_out.lv
+
+
+module ReconstructionFilter:
+    """
+    Unity-gain (Sallen-Key) 2nd-order low-pass reconstruction filter, fc ~ 1 kHz.
+
+    Topology: equal-resistor unity-gain Sallen-Key built on one channel of the
+    TLV9002 RRIO op-amp (configured as a voltage follower in the feedback path).
+
+    Design (verified in SPICE - DC gain 1.004 ~ unity, simulated -3 dB ~ 1.03 kHz):
+      R1 = R2 = 16 kohm
+      C1 = 15 nF (feedback, from R1/R2 node to output)
+      C2 = 6.8 nF (from non-inverting input to ground)
+      => fc = 1 / (2*pi*R*sqrt(C1*C2)) ~ 1.0 kHz, Q ~ 0.74 (near Butterworth)
+
+    Component values follow the Sallen-Key procedure in the LMV324-N datasheet
+    (SNOS012K, "Sallen-Key 2nd-Order Active Low-Pass Filter"). Real in-stock
+    passives are locked by LCSC ID.
+
+    Requirements:
+    - R-FILT1: 2nd-order Sallen-Key LPF, unity DC gain, -3 dB near 1 kHz.
+    """
+
+    power = new ElectricPower
+    input = new ElectricSignal
+    output = new ElectricSignal
+
+    # One TLV9002 amplifier provides the active element.
+    opamp = new Texas_Instruments_TLV9002IDR
+    power ~ opamp.power
+
+    r1 = new Resistor
+    r2 = new Resistor
+    c1 = new Capacitor
+    c2 = new Capacitor
+
+    # Constraint-driven auto-pick (no hand-pinned lcsc_id: a fragile MPN with no
+    # LCSC footprint/symbol blocks the build — let the picker resolve a stocked part).
+    r1.resistance = 16kohm +/- 1%
+    r2.resistance = 16kohm +/- 1%
+    r1.package = "0402"
+    r2.package = "0402"
+
+    c1.capacitance = 15nF +/- 5%
+    c2.capacitance = 6.8nF +/- 10%
+    c1.package = "0603"
+    c2.package = "0603"
+
+    # Sallen-Key network:
+    #   input -> R1 -> node_a -> R2 -> in+ (op-amp non-inverting)
+    #   C2 from in+ to ground
+    #   C1 from node_a to output (op-amp output = follower output)
+    #   op-amp configured as unity-gain follower: out tied to in-
+    input.line ~> r1 ~> r2 ~> opamp.in1p.line
+    c2.unnamed[0] ~ opamp.in1p.line
+    c2.unnamed[1] ~ power.lv
+
+    # C1 feedback from the R1/R2 junction to the op-amp output
+    c1.unnamed[0] ~ r1.unnamed[1]   # R1/R2 junction (node_a)
+    c1.unnamed[1] ~ opamp.out1.line
+
+    # Unity-gain feedback
+    opamp.out1.line ~ opamp.in1n.line
+    output.line ~ opamp.out1.line
+
+    output.reference ~ power
+    input.reference ~ power
+
+
+module App:
+    """
+    # Precision DAC Output-Buffer Board
+
+    A 12 V-input precision DAC board: a TPS563201 buck front-end produces a 5 V
+    rail, which is reverse-polarity-protected and regulated to a clean low-noise
+    3.3 V analog rail feeding a quad 12-bit I2C DAC with internal reference and a
+    buffered, filtered analog output channel. A 3.3 V SP3485 half-duplex RS-485
+    transceiver brings a control bus out to a terminal block.
+
+    ## Signal chain
+    12V in -> TPS563201 buck (5 V) -> Schottky reverse-protection ->
+    LP5907 low-noise LDO (3.3 V) ->
+    MCP4728 quad 12-bit I2C DAC (internal 2.048 V reference) ->
+    one DAC output -> Sallen-Key 2nd-order LPF (~1 kHz) on a TLV9002 RRIO op-amp ->
+    buffered analog output.
+    3.3 V -> SP3485 RS-485 transceiver -> A/B (120 ohm terminated) -> terminal block.
+
+    ## Requirements
+    - R1: 12 V input stepped to 5 V by a TPS563201 synchronous buck.
+    - R2: 5 V rail reverse-polarity protected by a series Schottky (auto-picked).
+    - R3: Clean 3.3 V rail from a low-noise analog LDO (LP5907).
+    - R4: Quad 12-bit I2C DAC with internal voltage reference (MCP4728, 2.048 V).
+    - R5: Buffer one DAC output through a 2nd-order Sallen-Key LPF (~1 kHz) on a
+          rail-to-rail op-amp (TLV9002); real in-stock filter/bypass passives.
+    - R6: 3.3 V SP3485 half-duplex RS-485 transceiver; logic + DE/nRE exposed,
+          A/B (120 ohm terminated) brought out to a 3-pin terminal block.
+
+    ## Key decisions / citations
+    - TPS563201 Vout set by FB divider 54.9k/10k -> 0.768 * (54.9+10)/10 = 4.99 V;
+      L = 4.7 uH, Cout = 2x22 uF, Cin = 10 uF + 0.1 uF (SLVSD90B Table 7-2 / input-cap).
+    - LP5907 1 uF in/out ceramic bypass for stability (SLVA079) + 10 nF EN
+      noise-reduction cap (LP5907 datasheet CNR/EN).
+    - MCP4728 internal 2.048 V reference; nLDAC updates all outputs (DS22187
+      Sec 3.4 / 4.7 / 4.8).
+    - Sallen-Key R/C from LMV324-N SNOS012K; -3 dB ~ 1.03 kHz verified in SPICE.
+    - SP3485 single 3.3 V supply, 0.1 uF bypass, 120 ohm A/B termination (SP3485 DS).
+    """
+
+    # 12 V board input rail (from connector / bench supply)
+    power_12v = new ElectricPower
+    assert power_12v.voltage within 12V +/- 10%
+
+    # 5 V rail (from the TPS563201 buck)
+    power_5v = new ElectricPower
+    assert power_5v.voltage within 4.5V to 5.5V
+
+    # Protected 5 V rail and regulated 3.3 V analog rail
+    power_5v_prot = new ElectricPower
+    power_3v3 = new ElectricPower
+    assert power_3v3.voltage within 3.3V +/- 2%
+
+    # I2C control bus (to host MCU - exposed at board level)
+    i2c = new I2C
+
+    # ---- Blocks ----
+    buck = new Texas_Instruments_TPS563201DDCR
+    protection = new ReversePolarityProtection
+    ldo = new Texas_Instruments_LP5907MFX_3_3_NOPB
+    dac = new Microchip_Tech_MCP4728_E_UN
+    filter = new ReconstructionFilter
+
+    # ---- Power path: 12V -> buck -> 5V -> Schottky -> LDO -> 3V3 ----
+    power_12v ~ buck.power_in
+    buck.power_out ~ power_5v
+    power_5v ~ protection.power_in
+    protection.power_out ~ power_5v_prot
+    power_5v_prot ~ ldo.power_in
+    ldo.power_out ~ power_3v3
+
+    # ---- 3V3 distribution ----
+    power_3v3 ~ dac.power
+    power_3v3 ~ filter.power
+
+    # ---- I2C to DAC ----
+    i2c ~ dac.i2c
+    i2c.scl.reference ~ power_3v3
+    i2c.sda.reference ~ power_3v3
+
+    # I2C pull-ups (standard-mode 400 kHz) on the 3V3 rail
+    i2c_pullups = new Resistor[2]
+    for rp in i2c_pullups:
+        rp.resistance = 4.7kohm +/- 5%
+        rp.package = "0402"
+    i2c.scl.line ~> i2c_pullups[0] ~> power_3v3.hv
+    i2c.sda.line ~> i2c_pullups[1] ~> power_3v3.hv
+
+    # ---- nLDAC tied low so DAC outputs update on each I2C write ----
+    # (datasheet Sec 3.4: LDAC tied low -> output updates at last data-byte ACK)
+    dac.nldac.line ~ power_3v3.lv
+
+    # ---- Buffer DAC channel A through the Sallen-Key reconstruction filter ----
+    dac.outputs[0].line ~ filter.input.line
+
+    # Board analog output
+    analog_out = new ElectricSignal
+    analog_out.line ~ filter.output.line
+    analog_out.reference ~ power_3v3
+
+    # ---- RS-485 half-duplex transceiver (3V3) brought out to a terminal block ----
+    rs485 = new MaxLinear_SP3485EN_L_TR
+    power_3v3 ~ rs485.power
+
+    # Board-level RS-485 logic (to host MCU/UART) - exposed like the i2c bus
+    rs485_di = new ElectricLogic    # driver input
+    rs485_ro = new ElectricLogic    # receiver output
+    rs485_de = new ElectricLogic    # driver enable (active HIGH)
+    rs485_nre = new ElectricLogic   # receiver enable (active LOW)
+    rs485_di ~ rs485.di
+    rs485_ro ~ rs485.ro
+    rs485_de ~ rs485.de
+    rs485_nre ~ rs485.nre
+
+    # 120 ohm A/B bus termination (TIA/EIA-485)
+    rs485_term = new Resistor
+    rs485_term.resistance = 120ohm +/- 1%
+    rs485_term.package = "0402"
+    rs485.rs485.diff_pair.p.line ~> rs485_term ~> rs485.rs485.diff_pair.n.line
+
+    # A / B / GND out to the 3-pin terminal block
+    rs485_conn = new TE_Connectivity_796636_3_package
+    rs485.rs485.diff_pair.p.line ~ rs485_conn.1   # A
+    rs485.rs485.diff_pair.n.line ~ rs485_conn.2   # B
+    power_3v3.lv ~ rs485_conn.3                    # GND

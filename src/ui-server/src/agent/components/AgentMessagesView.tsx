@@ -23,11 +23,18 @@ interface MessageBuildStatusState {
   pendingBuildIds: string[];
 }
 
+// Seconds without any progress event before a still-pending run is flagged as
+// possibly stuck. The agent emits progress frequently (per tool/model step), so a
+// long gap means the run is wedged rather than working.
+const STALL_SECONDS = 60;
+
 interface AgentMessagesViewProps {
   messagesRef: RefObject<HTMLDivElement>;
   messages: AgentMessage[];
   expandedTraceKeys: Set<string>;
   latestBuildStatus: MessageBuildStatusState | null;
+  // Seconds since the last agent progress event for the active run (0 when idle).
+  secondsSinceProgress: number;
   onToggleTraceExpanded: (traceKey: string) => void;
   onSubmitDesignQuestions: (answers: string) => void;
 }
@@ -37,6 +44,7 @@ export function AgentMessagesView({
   messages,
   expandedTraceKeys,
   latestBuildStatus,
+  secondsSinceProgress,
   onToggleTraceExpanded,
   onSubmitDesignQuestions,
 }: AgentMessagesViewProps) {
@@ -159,14 +167,31 @@ export function AgentMessagesView({
           const terminalItems = message.checklist?.items.filter((item) => item.status === 'done' || item.status === 'blocked') ?? [];
           const activeChecklistItems = message.checklist?.items.filter((item) => item.status !== 'done' && item.status !== 'blocked') ?? [];
           const visibleChecklistItems = [...activeChecklistItems, ...terminalItems];
+          // A still-pending message with no recent progress is likely wedged.
+          const isStalled = !!message.pending && secondsSinceProgress >= STALL_SECONDS;
+          // A non-pending message carries the run's terminal outcome in `activity`.
+          const terminalState = !message.pending
+            && (message.activity === 'Errored' || message.activity === 'Stopped' || message.activity === 'Interrupted')
+            ? message.activity
+            : null;
 
           return (
             <div key={message.id} className={`agent-message-row ${message.role} ${message.pending ? 'pending' : ''}`}>
               {message.pending && (
                 <div className="agent-message-meta">
-                  <Loader2 size={11} className="agent-tool-spin" />
-                  {message.activity && (
-                    <span className="agent-message-activity">{message.activity}</span>
+                  {isStalled ? (
+                    <AlertCircle size={11} className="agent-tool-status-icon error" />
+                  ) : (
+                    <Loader2 size={11} className="agent-tool-spin" />
+                  )}
+                  {isStalled ? (
+                    <span className="agent-message-activity agent-message-activity--stalled">
+                      No activity for {secondsSinceProgress}s — may be stuck
+                    </span>
+                  ) : (
+                    message.activity && (
+                      <span className="agent-message-activity">{message.activity}</span>
+                    )
                   )}
                 </div>
               )}
@@ -191,6 +216,11 @@ export function AgentMessagesView({
                 <div className="agent-checklist-panel">
                   <div className="agent-checklist-head">
                     <span className="agent-checklist-title">Checklist</span>
+                    {terminalState && (
+                      <span className={`agent-checklist-state agent-checklist-state--${terminalState.toLowerCase()}`}>
+                        {terminalState}
+                      </span>
+                    )}
                     <span className="agent-checklist-meta">{completedCount}/{checklistCount} done</span>
                   </div>
                   <div className="agent-checklist-progress">
@@ -203,11 +233,15 @@ export function AgentMessagesView({
                     {visibleChecklistItems.map((item) => (
                       <div
                         key={item.id}
-                        className={`agent-checklist-item agent-checklist-item--${item.status}`}
+                        className={`agent-checklist-item agent-checklist-item--${item.status}${
+                          item.status === 'doing' && !message.pending ? ' agent-checklist-item--stalled' : ''
+                        }`}
                       >
                         <span className="agent-checklist-item-icon">
                           {item.status === 'done' && <Check size={13} className="agent-tool-status-icon ok" />}
-                          {item.status === 'doing' && <Loader2 size={13} className="agent-tool-spin agent-tool-status-icon running" />}
+                          {item.status === 'doing' && (message.pending
+                            ? <Loader2 size={13} className="agent-tool-spin agent-tool-status-icon running" />
+                            : <span className="agent-checklist-item-circle agent-checklist-item-circle--stalled" />)}
                           {item.status === 'blocked' && <AlertCircle size={13} />}
                           {item.status === 'not_started' && <span className="agent-checklist-item-circle" />}
                         </span>

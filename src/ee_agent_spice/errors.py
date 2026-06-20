@@ -53,13 +53,45 @@ _PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
     ),
     (
         re.compile(
-            r"unknown (?:subckt|model|parameter)|could not find|undefined", re.I
+            r"(?:fewer|less) than 2 connections|has no (?:dc path to ground|"
+            r"path to ground)|node .*is (?:not connected|floating)|"
+            r"no path to ground", re.I
         ),
-        "model_error",
-        "A referenced model/subckt/node is undefined — check .model/.include names.",
+        "floating_node",
+        "A node is floating / has no DC path to ground — every node needs >=2 "
+        "connections and a resistive path to node 0; add a load or a high-value "
+        "resistor to ground.",
     ),
     (
-        re.compile(r"error|syntax", re.I),
+        re.compile(r"can(?:'|no)?t open|cannot find (?:include|file)|"
+                   r"could not open|no such file", re.I),
+        "include_error",
+        "An .include/.lib file could not be opened — check the path; the bundled "
+        "models are auto-included, so a custom .include must point to a real file.",
+    ),
+    (
+        re.compile(r"unknown (?:subckt|model)|unable to find (?:definition|model)|"
+                   r"could not find|undefined", re.I),
+        "model_error",
+        "A referenced model/subckt is undefined — inline a .model/.subckt or check "
+        "the name against .include'd libraries (the bundled lib defines Dgen/"
+        "Q2N3904/NMOS_GEN etc.).",
+    ),
+    (
+        re.compile(r"unknown (?:parameter|param)|too few parameters|"
+                   r"bad parameter|out of range", re.I),
+        "param_error",
+        "A device/analysis parameter is missing, malformed, or out of range — check "
+        "the element line and the analysis params.",
+    ),
+    (
+        re.compile(r"\.ic|initial condition", re.I),
+        "ic_error",
+        "An initial-condition (.ic) directive failed — name an existing node and pair "
+        "transient .ic with `uic` in the analysis params.",
+    ),
+    (
+        re.compile(r"error|syntax|unrecognized|illegal", re.I),
         "parse_error",
         "ngspice rejected the deck — likely a malformed netlist line.",
     ),

@@ -2001,6 +2001,57 @@ class PCB_Transformer:
             unlocked=None,
         )
 
+    def _attach_schematic_instance_paths(
+        self, logger: logging.Logger = logger
+    ) -> None:
+        """Stamp each footprint with the KiCad instance path of its schematic symbol.
+
+        KiCad cross-probes a symbol to its footprint by matching the footprint's
+        ``(path "/<sheet-uuid…>/<symbol-uuid>")`` to the symbol's ``symbol_instances``
+        path. The generated schematic and this PCB both derive that path from the
+        component's atopile address via the shared
+        ``schematic.compute_instance_paths``, so opening the emitted ``.kicad_pro``
+        cross-probes correctly. Best-effort: any failure just leaves footprints unlinked.
+        """
+        from faebryk.exporters.schematic.kicad.schematic import (
+            compute_instance_paths,
+            extract_components,
+        )
+
+        # Root stem = build name (matches the co-located ``<name>.kicad_sch``). Only the
+        # cosmetic Sheetfile property depends on it; the (path …) linkage does not.
+        try:
+            from atopile.config import config
+
+            root_stem = config.build.name
+        except Exception:  # noqa: BLE001 - no atopile config (e.g. unit tests)
+            root_stem = self.app.get_name()
+
+        try:
+            components, _ = extract_components(self.app)
+            paths = compute_instance_paths(components, self.app, root_stem=root_stem)
+        except Exception as e:  # noqa: BLE001 - linkage is best-effort
+            logger.debug("Schematic instance-path linkage skipped: %s", e)
+            return
+
+        for fp in self.pcb.footprints:
+            addr = Property.try_get_property(fp.propertys, "atopile_address")
+            if addr is None or (ip := paths.get(addr)) is None:
+                continue
+            fp.path = ip.full_path
+            Property.set_property(
+                fp,
+                self._make_fp_property(
+                    "Sheetname", "F.Fab", ip.sheet_name, str(gen_uuid())
+                ),
+            )
+            Property.set_property(
+                fp,
+                self._make_fp_property(
+                    "Sheetfile", "F.Fab", ip.sheet_file, str(gen_uuid())
+                ),
+            )
+
     @staticmethod
     def INCLUDE_DESCRIPTIVE_PROPERTIES_FROM_PCB() -> list[str]:
         """
@@ -2196,3 +2247,6 @@ class PCB_Transformer:
                 extra={"markdown": True},
             )
             self.remove_net(pcb_net)
+
+        # Link footprints to their schematic symbols for KiCad cross-probing.
+        self._attach_schematic_instance_paths(logger)

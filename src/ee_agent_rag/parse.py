@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -19,6 +20,8 @@ from pathlib import Path
 import httpx
 
 from .config import LLAMA_PARSE_BASE_URL, PARSED_CACHE, DocType
+
+logger = logging.getLogger(__name__)
 
 DATASHEET_INSTRUCTION = """\
 You are parsing an electronics datasheet. Output well-structured markdown.
@@ -133,7 +136,34 @@ def _apply_sidecar_patch(md: str, cache: Path) -> str:
     patch_file = cache.with_suffix(".patch.json")
     if not patch_file.exists():
         return md
-    for entry in json.loads(patch_file.read_text()):
+    try:
+        entries = json.loads(patch_file.read_text())
+    except json.JSONDecodeError as exc:
+        warnings.warn(
+            f"{patch_file.name}: not valid JSON ({exc}); ignored.", stacklevel=2
+        )
+        return md
+    if not isinstance(entries, list):
+        warnings.warn(
+            f"{patch_file.name}: expected a JSON list of patch entries; ignored.",
+            stacklevel=2,
+        )
+        return md
+    applied = 0
+    for entry in entries:
+        # Validate the entry shape before touching the text — a malformed patch must be
+        # skipped (with a warning), never raise or apply blindly (CODE_AUDIT Q3).
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("find"), str)
+            or not isinstance(entry.get("replace"), str)
+        ):
+            warnings.warn(
+                f"{patch_file.name}: skipped malformed entry "
+                f"(need string 'find' and 'replace'): {entry!r:.80}",
+                stacklevel=2,
+            )
+            continue
         find = entry["find"]
         if md.count(find) != 1:
             warnings.warn(
@@ -143,6 +173,12 @@ def _apply_sidecar_patch(md: str, cache: Path) -> str:
             )
             continue
         md = md.replace(find, entry["replace"])
+        applied += 1
+        logger.info(
+            "%s: applied patch (%s)", patch_file.name, entry.get("note", find[:60])
+        )
+    if applied:
+        logger.info("%s: applied %d/%d patches", patch_file.name, applied, len(entries))
     return md
 
 

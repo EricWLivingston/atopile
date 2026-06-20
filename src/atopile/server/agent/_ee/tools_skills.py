@@ -12,12 +12,15 @@ This is also the extension point for per-tool guidance: dropping
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
 from atopile.server.agent.config import AgentConfig
 from atopile.server.agent.orchestrator_helpers import _truncate_middle
+
+log = logging.getLogger(__name__)
 
 # Skill ids are directory names; constrain to a safe charset so ``skill_read`` can't be
 # steered outside the skills dir (no ``/`` or ``..``).
@@ -107,7 +110,10 @@ async def run_skills_list(arguments: dict[str, Any]) -> dict[str, Any]:
         skills = list_skills()
         return {"ok": True, "count": len(skills), "skills": skills}
     except Exception as e:  # noqa: BLE001 - tool must not crash the run
-        return {"ok": False, "error": f"{type(e).__name__}: {e}", "skills": []}
+        # Type only; full detail to the log (paths/internals stay out of the
+        # transcript — CODE_AUDIT Q1).
+        log.exception("skills_list failed")
+        return {"ok": False, "error": type(e).__name__, "skills": []}
 
 
 async def run_skill_read(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -115,4 +121,5 @@ async def run_skill_read(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         return read_skill(arguments.get("skill_id", ""))
     except Exception as e:  # noqa: BLE001 - tool must not crash the run
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        log.exception("skill_read failed")
+        return {"ok": False, "error": type(e).__name__}

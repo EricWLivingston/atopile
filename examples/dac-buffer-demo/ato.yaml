@@ -1,0 +1,23 @@
+requires-atopile: ^0.14.0
+paths:
+  src: ./
+  layout: ./layout
+builds:
+  default:
+    entry: dac-buffer.ato:App
+dependencies:
+- type: file
+  path: ./packages/Texas_Instruments_LP5907MFX_3_3_NOPB
+  identifier: local/texas-instruments-lp5907mfx-3-3-nopb
+- type: file
+  path: ./packages/Microchip_Tech_MCP4728_E_UN
+  identifier: local/microchip-tech-mcp4728-e-un
+- type: file
+  path: ./packages/Texas_Instruments_TLV9002IDR
+  identifier: local/texas-instruments-tlv9002idr
+- type: file
+  path: ./packages/Texas_Instruments_TPS563201DDCR
+  identifier: local/texas-instruments-tps563201ddcr
+- type: file
+  path: ./packages/MaxLinear_SP3485EN_L_TR
+  identifier: local/maxlinear-sp3485en-l-tr

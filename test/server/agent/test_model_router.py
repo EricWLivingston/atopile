@@ -65,6 +65,104 @@ def test_parse_tier_never_downshifts_active_design():
     )
 
 
+# ── heuristic short-circuit (T3: no API call for trivial turns) ───────
+
+
+@pytest.mark.parametrize(
+    ("msg", "active", "expected"),
+    [
+        ("thanks!", False, "simple"),
+        ("what does VF mean?", False, "simple"),
+        ("ok", True, None),  # mid-design always asks the classifier
+        ("design a 4-layer board", False, None),  # design keyword -> ask classifier
+        ("please fix the build error", False, None),  # keyword -> ask classifier
+        ("x" * 200, False, None),  # long -> ask classifier
+        ("", False, None),  # empty -> ask classifier
+    ],
+)
+def test_heuristic_tier(msg, active, expected):
+    assert model_router._heuristic_tier(msg, has_active_design=active) == expected
+
+
+def test_classify_turn_short_circuits_without_api_call(monkeypatch):
+    messages = _patch_anthropic(monkeypatch, "complex")  # would mislabel if called
+    tier = asyncio.run(
+        model_router.classify_turn(
+            "thanks, that's all",
+            has_active_design=False,
+            history_len=0,
+            config=AgentConfig(api_key="k"),
+        )
+    )
+    assert tier == "simple"
+    assert messages.calls == []  # no classification round-trip was made
+
+
+# ── content-based floor (never route a real design turn too low) ──────
+
+# A realistic, design-dense prompt (>= 400 chars, many design keywords, new-design
+# phrasing) — the kind the Haiku classifier mislabeled as "simple".
+_DESIGN_PROMPT = (
+    "Design a precision DAC output-buffer board in this project. Protect the 5V "
+    "supply against reverse polarity with a Schottky diode, regulate down to a "
+    "3.3V rail with a low-noise LDO, add a quad 12-bit I2C DAC with an internal "
+    "voltage reference, and buffer one DAC output through a second-order Sallen-Key "
+    "low-pass reconstruction filter built on a rail-to-rail op-amp. Pick real "
+    "in-stock passives and simulate the filter cutoff before committing values."
+)
+
+
+def test_min_floor_complex_for_new_design():
+    assert model_router._min_floor(_DESIGN_PROMPT) == "complex"
+
+
+def test_min_floor_standard_for_design_keywords():
+    # design-dense but not "design a new <thing>" phrasing
+    msg = (
+        "Please fix the build error on the regulator module, then connect the "
+        "capacitor and resistor to the 3.3V net and rerun the build to check the "
+        "voltage constraints resolve. The diode footprint also needs updating."
+    )
+    assert model_router._min_floor(msg) == "standard"
+
+
+def test_min_floor_simple_for_conversational():
+    assert model_router._min_floor("thanks, what does VF mean?") == "simple"
+
+
+def test_classify_turn_floor_overrides_simple_classifier(monkeypatch):
+    """Even if the weak classifier says 'simple', a new-design prompt floors complex."""
+    messages = _patch_anthropic(monkeypatch, "simple")
+    tier = asyncio.run(
+        model_router.classify_turn(
+            _DESIGN_PROMPT,
+            has_active_design=False,
+            history_len=0,
+            config=AgentConfig(api_key="k"),
+        )
+    )
+    assert tier == "complex"
+    assert messages.calls, "classifier should still have been consulted"
+
+
+def test_classify_turn_floor_applies_on_fail_open(monkeypatch):
+    class _Boom:
+        def __init__(self, **_: Any) -> None:
+            raise RuntimeError("no network")
+
+    monkeypatch.setattr("anthropic.AsyncAnthropic", _Boom)
+    tier = asyncio.run(
+        model_router.classify_turn(
+            _DESIGN_PROMPT,
+            has_active_design=False,
+            history_len=0,
+            config=AgentConfig(api_key="k"),
+        )
+    )
+    # fail-open is "standard", but the floor clamps a new-design prompt up to complex
+    assert tier == "complex"
+
+
 # ── classify_turn (fake SDK client) ───────────────────────────────────
 
 
@@ -162,10 +260,13 @@ def test_dynamic_model_env_is_anthropic_only(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "k")
 
     monkeypatch.setenv("EE_AGENT_PROVIDER", "anthropic")
+    # Clear the opt-in Opus override so we test the shipped default tiers.
+    monkeypatch.delenv("ATOPILE_AGENT_MODEL_COMPLEX", raising=False)
     cfg = AgentConfig.from_env()
     assert cfg.dynamic_model is True
     assert cfg.model_simple.startswith("claude-haiku")
-    assert cfg.model_complex.startswith("claude-opus")
+    # Complex defaults to Sonnet (cost): Opus is opt-in via ATOPILE_AGENT_MODEL_COMPLEX.
+    assert cfg.model_complex.startswith("claude-sonnet")
     assert cfg.router_model == cfg.model_simple
 
     monkeypatch.setenv("EE_AGENT_PROVIDER", "openai")
@@ -178,6 +279,16 @@ def test_dynamic_model_defaults_off(monkeypatch):
     monkeypatch.setenv("EE_AGENT_PROVIDER", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     assert AgentConfig.from_env().dynamic_model is False
+
+
+def test_complex_tier_opus_opt_in(monkeypatch):
+    """Opus is reachable as the complex tier only via the explicit env override."""
+    monkeypatch.setenv("EE_AGENT_DYNAMIC_MODEL", "1")
+    monkeypatch.setenv("EE_AGENT_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("ATOPILE_AGENT_MODEL_COMPLEX", "claude-opus-4-8")
+    cfg = AgentConfig.from_env()
+    assert cfg.model_complex == "claude-opus-4-8"
 
 
 # ── provider payload override ─────────────────────────────────────────

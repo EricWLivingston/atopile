@@ -488,6 +488,12 @@
   50% { opacity: 1; }
 }
 
+/* Stalled run: steady (no pulse) warning-colored label. */
+.agent-message-activity--stalled {
+  color: color-mix(in srgb, var(--error) 72%, var(--text-secondary));
+  animation: none;
+}
+
 .agent-message-row.user {
   align-items: flex-end;
 }
@@ -1185,7 +1191,7 @@
   width: 100%;
   resize: none;
   min-height: 38px;
-  max-height: 50vh;
+  max-height: 160px;
   padding: 8px 0;
   border: 0;
   border-radius: 0;
@@ -1499,6 +1505,25 @@
   font-size: 10px;
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+
+.agent-checklist-state {
+  font-size: 9px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--error) 16%, transparent);
+  color: color-mix(in srgb, var(--error) 80%, var(--text-primary));
+}
+
+.agent-checklist-state--stopped,
+.agent-checklist-state--interrupted {
+  background: color-mix(in srgb, var(--text-secondary) 18%, transparent);
+  color: var(--text-secondary);
 }
 
 .agent-checklist-progress {
@@ -1627,6 +1652,18 @@
 .agent-checklist-item--doing .agent-checklist-item-icon {
   animation: agent-spin 0.9s linear infinite;
   color: var(--agent-accent);
+}
+
+/* When the run is no longer live, an unfinished item must stop spinning so the
+   panel reads as ended rather than perpetually loading. */
+.agent-checklist-item--doing.agent-checklist-item--stalled .agent-checklist-item-icon {
+  animation: none;
+  color: var(--text-muted);
+}
+
+.agent-checklist-item-circle--stalled {
+  border-style: dashed;
+  opacity: 0.6;
 }
 
 .agent-checklist-item--done {

@@ -1,0 +1,10 @@
+requires-atopile: ^0.14.0
+paths:
+  src: ./
+  layout: ./layouts
+builds:
+  default:
+    entry: Texas_Instruments_TPS563201DDCR.ato:Texas_Instruments_TPS563201DDCR
+package:
+  identifier: local/texas-instruments-tps563201ddcr
+  version: 0.0.1

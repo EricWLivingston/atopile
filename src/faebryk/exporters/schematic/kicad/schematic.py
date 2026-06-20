@@ -43,6 +43,7 @@ from faebryk.exporters.schematic.kicad.placement import (
     sheet_extent,
 )
 from faebryk.exporters.schematic.kicad.real_symbol import real_symbol_from_file
+from faebryk.libs.kicad.identity import stable_uuid
 from faebryk.libs.util import sanitize_filepath_part
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,7 @@ class ComponentIR:
     pins: list[PinIR]
     module: fabll.Node | None = None
     inst_uuid: str = ""
+    address: str = ""  # atopile address (== footprint ``atopile_address``); "" if unknown
 
 
 @dataclass
@@ -219,7 +221,17 @@ def extract_components(app: fabll.Node) -> tuple[list[ComponentIR], set[str]]:
             PinIR(number=pad.pad_number, net=pad_to_net.get(pad))
             for pad in fp_trait.get_footprint().get_pads()
         ]
-        components.append(ComponentIR(ref=ref, value=value, pins=pins, module=module))
+        components.append(
+            ComponentIR(
+                ref=ref,
+                value=value,
+                pins=pins,
+                module=module,
+                # Same key the PCB writes as ``atopile_address`` (part_lifecycle.py),
+                # so the schematic symbol UUID and the footprint UUID line up.
+                address=module.get_full_name(include_uuid=False),
+            )
+        )
 
     components = natsorted(components, key=lambda c: c.ref)
     return components, net_names
@@ -358,6 +370,59 @@ def build_sheet_tree(components: list[ComponentIR], app: fabll.Node) -> SheetIR:
     return root
 
 
+@dataclass
+class InstancePath:
+    """A component's KiCad instance path + sheet metadata, shared by both emitters."""
+
+    full_path: str  # "/<sheet-uuid>/…/<comp-uuid>" (root-sheet parts are just "/<uuid>")
+    sheet_name: str
+    sheet_file: str  # "<stem>.kicad_sch"
+
+
+def compute_instance_paths(
+    components: list[ComponentIR], app: fabll.Node, *, root_stem: str
+) -> dict[str, InstancePath]:
+    """Map each component **atopile address** to its KiCad instance path.
+
+    Authoritative source of the schematic⇆PCB linkage: the hierarchical schematic emitter
+    and the PCB transformer both call this so a footprint's ``(path …)`` is byte-identical
+    to its symbol's ``symbol_instances`` path (KiCad cross-probes by matching them). Built
+    on the same :func:`build_sheet_tree`, with deterministic UUIDs (:func:`stable_uuid`)
+    derived from the sheet node id / component address, so it is stable across rebuilds.
+    """
+    root = build_sheet_tree(components, app)
+    result: dict[str, InstancePath] = {}
+    seen_stems: set[str] = set()
+
+    def _stem(base: str) -> str:  # mirror render_sheet_tree's _unique_stem
+        stem, n = base, 2
+        while stem in seen_stems:
+            stem = f"{base}-{n}"
+            n += 1
+        seen_stems.add(stem)
+        return stem
+
+    def _walk(
+        sheet: SheetIR, chain: list[str], names: list[str], is_root: bool
+    ) -> None:
+        if is_root:
+            file_stem, name_path = root_stem, names
+        else:
+            chain = chain + [stable_uuid(sheet.node_id)]
+            name_path = names + [sanitize_filepath_part(sheet.name) or "sheet"]
+            file_stem = _stem(f"{root_stem}-{'-'.join(name_path)}")
+        sheet_file = f"{file_stem}.kicad_sch"
+        for comp in sheet.components:
+            key = comp.address or comp.ref
+            full = "/" + "/".join(chain + [stable_uuid(key)])
+            result[key] = InstancePath(full, sheet.name, sheet_file)
+        for ch in sheet.children:
+            _walk(ch, chain, name_path, False)
+
+    _walk(root, [], [], True)
+    return result
+
+
 # --------------------------------------------------------------------------------------
 # Symbol resolution
 # --------------------------------------------------------------------------------------
@@ -409,13 +474,22 @@ class _SymbolRegistry:
         self._search_dirs = search_dirs
         self._by_lib_id: dict[str, SymbolDef] = {}
         self._generic_cache: dict[tuple[str, ...], SymbolDef] = {}
+        # Parsed-symbol cache keyed by file path: a design reuses the same .kicad_sym
+        # across many components (every 0603 cap), so parse each file once. ``None`` is
+        # cached too, so a known-bad file isn't re-parsed per component (CODE_AUDIT Q5).
+        self._real_cache: dict[Path, SymbolDef | None] = {}
         self.fallback_count = 0
+
+    def _real_symbol(self, sym_path: Path) -> SymbolDef | None:
+        if sym_path not in self._real_cache:
+            self._real_cache[sym_path] = real_symbol_from_file(sym_path)
+        return self._real_cache[sym_path]
 
     def resolve(self, comp: ComponentIR) -> SymbolDef:
         if comp.module is not None:
             sym_path = _find_symbol_file(comp.module, self._search_dirs)
             if sym_path is not None:
-                real = real_symbol_from_file(sym_path)
+                real = self._real_symbol(sym_path)
                 if real is not None:
                     self._by_lib_id.setdefault(real.lib_id, real)
                     return real
@@ -453,7 +527,8 @@ class _SymbolRegistry:
 # --------------------------------------------------------------------------------------
 def _instance_block(comp: ComponentIR, sym: SymbolDef, ix: float, iy: float) -> str:
     pin_lines = "\n".join(
-        f'    (pin "{escape(num)}" (uuid {_u()}))' for num in sym.pin_xy
+        f'    (pin "{escape(num)}" (uuid {stable_uuid(f"{comp.inst_uuid}:pin:{num}")}))'
+        for num in sym.pin_xy
     )
     # Anchor ref above / value below the symbol's real extent (legacy fixed offsets
     # collide on anything bigger or smaller than the old one-size grid cell).
@@ -512,7 +587,7 @@ def _power_instance_block(
         f" (effects (font (size 1.27 1.27)) hide))\n"
         f'    (property "Datasheet" "" (id 3) (at {x} {y} 0)'
         f" (effects (font (size 1.27 1.27)) hide))\n"
-        f'    (pin "1" (uuid {_u()}))\n'
+        f'    (pin "1" (uuid {stable_uuid(f"{inst_uuid}:pin:1")}))\n'
         f"  )"
     )
 
@@ -524,7 +599,7 @@ def _label_block(
         f'  (global_label "{escape(net)}" (shape bidirectional) (at {x} {y} {rot})'
         f" (fields_autoplaced)\n"
         f"    (effects (font (size 1.27 1.27)) (justify {justify}))\n"
-        f"    (uuid {_u()}))"
+        f"    (uuid {stable_uuid(f'label:{net}:{x}:{y}:{rot}')}))"
     )
 
 
@@ -542,7 +617,7 @@ def _wire_block(x1: float, y1: float, x2: float, y2: float) -> str:
     return (
         f"  (wire (pts (xy {x1} {y1}) (xy {x2} {y2}))\n"
         f"    (stroke (width 0) (type default) (color 0 0 0 0))\n"
-        f"    (uuid {_u()}))"
+        f"    (uuid {stable_uuid(f'wire:{x1}:{y1}:{x2}:{y2}')}))"
     )
 
 
@@ -832,7 +907,9 @@ def render_sheet_tree(
             path_by_sheet[id(sheet)] = []
             name_path = names
         else:
-            sheet.uuid = _u()  # internal: (sheet) block + (symbol_instances) path
+            # Deterministic, stable across rebuilds and shared with the PCB footprint
+            # paths (see compute_instance_paths) so the two files cross-probe.
+            sheet.uuid = stable_uuid(sheet.node_id)
             name_path = names + [sanitize_filepath_part(sheet.name) or "sheet"]
             sheet.file_stem = _unique_stem(f"{root_stem}-{'-'.join(name_path)}")
             path = prefix + [sheet.uuid]
@@ -870,10 +947,13 @@ def render_sheet_tree(
             With no usable direction (off-axis pin) the glyph sits directly on the
             pin point — the legacy, still-correct form (connection is by pin name).
             """
-            lib_id = (
-                f"{LIB_PREFIX}:{'GND' if ground else 'PWR'}_"
-                f"{sanitize_filepath_part(net) or 'net'}"
-            )
+            # Symbol-library id, e.g. "atopile:GND_<net>" — internal only (the displayed
+            # Value/net is ``net``). Avoid doubling (``GND_GND``) when the net is already
+            # named for its rail (the shared "GND", or a "+5V" power net).
+            _pfx = "GND" if ground else "PWR"
+            _suffix = sanitize_filepath_part(net) or "net"
+            _name = _suffix if _suffix.upper().startswith(_pfx) else f"{_pfx}_{_suffix}"
+            lib_id = f"{LIB_PREFIX}:{_name}"
             psym = power_sym_cache.get(lib_id)
             if psym is None:
                 psym = build_power_symbol(lib_id, net, ground=ground)
@@ -906,7 +986,9 @@ def render_sheet_tree(
                 )
 
             pwr_n[0] += 1
-            inst = _u()
+            # Deterministic (power symbols have no footprint, but stable uuids keep the
+            # emitted schematic byte-stable across rebuilds -> no git churn).
+            inst = stable_uuid(f"pwr:{sheet.node_id}:{net}:{pwr_n[0]}")
             instances.append(
                 _power_instance_block(
                     lib_id, net, f"#PWR{pwr_n[0]:04d}", sx, sy, inst, rot, value_at
@@ -925,7 +1007,7 @@ def render_sheet_tree(
             registry.add(flag_def)
             used.add(flag_def.lib_id)
             flg_n[0] += 1
-            finst = _u()
+            finst = stable_uuid(f"flag:{sheet.node_id}:{net}:{flg_n[0]}")
             instances.append(
                 _power_instance_block(
                     flag_def.lib_id,
@@ -956,7 +1038,9 @@ def render_sheet_tree(
         for comp in sheet.components:
             sym = sym_by_ref[comp.ref]
             used.add(sym.lib_id)
-            comp.inst_uuid = _u()
+            # Deterministic UUID derived from the atopile address so the matching PCB
+            # footprint can be stamped with the identical instance path (cross-probe).
+            comp.inst_uuid = stable_uuid(comp.address or comp.ref)
             ix, iy = positions[comp.ref]
             instances.append(_instance_block(comp, sym, ix, iy))
 
@@ -1012,10 +1096,12 @@ def render_sheet_tree(
             f"{chr(10).join(wires)}\n"
             f"{chr(10).join(labels)}\n"
         )
+        # Deterministic per-file uuid (stable across rebuilds -> less git churn).
+        file_uuid = stable_uuid("file:" + sheet.node_id)
         if is_root:
             doc = (
                 f"(kicad_sch (version {SCH_VERSION}) (generator eeschema)\n"
-                f"  (uuid {_u()})\n"
+                f"  (uuid {file_uuid})\n"
                 f'  (paper "{paper}")\n'
                 f"{title_block}"
                 f"{body}"
@@ -1026,7 +1112,7 @@ def render_sheet_tree(
         else:
             doc = (
                 f"(kicad_sch (version {SCH_VERSION}) (generator eeschema)\n"
-                f"  (uuid {_u()})\n"
+                f"  (uuid {file_uuid})\n"
                 f'  (paper "{paper}")\n'
                 f"{title_block}"
                 f"{body}"

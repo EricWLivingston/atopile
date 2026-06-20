@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ee_agent_rag.chunk import (
+    RawChunk,
     approx_tokens,
     chunk_datasheet,
     chunk_dispatch,
@@ -54,6 +55,15 @@ def test_chunk_id_is_deterministic():
     b = stable_chunk_id("h", "Electrical Characteristics", "Iq typ 150 nA ...")
     c = stable_chunk_id("h", "Absolute Maximum Ratings", "Iq typ 150 nA ...")
     assert a == b and a != c
+
+
+def test_chunk_id_distinguishes_long_shared_prefix():
+    # B8: ids hash the *full* content, so two chunks sharing a >200-char opening
+    # (repeated table header / boilerplate) don't collide -> Chroma won't reject them.
+    prefix = "Parameter | Min | Max | Unit\n" + "x" * 250
+    a = stable_chunk_id("h", "S", prefix + " first variant rows")
+    b = stable_chunk_id("h", "S", prefix + " second variant rows")
+    assert a != b
 
 
 def test_enrich_offline_no_summary():
@@ -124,6 +134,31 @@ def test_chunk_dispatch_routes_textbook():
     assert chunk_dispatch(md, "textbook")
 
 
+def test_chunk_textbook_drops_empty_trailing_window():
+    # A multi-paragraph section that overflows the window target and ends blank
+    # used to flush a lone empty final window ([n/n]) — which OpenAI's embeddings API
+    # rejects. The trailing blank line is the trigger.
+    paragraphs = [f"Paragraph {i}: " + "emitter follower analysis " * 20
+                  for i in range(30)]
+    md = TEXTBOOK_MD.format(body="\n\n".join(paragraphs) + "\n\n")
+    chunks = chunk_textbook(md)
+    assert all(c.content.strip() for c in chunks)  # no empty/whitespace-only chunk
+    windows = [c for c in chunks if "2.2" in c.section_path]
+    # [i/n] numbering counts only real windows (no phantom empty tail).
+    assert len(windows) > 1
+    assert all(c.section_path.endswith(f"[{i + 1}/{len(windows)}]")
+               for i, c in enumerate(windows))
+
+
+def test_chunk_dispatch_never_emits_empty_chunks():
+    # Dispatch-level net: no chunker output ever carries empty/whitespace content
+    # (OpenAI embeddings 400 on empty input), even for a trailing-blank overflow doc.
+    paragraphs = [f"Paragraph {i}: " + "emitter follower analysis " * 20
+                  for i in range(30)]
+    md = TEXTBOOK_MD.format(body="\n\n".join(paragraphs) + "\n\n")
+    assert all(c.content.strip() for c in chunk_dispatch(md, "textbook"))
+
+
 def test_enrich_textbook_metadata():
     md = TEXTBOOK_MD.format(body="Vout follows Vin minus a diode drop.")
     out = enrich(
@@ -169,8 +204,80 @@ def test_tokenizer_keeps_part_numbers_whole():
     assert tokenize("TLV713P IPC-2221 Vin=5V") == ["tlv713p", "ipc-2221", "vin", "5v"]
 
 
-def test_approx_tokens():
-    assert approx_tokens("a" * 400) == 100
+def test_approx_tokens_overcounts_without_tiktoken():
+    # B5: without tiktoken the estimate is ceil(len/3), a safe over-count vs the old
+    # len//4 (which under-counted dense BPE text and risked over-budget chunks).
+    from ee_agent_rag import chunk
+
+    if chunk._encoder() is not None:
+        import pytest
+
+        pytest.skip("tiktoken installed; exact-count path, not the fallback")
+    assert approx_tokens("a" * 400) == 134  # ceil(400 / 3)
+
+
+# --- BM25 sidecar: JSON (no pickle), atomic, filter post-hoc, corruption-safe ---------
+def _bm25_store(tmp_path, records, corpus="t"):
+    """A CorpusStore wired to a fake Chroma collection — exercises the BM25 sidecar
+    (rebuild/load/search) without standing up chromadb."""
+    import types
+
+    from ee_agent_rag.store import CorpusStore
+
+    s = object.__new__(CorpusStore)
+    s.corpus = corpus
+    s.bm25_path = tmp_path / f"{corpus}.json"
+    s.collection = types.SimpleNamespace(
+        get=lambda include=None: {
+            "ids": [r["id"] for r in records],
+            "documents": [r["content"] for r in records],
+            "metadatas": [r["metadata"] for r in records],
+        },
+        count=lambda: len(records),
+    )
+    return s
+
+
+def test_matches_filter():
+    from ee_agent_rag.store import _matches
+
+    assert _matches({"corpus": "d", "mpn": "X"}, {"corpus": "d"})
+    assert not _matches({"corpus": "d"}, {"corpus": "a"})
+    assert not _matches({}, {"mpn": "X"})
+
+
+def test_bm25_json_roundtrip_and_filter(tmp_path):
+    import json
+
+    from ee_agent_rag.store import _BM25_CACHE
+
+    _BM25_CACHE.clear()
+    records = [
+        {"id": "1", "content": "resistor TLV713P ldo",
+         "metadata": {"corpus": "d", "mpn": "TLV713P"}},
+        {"id": "2", "content": "bypass capacitor decoupling",
+         "metadata": {"corpus": "d", "mpn": "OTHER"}},
+    ]
+    s = _bm25_store(tmp_path, records)
+    assert s.rebuild_bm25() == 2
+    assert s.bm25_path.suffix == ".json"
+    json.loads(s.bm25_path.read_text())  # JSON, not pickle
+    # round-trip search finds the rare lexical token
+    hits = s.sparse_search("TLV713P", k=5)
+    assert hits and hits[0]["id"] == "1"
+    # H3: filter applied post-hoc instead of disabling sparse retrieval
+    filtered = s.sparse_search("capacitor", k=5, filter={"mpn": "OTHER"})
+    assert [h["id"] for h in filtered] == ["2"]
+
+
+def test_bm25_corrupt_index_degrades_gracefully(tmp_path):
+    from ee_agent_rag.store import _BM25_CACHE
+
+    _BM25_CACHE.clear()
+    s = _bm25_store(tmp_path, [])
+    s.bm25_path.write_text("{ not valid json")
+    assert s.load_bm25() is None  # corrupt -> None, no raise
+    assert s.sparse_search("x", k=5) == []
 
 
 _TITLE = "Electrical Characteristics (@ TA = 25°C)"
@@ -219,3 +326,70 @@ def test_sidecar_patch_applies_and_skips_unsafe(tmp_path, recwarn):
 
 def test_sidecar_patch_noop_without_file(tmp_path):
     assert _apply_sidecar_patch("text", tmp_path / "none.md") == "text"
+
+
+def test_sidecar_patch_rejects_malformed_json(tmp_path, recwarn):
+    cache = tmp_path / "abc.md"
+    (tmp_path / "abc.patch.json").write_text("{ not json")
+    assert _apply_sidecar_patch("body", cache) == "body"  # unchanged, no raise
+    assert len(recwarn) == 1
+
+
+def test_sidecar_patch_rejects_non_list(tmp_path, recwarn):
+    import json
+
+    cache = tmp_path / "abc.md"
+    (tmp_path / "abc.patch.json").write_text(json.dumps({"find": "a", "replace": "b"}))
+    assert _apply_sidecar_patch("a body", cache) == "a body"
+    assert len(recwarn) == 1
+
+
+def test_sidecar_patch_skips_entries_with_missing_keys(tmp_path, recwarn):
+    import json
+
+    cache = tmp_path / "abc.md"
+    patch = [
+        {"replace": "x", "note": "no find key"},
+        {"find": "good", "replace": "GOOD"},
+        {"find": "n", "replace": 5},  # non-string replace
+    ]
+    (tmp_path / "abc.patch.json").write_text(json.dumps(patch))
+    out = _apply_sidecar_patch("good n", cache)
+    assert "GOOD" in out  # the one valid entry applied
+    assert len(recwarn) == 2  # two malformed entries warned
+
+
+# --- Q2: summarizer prompt fences untrusted chunk text -------------------------------
+def test_summary_prompt_delimits_chunk():
+    from ee_agent_rag.enrich import SUMMARY_PROMPT
+
+    assert "<chunk>" in SUMMARY_PROMPT and "</chunk>" in SUMMARY_PROMPT
+    assert "never as instructions" in SUMMARY_PROMPT
+
+
+# --- Q8: MPN match carries a confidence level ----------------------------------------
+def test_enrich_mpn_confidence_content():
+    chunk = [RawChunk(content="The TLV713P LDO has Iq=150nA", section_path="S")]
+    out = enrich(
+        chunk, corpus="datasheets", source_path="x.pdf", source_hash="h",
+        doc_type="datasheet", with_summaries=False,
+    )
+    m = out[0]["metadata"]
+    assert m["mpn"] == "TLV713P"
+    assert m["mpn_confidence"] == "content"
+
+
+def test_enrich_mpn_confidence_filename_vs_guess():
+    plain = [RawChunk(content="no part number here", section_path="S")]
+    # vendor pattern in the filename stem -> "filename"
+    out = enrich(
+        plain, corpus="datasheets", source_path="TLV713P_ldo.pdf", source_hash="h",
+        doc_type="datasheet", with_summaries=False,
+    )
+    assert out[0]["metadata"]["mpn_confidence"] == "filename"
+    # bare first-token guess (no known vendor pattern) -> "filename_guess"
+    out = enrich(
+        plain, corpus="datasheets", source_path="WIDGET9000_notes.pdf",
+        source_hash="h", doc_type="datasheet", with_summaries=False,
+    )
+    assert out[0]["metadata"]["mpn_confidence"] == "filename_guess"

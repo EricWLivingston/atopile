@@ -1,0 +1,109 @@
+#pragma experiment("BRIDGE_CONNECT")
+#pragma experiment("FOR_LOOP")
+
+import ElectricPower
+import Resistor
+import Capacitor
+import Inductor
+
+from "parts/Texas_Instruments_TPS563201DDCR/Texas_Instruments_TPS563201DDCR.ato" import Texas_Instruments_TPS563201DDCR_package
+
+module Texas_Instruments_TPS563201DDCR:
+    """
+    TPS563201 synchronous buck converter (4.5-17 V in, up to 3 A) with a
+    constraint-set output voltage.
+
+    The output voltage is programmed by a divider from VOUT to VFB to GND.
+    Internal feedback reference VFB = 0.768 V (TPS563201 datasheet SLVSD90B,
+    "Output Voltage Resistors Selection", Eq. 2):
+
+        Vout = 0.768 V * (R_top + R_bottom) / R_bottom
+
+    Recommended component values from datasheet Table 7-2 (Recommended
+    Component Values) for the common output rails are honored by the default
+    divider/inductor/output-cap values below (defaults to the 5 V row:
+    R_top = 54.9 k, R_bottom = 10.0 k, L = 4.7 uH typ, Cout = 20-68 uF).
+
+    Support circuitry per datasheet:
+    - Input decoupling: >= 10 uF ceramic + optional 0.1 uF HF cap close to VIN
+      (Sec "Input Capacitor Selection", page 16).
+    - Bootstrap cap from VBST to SW (0.1 uF, datasheet typical application
+      Figure 7-1, C7).
+    - Output inductor SW -> VOUT and output bulk capacitance (Table 7-2).
+    - EN pulled to VIN through a resistor to enable the device by default.
+
+    Requirements:
+    - R-BUCK1: Step VIN (nom 12 V) down to a 5 V rail set by the FB divider,
+      with datasheet-recommended L and in/out capacitors; passives auto-picked.
+    """
+
+    # ---- Public interfaces ----
+    power_in = new ElectricPower    # 12 V input
+    power_out = new ElectricPower   # regulated output (5 V by default)
+
+    assert power_in.voltage within 4.5V to 17V
+
+    # ---- Internal feedback reference (datasheet) ----
+    v_fb: V
+    assert v_fb within 0.768V +/- 0%
+
+    package = new Texas_Instruments_TPS563201DDCR_package
+
+    # ---- Power rails ----
+    power_in.hv ~ package.VIN
+    power_in.lv ~ package.GND
+    power_out.lv ~ package.GND
+
+    # ---- Input decoupling: 10 uF bulk + 0.1 uF HF (datasheet page 16) ----
+    cin_bulk = new Capacitor
+    cin_bulk.capacitance = 10uF +/- 20%
+    cin_bulk.package = "0805"
+    power_in.hv ~> cin_bulk ~> power_in.lv
+
+    cin_hf = new Capacitor
+    cin_hf.capacitance = 100nF +/- 10%
+    cin_hf.package = "0402"
+    power_in.hv ~> cin_hf ~> power_in.lv
+
+    # ---- EN pull-up to VIN (enable by default) ----
+    en_pullup = new Resistor
+    en_pullup.resistance = 100kohm +/- 5%
+    en_pullup.package = "0402"
+    package.EN ~> en_pullup ~> package.VIN
+
+    # ---- Bootstrap cap VBST -> SW (datasheet Fig 7-1, C7 = 0.1 uF) ----
+    cboot = new Capacitor
+    cboot.capacitance = 100nF +/- 10%
+    cboot.package = "0402"
+    package.VBST ~ cboot.unnamed[0]
+    package.SW ~ cboot.unnamed[1]
+
+    # ---- Output inductor SW -> VOUT (Table 7-2: 4.7 uH typ) ----
+    inductor = new Inductor
+    inductor.inductance = 4.7uH +/- 20%
+    assert inductor.max_current >= 2A
+    package.SW ~ inductor.unnamed[0]
+    inductor.unnamed[1] ~ power_out.hv
+
+    # ---- Output bulk capacitance (Table 7-2: 20-68 uF) : 2x 22 uF ----
+    cout = new Capacitor[2]
+    for c in cout:
+        c.capacitance = 22uF +/- 20%
+        c.package = "0805"
+        power_out.hv ~> c ~> power_out.lv
+
+    # ---- Feedback divider VOUT -> VFB -> GND (Table 7-2, 5 V row) ----
+    # R_top = 54.9 k (VOUT->VFB), R_bottom = 10.0 k (VFB->GND)
+    #   Vout = 0.768 * (54.9 + 10.0) / 10.0 = 4.99 V
+    r_top = new Resistor
+    r_bottom = new Resistor
+    r_top.resistance = 54.9kohm +/- 1%
+    r_bottom.resistance = 10kohm +/- 1%
+    r_top.package = "0402"
+    r_bottom.package = "0402"
+
+    power_out.hv ~> r_top ~> package.VFB
+    package.VFB ~> r_bottom ~> power_out.lv
+
+    # Resulting output voltage (declares intent for the picker/checker)
+    assert power_out.voltage within 5V +/- 3%

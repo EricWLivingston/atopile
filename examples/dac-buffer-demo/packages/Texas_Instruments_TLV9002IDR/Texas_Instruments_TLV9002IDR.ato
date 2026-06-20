@@ -1,0 +1,60 @@
+#pragma experiment("BRIDGE_CONNECT")
+
+import ElectricPower
+import ElectricSignal
+import Capacitor
+
+from "parts/Texas_Instruments_TLV9002IDR/Texas_Instruments_TLV9002IDR.ato" import Texas_Instruments_TLV9002IDR_package
+
+module Texas_Instruments_TLV9002IDR:
+    """
+    TLV9002 dual rail-to-rail-input/output (RRIO) op-amp, 1 MHz GBW, 2 V/us.
+
+    Suitable for active filters and signal buffering up to a few kHz: per the
+    LMV324-N active-filter guidance (SNOS012K), single-op-amp Sallen-Key filters
+    need open-loop gain >= 50x the filter gain at the highest frequency of
+    interest and adequate slew rate. At fc ~ 1 kHz, the TLV9002 (GBW 1 MHz)
+    has ~1000x margin, so it is a strong fit for a 1 kHz reconstruction filter.
+
+    Two independent amplifiers (A: in1p/in1n/out1, B: in2p/in2n/out2) plus a
+    100 nF supply decoupling capacitor.
+    """
+
+    power = new ElectricPower
+
+    in1p = new ElectricSignal
+    in1n = new ElectricSignal
+    out1 = new ElectricSignal
+    in2p = new ElectricSignal
+    in2n = new ElectricSignal
+    out2 = new ElectricSignal
+
+    package = new Texas_Instruments_TLV9002IDR_package
+
+    assert power.voltage within 1.8V to 5.5V
+
+    # ---- Power ----
+    power.hv ~ package.Vpos
+    power.lv ~ package.Vneg
+
+    # ---- Amplifier A ----
+    in1p.line ~ package.IN1pos
+    in1n.line ~ package.IN1neg
+    out1.line ~ package.OUT1
+    in1p.reference ~ power
+    in1n.reference ~ power
+    out1.reference ~ power
+
+    # ---- Amplifier B ----
+    in2p.line ~ package.IN2pos
+    in2n.line ~ package.IN2neg
+    out2.line ~ package.OUT2
+    in2p.reference ~ power
+    in2n.reference ~ power
+    out2.reference ~ power
+
+    # ---- Decoupling ----
+    decoup = new Capacitor
+    decoup.capacitance = 100nF +/- 10%
+    decoup.package = "0402"
+    power.hv ~> decoup ~> power.lv

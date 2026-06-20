@@ -1,0 +1,10 @@
+requires-atopile: ^0.14.0
+paths:
+  src: ./
+  layout: ./layouts
+builds:
+  default:
+    entry: Microchip_Tech_MCP4728_E_UN.ato:Microchip_Tech_MCP4728_E_UN
+package:
+  identifier: local/microchip-tech-mcp4728-e-un
+  version: 0.0.1

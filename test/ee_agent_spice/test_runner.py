@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from ee_agent_spice.errors import classify_log
+from ee_agent_spice.errors import NgspiceError, classify_log
 from ee_agent_spice.persist import run_id, summarise
 from ee_agent_spice.runner import (
     _control_card,
@@ -59,6 +59,40 @@ def test_build_deck_strips_agent_supplied_terminator():
 )
 def test_control_card(analysis, params, expected):
     assert _control_card(analysis, params) == expected
+
+
+# --- param validation (B3): SPICE suffixes pass, injection/garbage rejected ----------
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"t_step": "10 us", "t_end": "10ms"},          # space -> injection guard
+        {"t_step": "10us\n.tran 1 1", "t_end": "1ms"},  # newline directive injection
+        {"t_step": "abc", "t_end": "1ms"},              # not a number
+        {"t_step": float("inf"), "t_end": "1ms"},       # non-finite
+        {"t_step": True, "t_end": "1ms"},               # bool is not a sweep value
+    ],
+)
+def test_control_card_rejects_bad_numeric_params(params):
+    with pytest.raises(NgspiceError) as exc:
+        _control_card("tran", params)
+    assert exc.value.err_type == "invalid_params"
+
+
+def test_control_card_rejects_bad_sweep_source():
+    with pytest.raises(NgspiceError) as exc:
+        _control_card("dc", {"source": "V1; .end", "start": 0, "stop": 5, "step": 1})
+    assert exc.value.err_type == "invalid_params"
+
+
+def test_control_card_rejects_bad_ac_variation():
+    with pytest.raises(NgspiceError) as exc:
+        _control_card("ac", {"variation": "bogus", "n_points": 10,
+                             "f_start": 1, "f_stop": 1e6})
+    assert exc.value.err_type == "invalid_params"
+
+
+def test_control_card_accepts_spice_suffix_numbers():
+    assert _control_card("tran", {"t_step": "4.7us", "t_end": "1k"}) == ".tran 4.7us 1k"
 
 
 def test_strip_terminators_drops_end_and_endc():
@@ -127,6 +161,12 @@ def test_run_id_is_deterministic_and_analysis_sensitive():
         ("unknown subckt OPAMP", "model_error"),
         ("syntax error in line 3", "parse_error"),
         ("everything is fine", "unknown"),
+        # B4: more actionable classes so the agent fixes the right thing
+        ("Error: node out has fewer than 2 connections", "floating_node"),
+        ("node vcc has no DC path to ground", "floating_node"),
+        ("can't open file mymodel.lib", "include_error"),
+        ("unknown parameter foo on R1", "param_error"),
+        ("Error: .ic node bogus not found", "ic_error"),
     ],
 )
 def test_classify_log(log, err_type):

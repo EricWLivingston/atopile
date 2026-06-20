@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { collectChangedFilesSummary, type AgentChangedFile } from './components/viewHelpers';
 import { findLatestBuildStatus } from './runtime/buildStatus';
 import { useAgentComposerState } from './runtime/useAgentComposerState';
@@ -24,6 +24,11 @@ export function useAgentChatRuntime(projectRoot: string | null, selectedTargets:
   const [compactionNotice, setCompactionNotice] = useState<{ nonce: number; status: string; detail: string | null } | null>(null);
   const pendingSteeringByChatRef = useRef<Record<string, string[]>>({});
   const compactionNoticeTimerRef = useRef<number | null>(null);
+  // Stall watchdog: time since the last agent progress event for the active run.
+  // Lets the UI distinguish a live run (recent events) from a wedged one, even when
+  // no terminal event ever arrives. Reset whenever a run is (in)active.
+  const lastProgressAtRef = useRef<number>(Date.now());
+  const [secondsSinceProgress, setSecondsSinceProgress] = useState(0);
 
   const projectModules = useStore((state) => (projectRoot ? state.projectModules[projectRoot] ?? [] : []));
   const projectFileNodes = useStore((state) => (projectRoot ? state.projectFiles[projectRoot] ?? [] : []));
@@ -102,6 +107,29 @@ export function useAgentChatRuntime(projectRoot: string | null, selectedTargets:
     setMentionToken: composerState.setMentionToken,
     setMentionIndex: composerState.setMentionIndex,
   });
+
+  // Every progress event resets the stall clock.
+  useEffect(() => {
+    const onProgress = () => { lastProgressAtRef.current = Date.now(); };
+    window.addEventListener('atopile:agent_progress', onProgress as EventListener);
+    return () => window.removeEventListener('atopile:agent_progress', onProgress as EventListener);
+  }, []);
+
+  // While a run is active, tick the seconds-since-last-progress each second; reset
+  // the clock when a run starts and zero it out when idle.
+  useEffect(() => {
+    if (!(isSending || isStopping)) {
+      setSecondsSinceProgress(0);
+      return;
+    }
+    lastProgressAtRef.current = Date.now();
+    const tick = () => setSecondsSinceProgress(
+      Math.max(0, Math.floor((Date.now() - lastProgressAtRef.current) / 1000)),
+    );
+    tick();
+    const timerId = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timerId);
+  }, [isSending, isStopping]);
 
   const changedFilesSummary = useMemo(() => collectChangedFilesSummary(messages), [messages]);
   const contextUsage = useMemo(() => {
@@ -186,6 +214,7 @@ export function useAgentChatRuntime(projectRoot: string | null, selectedTargets:
     changedFilesSummary,
     contextUsage,
     latestBuildStatus,
+    secondsSinceProgress,
     statusClass,
     statusText,
     setIsChatsPanelOpen: panelState.setIsChatsPanelOpen,

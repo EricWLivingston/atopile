@@ -14,6 +14,7 @@ come back keyed by node name (voltage) or ``<src>#branch`` (source current);
 from __future__ import annotations
 
 import ctypes.util
+import math
 import os
 import re
 import threading
@@ -43,23 +44,83 @@ def _strip_terminators(body: str) -> str:
     return "\n".join(lines).strip()
 
 
+_IDENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+# A SPICE number: optional sign, mantissa, optional exponent, optional engineering
+# scale/unit suffix (k, meg, u, ms, ...). The crucial bit is the anchored ^...$ with no
+# whitespace/newline class: it accepts "10us"/"4.7k"/"1e3" but rejects anything carrying
+# a space or newline that could smuggle a second directive into the control card.
+_SPICE_NUM_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?[A-Za-z%]*$")
+_AC_VARIATIONS = frozenset({"dec", "oct", "lin"})
+
+
+def _num(params: dict[str, Any], key: str) -> str:
+    """Return ``params[key]`` as a validated SPICE number string, or raise.
+
+    Control-card fields are interpolated straight into the deck, so a malformed value
+    could break it or inject a directive. Accepts finite numbers and SPICE-number
+    strings (engineering suffixes like ``10us``/``4.7k``); rejects anything else,
+    including values with whitespace/newlines (CODE_AUDIT B3)."""
+    if key not in params:
+        raise KeyError(key)  # caller maps this to a "missing required param" failure
+    val = params[key]
+    if isinstance(val, bool):  # bool is an int subclass — never a valid sweep value
+        raise NgspiceError(f"param {key!r} must be numeric", "", "invalid_params")
+    if isinstance(val, (int, float)):
+        if not math.isfinite(val):
+            raise NgspiceError(f"param {key!r} must be finite", "", "invalid_params")
+        return str(val).strip()
+    if not _SPICE_NUM_RE.match(str(val).strip()):
+        raise NgspiceError(
+            f"param {key!r} must be a number (optionally with a SPICE unit suffix), "
+            f"got {val!r}",
+            "",
+            "invalid_params",
+        )
+    return str(val).strip()
+
+
+def _ident(value: Any, what: str) -> str:
+    """Validate a SPICE identifier (source/element name) — no spaces/newlines that could
+    smuggle extra directives into the control card."""
+    s = str(value).strip()
+    if not _IDENT_RE.match(s):
+        raise NgspiceError(
+            f"{what} must be a simple identifier, got {value!r}", "", "invalid_params"
+        )
+    return s
+
+
 def _control_card(analysis: str, params: dict[str, Any]) -> str:
-    """Build the analysis dot-card from structured params; raises on missing keys."""
+    """Build the analysis dot-card from structured params; raises on missing/invalid."""
     if analysis == "op":
         return ".op"
     if analysis == "dc":
         src = params.get("source")
         if not src:  # a DC analysis with no sweep source is just an operating point
             return ".op"
-        return f".dc {src} {params['start']} {params['stop']} {params['step']}"
+        src = _ident(src, "dc sweep source")
+        return f".dc {src} {_num(params, 'start')} {_num(params, 'stop')} " + _num(
+            params, "step"
+        )
     if analysis == "ac":
-        variation = params.get("variation", "dec")
-        n, f0, f1 = params["n_points"], params["f_start"], params["f_stop"]
+        variation = str(params.get("variation", "dec")).strip().lower()
+        if variation not in _AC_VARIATIONS:
+            raise NgspiceError(
+                f"ac variation must be one of {sorted(_AC_VARIATIONS)}, "
+                f"got {params.get('variation')!r}",
+                "",
+                "invalid_params",
+            )
+        n, f0, f1 = (
+            _num(params, "n_points"),
+            _num(params, "f_start"),
+            _num(params, "f_stop"),
+        )
         return f".ac {variation} {n} {f0} {f1}"
     if analysis == "tran":
-        card = f".tran {params['t_step']} {params['t_end']}"
+        card = f".tran {_num(params, 't_step')} {_num(params, 't_end')}"
         if params.get("t_start") is not None:
-            card += f" {params['t_start']}"
+            card += f" {_num(params, 't_start')}"
         if params.get("uic"):
             card += " uic"
         return card
@@ -117,6 +178,14 @@ def _resolve(probe: str, keys: list[str]) -> str | None:
 _LOCK = threading.Lock()
 _SHARED: Any = None
 
+# Wall-clock budget for a single ngspice run. A non-converging/stiff deck can otherwise
+# spin forever inside the C core, wedging the worker and (via the singleton lock) every
+# later sim. We bound the run AND the lock wait so the agent always gets control back
+# with a structured `timeout` error instead of hanging (CODE_AUDIT B2). The pyspice_run
+# skill tells the agent to keep t_end/n_points modest so legitimate runs finish well
+# under this.
+_SIM_TIMEOUT_S = float(os.environ.get("EE_SPICE_TIMEOUT_S", "30"))
+
 
 def _ngspice_library_path() -> str | None:
     """Locate libngspice as an absolute path (brew dirs aren't on the dyld path).
@@ -170,18 +239,54 @@ def _latest_plot_name(plot_names: list[str]) -> str | None:
     return None
 
 
+def _load_and_run(ng: Any, deck: str) -> None:
+    ng.load_circuit(deck)
+    ng.run()
+
+
 def _run_ngspice(deck: str, analysis: str) -> tuple[dict[str, np.ndarray], str, str]:
-    """Run the deck on the locked singleton; return (vectors, log, plot) or raise."""
-    with _LOCK:
+    """Run the deck on the locked singleton; return (vectors, log, plot) or raise.
+
+    Bounded by ``_SIM_TIMEOUT_S`` on both the lock wait and the run itself so a hung
+    deck can never block the worker indefinitely.
+    """
+    if not _LOCK.acquire(timeout=_SIM_TIMEOUT_S):
+        raise NgspiceError(
+            "ngspice is busy with another simulation that exceeded its time budget; "
+            "try again shortly.",
+            "",
+            "timeout",
+        )
+    timed_out = False
+    try:
         ng = _shared()
         ng._log = []  # reset capture for this run
         try:
-            try:
-                ng.load_circuit(deck)
-                ng.run()
-            except NgspiceError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - PySpice raises NgSpiceCommandError
+            # Run in a watchdog thread so a non-converging deck times out instead of
+            # hanging. ngspice's C core can't be force-killed mid-call, so on timeout we
+            # surface the error and let the (daemon) thread unwind on its own.
+            worker_exc: dict[str, BaseException] = {}
+
+            def _target() -> None:
+                try:
+                    _load_and_run(ng, deck)
+                except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
+                    worker_exc["e"] = exc
+
+            t = threading.Thread(target=_target, daemon=True)
+            t.start()
+            t.join(_SIM_TIMEOUT_S)
+            if t.is_alive():
+                timed_out = True
+                raise NgspiceError(
+                    f"ngspice exceeded the {_SIM_TIMEOUT_S:.0f}s time budget — reduce "
+                    "t_end/n_points or simplify the circuit.",
+                    "".join(ng._log),
+                    "timeout",
+                )
+            if (exc := worker_exc.get("e")) is not None:
+                if isinstance(exc, NgspiceError):
+                    raise exc
                 log = "".join(ng._log)
                 err_type, rationale = classify_log(log)
                 raise NgspiceError(rationale or str(exc), log, err_type) from exc
@@ -197,10 +302,16 @@ def _run_ngspice(deck: str, analysis: str) -> tuple[dict[str, np.ndarray], str, 
                 raise NgspiceError(rationale, log, err_type)
             return vectors, log, plot_name
         finally:
-            try:  # free plots so memory doesn't grow across runs on the singleton
-                ng.exec_command("destroy all")
-            except Exception:  # noqa: BLE001 - best-effort cleanup
-                pass
+            # Don't touch the singleton while a timed-out worker may still be inside the
+            # C core (concurrent access corrupts state); cleanup on the next successful
+            # run handles cleanup. Otherwise free plots so memory doesn't grow.
+            if not timed_out:
+                try:
+                    ng.exec_command("destroy all")
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    pass
+    finally:
+        _LOCK.release()
 
 
 # --------------------------------------------------------------------------------------

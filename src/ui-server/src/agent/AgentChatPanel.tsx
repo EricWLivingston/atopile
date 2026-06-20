@@ -103,6 +103,7 @@ export function AgentChatPanel({ projectRoot, selectedTargets }: AgentChatPanelP
               messages={runtime.messages}
               expandedTraceKeys={runtime.expandedTraceKeys}
               latestBuildStatus={runtime.latestBuildStatus}
+              secondsSinceProgress={runtime.secondsSinceProgress}
               onToggleTraceExpanded={runtime.toggleTraceExpanded}
               onSubmitDesignQuestions={(answers) => void runtime.sendMessage({ directMessage: answers, hideUserMessage: true })}
             />

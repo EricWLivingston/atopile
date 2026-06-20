@@ -77,6 +77,12 @@ vendor `.model` line (find it via `rag_search`/datasheet) in your netlist body.
 - `ac`: `{"variation": "dec", "n_points": 100, "f_start": 1, "f_stop": 1e6}`
 - `tran`: `{"t_step": "10us", "t_end": "10ms", "uic": false}`
 
+Numeric params accept SPICE engineering suffixes (`10us`, `4.7k`, `1e6`) but must be plain
+values — no spaces or extra tokens. **Each run has a ~30 s wall-clock budget** (overridable
+via `EE_SPICE_TIMEOUT_S`); pick a `t_end`/`n_points` that finishes well under it. A run that
+exceeds it returns `{success:false, errors:[{type:"timeout"}]}` — shorten the sweep
+(`t_end`), coarsen `t_step`, or simplify the circuit rather than retrying as-is.
+
 ### probes
 
 List nodes/currents to record: a node voltage as `out` or `v(out)`, a source current as

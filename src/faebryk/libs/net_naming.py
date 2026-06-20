@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import logging
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -118,6 +119,199 @@ def _get_net_stable_key(net: F.Net) -> tuple[str, ...]:
 
     stable_names = sorted(m.get_full_name(include_uuid=False) for m in mifs)
     return tuple(stable_names)
+
+
+# ---------------------------------------------------------------------------------------
+# Power / ground rail naming (voltage-aware rails, shared GND) + device-pin fallback.
+#
+# The default implicit naming yields generic, fragmented names for power infrastructure
+# ("hv", "lv", "c1-power-hv", "rs485-power-lv"). The helpers below give power rails a
+# voltage-derived name ("+5V", "+3V3"), collapse all non-isolated ground nets to a single
+# "GND" (flagging fragments), and, when no purposeful name exists, fall back to the pin name
+# of a connected device, preferring ICs over passives.
+# ---------------------------------------------------------------------------------------
+
+# Mirrors the schematic emitter's classify_nets edge sets (schematic.py).
+_POWER_RAIL_EDGES = {"hv", "vcc"}
+_GROUND_RAIL_EDGES = {"lv", "gnd"}
+
+# Designator-prefix tiers for the pin-name fallback: ICs win over passives.
+_IC_DESIGNATOR_PREFIXES = {"U", "IC"}
+_PASSIVE_DESIGNATOR_PREFIXES = {"R", "C", "L", "FB", "RN", "CN", "Y", "X"}
+
+# Generic interface leaves that make poor net names (never used as a pin-name fallback).
+_GENERIC_PIN_NAMES = {"line", "hv", "lv", "p", "n", "vcc", "gnd"}
+
+
+def _rail_marker_is_passive(pnode: fabll.Node) -> bool:
+    """True if this ``ElectricPower`` belongs to a 2-pin passive (R/C/L/…).
+
+    ``Capacitor``/``Resistor``/``Inductor`` carry a convenience ``.power`` interface that is
+    auto-bonded to their two pins (``power.lv ~ pin2``). It is just a pin alias, **not** an
+    authoritative rail — e.g. a bootstrap cap's ``power.lv`` lands on the buck SW node, which
+    is not ground. So a passive's ``.power`` must not classify a net as power/ground.
+    """
+    return _component_designator_prefix(pnode) in _PASSIVE_DESIGNATOR_PREFIXES
+
+
+def _net_rail_role(net: F.Net) -> str | None:
+    """Classify a net as ``"ground"`` / ``"power"`` rail, or None.
+
+    A net is a rail if any connected electrical is the ``lv``/``gnd`` (ground) or
+    ``hv``/``vcc`` (power) child of a *non-passive* ``ElectricPower``. Ground wins ties,
+    matching the schematic emitter's ``classify_nets``.
+    """
+    role: str | None = None
+    for iface in net.get_connected_interfaces():
+        parent = iface.get_parent()
+        if parent is None:
+            continue
+        pnode, ename = parent
+        if ename not in _GROUND_RAIL_EDGES and ename not in _POWER_RAIL_EDGES:
+            continue
+        try:
+            if not pnode.isinstance(F.ElectricPower):
+                continue
+        except Exception:  # noqa: BLE001 - type probe is best-effort
+            continue
+        if _rail_marker_is_passive(pnode):
+            continue  # a passive's .power is a pin alias, not a rail marker
+        if ename in _GROUND_RAIL_EDGES:
+            return "ground"  # ground is decisive
+        role = "power"
+    return role
+
+
+def _format_rail_voltage(volts: float) -> str:
+    """Format a rail voltage as a net name, e.g. ``5.0 -> "+5V"``, ``3.3 -> "+3V3"``.
+
+    Engineering style: the decimal point is replaced by the unit letter (``3V3``), the sign
+    is always explicit. This ``+3V3`` spelling is the single cosmetic choice — switch the
+    body construction here for the dotted ``+3.3V`` form if preferred.
+    """
+    sign = "-" if volts < 0 else "+"
+    whole, frac = f"{round(abs(volts), 2):.2f}".split(".")
+    frac = frac.rstrip("0")
+    body = f"{whole}V{frac}" if frac else f"{whole}V"
+    return f"{sign}{body}"
+
+
+def _extract_voltage_stat(
+    voltage_param: fabll.Node, solver: object | None
+) -> tuple[float, float] | None:
+    """Read a rail voltage as ``(nominal_volts, relative_width)``, or None if unknown.
+
+    ``nominal`` is the midpoint of the extracted subset; ``relative_width`` =
+    ``(max-min)/|nominal|`` measures how tightly the rail is specified. A near-zero nominal
+    is treated as unknown (``+0V`` is meaningless).
+    """
+    values: list[float] | None = None
+    try:
+        values = voltage_param.get_values()
+    except Exception:  # noqa: BLE001
+        values = None
+    if not values and solver is not None and hasattr(solver, "try_extract_superset"):
+        try:
+            param_trait = voltage_param.get_trait(F.Parameters.is_parameter)
+            lit = solver.try_extract_superset(param_trait)  # type: ignore[attr-defined]
+            if lit is not None:
+                disp = voltage_param.force_get_display_units()
+                values = lit.convert_to_unit(
+                    disp, g=voltage_param.g, tg=voltage_param.tg
+                ).get_values()
+        except Exception:  # noqa: BLE001 - degrade to no voltage name
+            values = None
+    values = [v for v in (values or []) if math.isfinite(v)]
+    if not values:
+        return None
+    nominal = sum(values) / len(values)
+    if abs(nominal) < 0.05:
+        return None
+    rel_width = (max(values) - min(values)) / abs(nominal)
+    return nominal, rel_width
+
+
+def _rail_voltage_name(net: F.Net, solver: object | None) -> str | None:
+    """Voltage-derived base name (``+5V``) for a power-rail net, or None if unconstrained.
+
+    A rail net usually spans several bus-connected ``ElectricPower``s. Some are loosely
+    constrained (a sink that merely tolerates 1.7..5.5 V), so their midpoints drift off the
+    rail's nominal. Pick the member with the **tightest** relative spec — that is the
+    author's actual rail assert (e.g. ``3.3V ±2%`` beats a downstream ``1.7..5.5 V`` input).
+    """
+    best: tuple[float, float] | None = None  # (relative_width, nominal_volts)
+    for iface in net.get_connected_interfaces():
+        parent = iface.get_parent()
+        if parent is None:
+            continue
+        pnode, ename = parent
+        if ename not in _POWER_RAIL_EDGES:
+            continue
+        try:
+            if not pnode.isinstance(F.ElectricPower):
+                continue
+            if _rail_marker_is_passive(pnode):
+                continue  # a passive's .power voltage is meaningless ({ℝ+})
+            voltage_param = pnode.cast(F.ElectricPower).voltage.get()
+        except Exception:  # noqa: BLE001
+            continue
+        stat = _extract_voltage_stat(voltage_param, solver)
+        if stat is None:
+            continue
+        nominal, rel_width = stat
+        if best is None or (rel_width, -abs(nominal)) < (best[0], -abs(best[1])):
+            best = (rel_width, nominal)
+    if best is None:
+        return None
+    return _format_rail_voltage(best[1])
+
+
+def _component_designator_prefix(mif: F.Electrical) -> str | None:
+    """Designator prefix (``U``/``R``/``C``…) of the component owning this interface."""
+    try:
+        for node, _name in mif.get_hierarchy():
+            if dp := node.try_get_trait(F.has_designator_prefix):
+                return dp.get_prefix()
+    except fabll.NodeNoParent:
+        pass
+    return None
+
+
+def _designator_tier(prefix: str | None) -> int:
+    """0 = IC, 1 = other active (Q/D/…), 2 = passive — lower wins the pin-name fallback."""
+    if prefix in _IC_DESIGNATOR_PREFIXES:
+        return 0
+    if prefix in _PASSIVE_DESIGNATOR_PREFIXES:
+        return 2
+    return 1
+
+
+def _pin_name_fallback(net: F.Net) -> str | None:
+    """Derive a base name from the connected device pin names, ICs prioritized over passives.
+
+    Used only when no suggested/voltage/explicit name exists. An IC+resistor net resolves to
+    the IC pin name. Returns None for nets with no footprinted device (e.g. pure-electrical
+    unit-test graphs), leaving the existing implicit naming untouched.
+    """
+    candidates: list[tuple[int, str]] = []
+    for mif in net.get_connected_interfaces():
+        prefix = _component_designator_prefix(mif)
+        if prefix is None:
+            continue
+        try:
+            name = mif.get_name()
+        except fabll.NodeNoParent:
+            continue
+        if not name or name.isdigit() or len(name) <= 1:
+            continue  # skip bare pad numbers ("6") and single-char lead names ("a")
+        low = name.lower()
+        if low in _GENERIC_PIN_NAMES or _name_shittiness(low) < 0.5:
+            continue  # skip generic leaves (line/hv/lv/p/n/unnamed/_\d+)
+        candidates.append((_designator_tier(prefix), name))
+    if not candidates:
+        return None
+    # Lowest tier (IC) wins; lexicographic tie-break for determinism.
+    return min(candidates, key=lambda c: (c[0], c[1]))[1]
 
 
 def _collect_unnamed_nets(nets: Iterable[F.Net]) -> dict[F.Net, list[F.Electrical]]:
@@ -262,9 +456,18 @@ def _determine_base_name(
 
 
 def _process_unnamed_nets(
-    unnamed_nets: dict[F.Net, list[F.Electrical]], names: FuncDict[F.Net, _NetName]
+    unnamed_nets: dict[F.Net, list[F.Electrical]],
+    names: FuncDict[F.Net, _NetName],
+    solver: object | None,
+    ground_nets: list[F.Net],
 ) -> None:
-    """Process nets without names, determining their base names."""
+    """Process nets without names, determining their base names.
+
+    Power rails are named by voltage (``+5V``), ground rails are deferred to
+    :func:`_resolve_ground_nets` (collected into ``ground_nets``), and otherwise unnamed nets
+    fall back to a connected device pin name (IC over passive) when the implicit name is
+    generic.
+    """
     for net, mifs in unnamed_nets.items():
         # Collect all naming information
         required, suggested, implicit = _collect_naming_info_from_interfaces(mifs)
@@ -280,9 +483,65 @@ def _process_unnamed_nets(
             )
             continue
 
-        # Create net name entry and determine base name
         names[net] = _NetName()
-        names[net].base_name = _determine_base_name(suggested, implicit)
+
+        # Power / ground rails get special treatment.
+        role = _net_rail_role(net)
+        if role == "ground":
+            # Defer to the ground-collapse pass (needs to see all grounds at once).
+            ground_nets.append(net)
+            continue
+        if role == "power":
+            # Power rail: the solved voltage is the rail's identity, so it wins over the
+            # library pin/interface hints on the net (generic "hv", a diode "anode", …). An
+            # explicit author EXPECTED override still wins — it is handled above as a
+            # ``required`` name before we get here. Rails without a resolvable voltage fall
+            # back to a device pin name, then the implicit name.
+            if vname := _rail_voltage_name(net, solver):
+                base = vname
+            else:
+                base = _determine_base_name(suggested, implicit)
+                if base is None or _is_generic_name(base):
+                    base = _pin_name_fallback(net) or base
+            names[net].base_name = base
+            continue
+
+        # Plain net: implicit name, falling back to a connected device pin name when generic.
+        base = _determine_base_name(suggested, implicit)
+        if base is None or _is_generic_name(base):
+            if pin := _pin_name_fallback(net):
+                base = pin
+        names[net].base_name = base
+
+
+def _describe_ground(net: F.Net) -> str:
+    """Short human identifier for a ground net, for the fragmentation warning."""
+    return _get_fallback_prefix(net) or "GND"
+
+
+def _resolve_ground_nets(
+    ground_nets: list[F.Net], names: FuncDict[F.Net, _NetName]
+) -> None:
+    """Collapse all ground-role nets to ``GND``; warn when grounds are not tied together.
+
+    Every ground net is named ``GND``; if more than one electrically-distinct ground net
+    exists (a likely missing tie), the rest are de-conflicted by the normal prefixing pass
+    and a warning lists them — surfacing the fragmentation rather than silently emitting
+    ``GND-2``. An author can opt a net out by giving it an explicit name (``override_net_name``).
+    """
+    if not ground_nets:
+        return
+    for net in ground_nets:
+        names[net].base_name = "GND"
+    if len(ground_nets) > 1:
+        ordered = sorted(ground_nets, key=_get_net_stable_key)
+        logger.warning(
+            "Multiple electrically-distinct ground nets detected (%d); they likely should "
+            "be tied to a single reference. Naming the primary 'GND' and de-conflicting the "
+            "rest: %s",
+            len(ground_nets),
+            ", ".join(_describe_ground(n) for n in ordered),
+        )
 
 
 def _is_generic_name(name: str | None) -> bool:
@@ -290,7 +549,10 @@ def _is_generic_name(name: str | None) -> bool:
     if name is None:
         return True
 
-    generic_names = {"line", "hv", "p", "n"}
+    if name.isdigit():  # bare pad/pin numbers ("7")
+        return True
+
+    generic_names = {"line", "hv", "lv", "p", "n", "vcc", "gnd"}
     generic_patterns: list[Callable[[str], bool]] = [
         lambda n: n.startswith("unnamed"),
         lambda n: re.match(r"^(_\d+|p\d+)$", n) is not None,
@@ -672,20 +934,26 @@ def _apply_names_to_nets(names: FuncDict[F.Net, _NetName]) -> None:
         )
 
 
-def attach_net_names(nets: Iterable[F.Net]) -> None:
+def attach_net_names(nets: Iterable[F.Net], solver: object | None = None) -> None:
     """
     Generate good net names for all nets in a design.
 
     This function assigns meaningful names to nets based on:
     1. Required names from has_net_name traits (highest priority)
     2. Suggested names from has_net_name traits
-    3. Implicit names from connected interfaces
-    4. Conflict resolution through prefixing and suffixing
+    3. Voltage-derived names for power rails ("+5V"); shared "GND" for ground rails
+    4. Implicit names from connected interfaces, falling back to a connected device pin
+       name (ICs prioritized over passives)
+    5. Conflict resolution through prefixing and suffixing
+
+    ``solver`` (the build's parameter solver) is optional: it is used only to read solved
+    rail voltages. Without it (e.g. in unit tests) rails degrade to their generic names.
 
     The naming process follows these steps:
     - Collect and sort unnamed nets
     - Register already-named nets
-    - Process unnamed nets to determine base names
+    - Process unnamed nets to determine base names (power rails, ground rails, pin fallback)
+    - Collapse ground rails to a single "GND"
     - Apply affixes (prefixes/suffixes) from traits
     - Resolve conflicts through hierarchical prefixing
     - Apply numeric suffixes for remaining conflicts
@@ -704,7 +972,11 @@ def attach_net_names(nets: Iterable[F.Net]) -> None:
     _register_named_nets(nets_ordered, names)
 
     # Process unnamed nets
-    _process_unnamed_nets(unnamed_nets, names)
+    ground_nets: list[F.Net] = []
+    _process_unnamed_nets(unnamed_nets, names, solver, ground_nets)
+
+    # Collapse ground rails to a shared "GND"
+    _resolve_ground_nets(ground_nets, names)
 
     # Apply affixes
     _apply_affixes(unnamed_nets, names)
@@ -1120,3 +1392,56 @@ class TestNetNaming:
             "Expected CLK nets to show conflict resolution (plain + suffixes/prefixes)"
             f", got {clk_nets}"
         )
+
+    def test_ground_nets_collapse_to_gnd(self):
+        """Two electrically-distinct ground rails collapse to a single plain ``GND``;
+        the second is de-conflicted (not ``GND-2``)."""
+        import faebryk.core.node as fabll
+
+        g = fabll.graph.GraphView.create()
+        tg = fbrk.TypeGraph.create(g=g)
+
+        class App(fabll.Node):
+            power_a = F.ElectricPower.MakeChild()
+            power_b = F.ElectricPower.MakeChild()
+
+        app = App.bind_typegraph(tg=tg).create_instance(g=g)
+
+        nets = self._bind_nets_for_test(
+            electricals=app.get_children(direct_only=False, types=F.Electrical),
+            tg=tg,
+            g=g,
+        )
+        attach_net_names(nets)
+
+        net_names = sorted(n.get_name() for n in nets if n.get_name() is not None)
+        gnd_nets = [n for n in net_names if "GND" in n]
+        # both ground rails named for GND, exactly one keeps the plain "GND"
+        assert len(gnd_nets) == 2, f"expected 2 ground nets, got {gnd_nets}"
+        assert sum(1 for n in net_names if n == "GND") == 1, net_names
+        # the de-conflicted one is not a numeric suffix
+        assert all(n == "GND" or not re.fullmatch(r"GND-\d+", n) for n in gnd_nets)
+
+
+def test_format_rail_voltage():
+    assert _format_rail_voltage(5.0) == "+5V"
+    assert _format_rail_voltage(3.3) == "+3V3"
+    assert _format_rail_voltage(12.0) == "+12V"
+    assert _format_rail_voltage(1.8) == "+1V8"
+    assert _format_rail_voltage(-5.0) == "-5V"
+    assert _format_rail_voltage(-12.0) == "-12V"
+
+
+def test_designator_tier_orders_ic_before_passive():
+    # ICs win the pin-name fallback over passives; other actives sit between.
+    assert _designator_tier("U") < _designator_tier("Q")
+    assert _designator_tier("Q") < _designator_tier("R")
+    assert _designator_tier("IC") == _designator_tier("U")
+
+
+def test_generic_name_includes_pad_numbers_and_vcc():
+    assert _is_generic_name("7")  # bare pad number
+    assert _is_generic_name("vcc")
+    assert _is_generic_name("hv")
+    assert not _is_generic_name("VFB")
+    assert not _is_generic_name("+5V")

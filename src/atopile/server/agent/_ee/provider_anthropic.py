@@ -16,6 +16,7 @@ import asyncio
 import copy
 import json
 import logging
+import threading
 import uuid
 from collections import OrderedDict
 from typing import Any
@@ -59,6 +60,9 @@ class AnthropicProvider:
         # conversation ourselves, keyed by the response_id we mint and return, so we
         # can rebuild the complete transcript Anthropic requires on every request.
         self._transcripts: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+        # The provider is a process-wide singleton shared by all sessions; guard the LRU
+        # so concurrent turns can't race on move_to_end/popitem (CODE_AUDIT Q7).
+        self._transcripts_lock = threading.Lock()
 
     def _get_client(self) -> AsyncAnthropic:
         if self._client is None:
@@ -97,6 +101,15 @@ class AnthropicProvider:
         conversation = self._rebuild_conversation(previous_response_id, delta)
 
         anthropic_tools = [_convert_tool_def(t) for t in tools]
+        # Cache the whole tools block: Anthropic caches everything up to the last
+        # ``cache_control`` breakpoint, so marking only the final tool def caches all of
+        # them. Tools + system are stable across a session, so this is the biggest
+        # per-turn token win (CODE_AUDIT T1). Breakpoint order: tools -> system.
+        if anthropic_tools:
+            anthropic_tools[-1] = {
+                **anthropic_tools[-1],
+                "cache_control": {"type": "ephemeral"},
+            }
         system_blocks = _build_system_with_caching(instructions, skill_state)
 
         # Per-call model override (dynamic complexity routing). Safe mid-chain:
@@ -112,6 +125,7 @@ class AnthropicProvider:
 
         # 3) Call the API with retries + context-overflow handling.
         response = await self._request_with_retries(payload)
+        _log_cache_metrics(response, payload["model"])
 
         # 4) Persist the assistant turn so the *next* delta's tool_result pairs with
         #    a real preceding tool_use, and mint the id the runner hands back to us
@@ -143,7 +157,13 @@ class AnthropicProvider:
         message is a ``user`` turn (the API rejects anything else).
         """
         if previous_response_id is not None:
-            base = self._transcripts.get(previous_response_id)
+            # Grab the stored list + LRU-touch under the lock, then deep-copy outside:
+            # stored transcripts are never mutated in place (each id maps to a fresh
+            # list), so the reference stays valid even if evicted after we release.
+            with self._transcripts_lock:
+                base = self._transcripts.get(previous_response_id)
+                if base is not None:
+                    self._transcripts.move_to_end(previous_response_id)  # LRU touch
             if base is None:
                 # We minted ids but lost this one (process restart or LRU
                 # eviction). Raise a message containing "previous_response_id" so
@@ -155,7 +175,6 @@ class AnthropicProvider:
                     "without re-sending full history."
                 )
             conversation = copy.deepcopy(base)
-            self._transcripts.move_to_end(previous_response_id)  # LRU touch
         else:
             conversation = []
 
@@ -168,15 +187,17 @@ class AnthropicProvider:
                 {"role": "user", "content": [{"type": "text", "text": "Continue."}]}
             )
 
+        _repair_orphaned_tool_uses(conversation)
         return conversation
 
     def _store_transcript(
         self, response_id: str, conversation: list[dict[str, Any]]
     ) -> None:
-        self._transcripts[response_id] = conversation
-        self._transcripts.move_to_end(response_id)
-        while len(self._transcripts) > _MAX_TRANSCRIPTS:
-            self._transcripts.popitem(last=False)
+        with self._transcripts_lock:
+            self._transcripts[response_id] = conversation
+            self._transcripts.move_to_end(response_id)
+            while len(self._transcripts) > _MAX_TRANSCRIPTS:
+                self._transcripts.popitem(last=False)
 
     # ── Retry + overflow handling (parallels OpenAIProvider) ──────────
 
@@ -270,7 +291,7 @@ class AnthropicProvider:
             "paragraph that preserves: (1) all decisions made, (2) key tool "
             "results, (3) outstanding work items, and (4) any user constraints. "
             "Do not invent new details. Output prose only.\n\n"
-            f"Conversation:\n{json.dumps(old, ensure_ascii=False)[:50000]}"
+            f"Conversation:\n{_messages_to_text(old, max_chars=50_000)}"
         )
 
         try:
@@ -373,7 +394,20 @@ def _convert_messages_openai_to_anthropic(
 
     def _flush_user() -> None:
         if pending_user_blocks:
-            out.append({"role": "user", "content": list(pending_user_blocks)})
+            # Anthropic requires every ``tool_result`` block to lead the user turn
+            # (contiguous, before any text). Upstream nudges (e.g. the post-
+            # ``parts_install`` user message in orchestrator_helpers) can interleave
+            # text *between* the tool_results of parallel tool calls, producing
+            # ``[tool_result, text, tool_result, …]`` — which the API rejects with a
+            # 400 ("tool_use ids found without tool_result blocks immediately after").
+            # Stable-partition tool_results to the front so the order is always valid.
+            tool_results = [
+                b for b in pending_user_blocks if b.get("type") == "tool_result"
+            ]
+            others = [
+                b for b in pending_user_blocks if b.get("type") != "tool_result"
+            ]
+            out.append({"role": "user", "content": tool_results + others})
             pending_user_blocks.clear()
 
     for item in messages:
@@ -438,6 +472,77 @@ def _convert_messages_openai_to_anthropic(
     _flush_assistant()
     _flush_user()
     return out
+
+
+def _repair_orphaned_tool_uses(conversation: list[dict[str, Any]]) -> None:
+    """Guarantee every ``tool_use`` has a matching ``tool_result`` in the next turn.
+
+    Anthropic rejects the whole request (400) if any ``tool_use`` id in an assistant
+    turn lacks a ``tool_result`` in the immediately following user turn. A dropped or
+    mis-routed result (parallel tool calls, partial deltas, eviction) would otherwise
+    kill the entire run. This walks each assistant turn and injects a synthetic
+    ``tool_result`` for any orphan into the following user turn (creating that turn if
+    needed), so a stray orphan degrades to one missing result instead of a dead run.
+
+    Mutates ``conversation`` in place.
+    """
+    i = 0
+    while i < len(conversation):
+        msg = conversation[i]
+        if msg.get("role") != "assistant":
+            i += 1
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            i += 1
+            continue
+        tool_use_ids = [
+            b["id"]
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+        ]
+        if not tool_use_ids:
+            i += 1
+            continue
+
+        # Ensure a following user turn exists to hold the tool_results.
+        nxt = conversation[i + 1] if i + 1 < len(conversation) else None
+        if nxt is None or nxt.get("role") != "user":
+            nxt = {"role": "user", "content": []}
+            conversation.insert(i + 1, nxt)
+        if not isinstance(nxt.get("content"), list):
+            nxt["content"] = (
+                [{"type": "text", "text": nxt["content"]}]
+                if isinstance(nxt.get("content"), str) and nxt["content"]
+                else []
+            )
+
+        present = {
+            b["tool_use_id"]
+            for b in nxt["content"]
+            if isinstance(b, dict)
+            and b.get("type") == "tool_result"
+            and b.get("tool_use_id")
+        }
+        missing = [tid for tid in tool_use_ids if tid not in present]
+        if missing:
+            log.warning(
+                "Repairing %d orphaned tool_use id(s) with synthetic tool_result "
+                "to avoid an Anthropic 400: %s",
+                len(missing),
+                ", ".join(missing),
+            )
+            # tool_results must lead the user turn (see _flush_user); prepend them.
+            synthetic = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tid,
+                    "content": "[no result captured]",
+                }
+                for tid in missing
+            ]
+            nxt["content"] = synthetic + nxt["content"]
+        i += 2
 
 
 def _build_system_with_caching(
@@ -570,6 +675,72 @@ def _build_llm_response(openai_shape: dict[str, Any]) -> LLMResponse:
 # ─────────────────────────────────────────────────────────────────────
 #   Misc helpers
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _messages_to_text(messages: list[dict[str, Any]], max_chars: int) -> str:
+    """Render Anthropic messages as readable ``role: text`` lines for the summarizer,
+    walking the *tail* so the most recent (most relevant) turns survive the budget.
+
+    Cheaper and more faithful than ``json.dumps(messages)[:max_chars]`` (CODE_AUDIT T6):
+    no JSON envelope/escaping bloat in the budget, and truncation drops the *oldest*
+    lines rather than slicing mid-token at an arbitrary char offset.
+    """
+    lines: list[str] = []
+    used = 0
+    for msg in reversed(messages):
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            text = content
+        else:
+            parts: list[str] = []
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    parts.append(block.get("text", ""))
+                elif btype == "tool_use":
+                    parts.append(
+                        f"[tool_use {block.get('name', '')} "
+                        f"{json.dumps(block.get('input', {}), ensure_ascii=False)}]"
+                    )
+                elif btype == "tool_result":
+                    inner = block.get("content", "")
+                    parts.append(f"[tool_result {inner}]")
+            text = " ".join(p for p in parts if p)
+        line = f"{role}: {text}".strip()
+        if not line:
+            continue
+        if used + len(line) > max_chars:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    lines.reverse()
+    return "\n".join(lines)
+
+
+def _log_cache_metrics(response: Any, model: str) -> None:
+    """Log prompt-cache effectiveness so caching can be verified (CODE_AUDIT T2).
+
+    The cached prefix (tools + system) only pays off if it is byte-identical AND
+    served by the same model turn-to-turn — Anthropic keys the cache per model, so
+    dynamic routing that alternates Haiku/Sonnet/Opus shows ``creation`` (a miss +
+    re-bill) rather than ``read`` on the swapped turn. A steady ``read >> creation``
+    confirms the cache holds.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    read = getattr(usage, "cache_read_input_tokens", 0) or 0
+    creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+    log.debug(
+        "anthropic cache [model=%s]: read=%d creation=%d input=%d",
+        model,
+        read,
+        creation,
+        getattr(usage, "input_tokens", 0) or 0,
+    )
 
 
 def _looks_like_context_overflow(exc: APIStatusError) -> bool:

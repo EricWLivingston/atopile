@@ -1,0 +1,75 @@
+#pragma experiment("BRIDGE_CONNECT")
+
+import ElectricPower
+import ElectricLogic
+import ElectricSignal
+import I2C
+import Capacitor
+
+from "parts/Microchip_Tech_MCP4728_E_UN/Microchip_Tech_MCP4728_E_UN.ato" import Microchip_Tech_MCP4728_E_UN_package
+
+module Microchip_Tech_MCP4728_E_UN:
+    """
+    MCP4728 quad 12-bit I2C DAC with internal voltage reference and EEPROM.
+
+    Per the MCP4728 datasheet (DS22187, Section 4.0 / 4.7):
+      - Each channel can use the internal 2.048 V reference (gain 1 -> 0..2.048 V,
+        gain 2 -> 0..4.096 V) or VDD as reference, selected per channel by software.
+      - Outputs are buffered by an internal rail-to-rail precision amplifier.
+
+    Output update / LDAC (datasheet Section 3.4 / 4.8):
+      - nLDAC high->low transfers all input registers to output registers and
+        updates all four VOUT simultaneously. If nLDAC is tied low, each output
+        updates immediately at the last data-byte ACK.
+
+    Requirements:
+    - R-DAC1: 4-channel 12-bit, I2C, internal 2.048 V reference
+    """
+
+    power = new ElectricPower
+    i2c = new I2C
+    nldac = new ElectricLogic
+    rdy = new ElectricLogic
+    outputs = new ElectricSignal[4]
+
+    package = new Microchip_Tech_MCP4728_E_UN_package
+
+    assert power.voltage within 2.7V to 5.5V
+
+    # ---- Power ----
+    power.hv ~ package.VDD
+    power.lv ~ package.VSS
+
+    # ---- I2C ----
+    i2c.scl.line ~ package.SCL
+    i2c.sda.line ~ package.SDA
+    i2c.scl.reference ~ power
+    i2c.sda.reference ~ power
+    assert i2c.frequency within 100kHz to 3.4MHz
+
+    # ---- LDAC / RDY ----
+    nldac.line ~ package.nLDAC
+    nldac.reference ~ power
+    rdy.line ~ package.RDY_nBSY
+    rdy.reference ~ power
+
+    # ---- Analog outputs ----
+    outputs[0].line ~ package.VOUTA
+    outputs[1].line ~ package.VOUTB
+    outputs[2].line ~ package.VOUTC
+    outputs[3].line ~ package.VOUTD
+    outputs[0].reference ~ power
+    outputs[1].reference ~ power
+    outputs[2].reference ~ power
+    outputs[3].reference ~ power
+
+    # ---- Decoupling: 10uF bulk + 100nF HF (datasheet recommends VDD bypass) ----
+    bulk = new Capacitor
+    bulk.capacitance = 10uF +/- 20%
+    bulk.package = "0805"
+    power.hv ~> bulk ~> power.lv
+
+    decoup = new Capacitor
+    decoup.capacitance = 100nF +/- 10%
+    decoup.package = "0402"
+    power.hv ~> decoup ~> power.lv

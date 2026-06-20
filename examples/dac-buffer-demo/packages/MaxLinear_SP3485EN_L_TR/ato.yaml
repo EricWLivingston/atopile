@@ -1,0 +1,10 @@
+requires-atopile: ^0.14.0
+paths:
+  src: ./
+  layout: ./layouts
+builds:
+  default:
+    entry: MaxLinear_SP3485EN_L_TR.ato:MaxLinear_SP3485EN_L_TR
+package:
+  identifier: local/maxlinear-sp3485en-l-tr
+  version: 0.0.1

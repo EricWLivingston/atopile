@@ -133,6 +133,32 @@ def test_placement_cells_disjoint_and_on_grid():
             assert not overlaps, f"cells of {a} and {b} overlap"
 
 
+def test_placement_overlap_check_warns(caplog):
+    # B7: the disjointness invariant is now checked in code. Feed deliberately
+    # overlapping positions to the checker and assert it warns (never crashes).
+    from faebryk.exporters.schematic.kicad import placement as P
+
+    comps = [_comp("U1", ["a", "b", "c", "d", "e"]), _comp("C1", ["a", "b"])]
+    syms, _ = _setup(comps)
+    items = {c.ref: P._item(c.ref, syms[c.ref]) for c in comps}
+    positions = {"U1": (50.8, 50.8), "C1": (50.8, 50.8)}  # coincident -> overlap
+    with caplog.at_level("WARNING"):
+        P._warn_if_cells_overlap(positions, items)
+    assert any("overlap" in r.message for r in caplog.records)
+
+
+def test_placement_no_overlap_warning_for_real_layout(caplog):
+    comps = [
+        _comp("U1", ["vcc", "gnd", "sda", "scl", "io1"]),
+        _comp("C1", ["vcc", "gnd"]),
+        _comp("R1", ["sda", "vcc"]),
+    ]
+    syms, deg = _setup(comps)
+    with caplog.at_level("WARNING"):
+        place_components(comps, syms, deg)
+    assert not any("overlap" in r.message for r in caplog.records)
+
+
 def test_placement_satellites_orbit_their_anchor():
     comps = [
         _comp("U1", ["vcc", "gnd", "sda", "scl", "io1", "io2"]),
@@ -211,7 +237,7 @@ def test_power_pins_get_stub_wires_to_oriented_glyphs():
     glyph_at = {
         (float(x), float(y), int(r))
         for x, y, r in re.findall(
-            r'\(lib_id "atopile:(?:PWR|GND)_(?!FLAG)[^"]*"\)'
+            r'\(lib_id "atopile:(?:PWR|GND)(?:_(?!FLAG)[^"]*)?"\)'
             r" \(at ([\d.-]+) ([\d.-]+) (\d+)\)",
             doc,
         )

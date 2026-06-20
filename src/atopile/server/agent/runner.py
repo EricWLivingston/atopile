@@ -164,6 +164,57 @@ def _build_turn_time_budget_stop_text(
     )
 
 
+def _build_token_budget_stop_text(
+    total_tokens: int, budget: int, loops: int, traces: list[ToolTrace]
+) -> str:
+    return (
+        f"Stopped after exceeding the per-turn token budget "
+        f"({total_tokens:,}/{budget:,} tokens, {loops} loops, "
+        f"{len(traces)} tool calls). Send another message to continue from here."
+    )
+
+
+def _build_failure_budget_stop_text(
+    build_failures: int, loops: int, traces: list[ToolTrace]
+) -> str:
+    return (
+        f"Stopped after {build_failures} build attempts kept failing "
+        f"({loops} loops, {len(traces)} tool calls). The design still has unresolved "
+        "build errors — review the latest build logs and rethink the approach "
+        "before retrying rather than rebuilding repeatedly."
+    )
+
+
+def _build_attempt_failed(tool_name: str, result_payload: dict[str, Any]) -> bool:
+    """Heuristic: a ``build_logs_search`` result surfacing ERROR/ALERT entries means the
+    last build attempt failed. ``build_run`` is async (it only queues and reports
+    ``success`` immediately), so build failures are invisible to the tool-failure path
+    and only show up when the agent reads the logs."""
+    if tool_name != "build_logs_search":
+        return False
+    # The result is summary/preview text (often truncated); the query that produced it
+    # filtered to ERROR/ALERT levels, so any such entry in the body is a real failure.
+    # Note: the query args are not part of the result, so this can't false-positive on
+    # the requested log_levels.
+    blob = str(result_payload)
+    return '"level": "ERROR"' in blob or '"level": "ALERT"' in blob
+
+
+def _escalate_model(current: str, cfg: AgentConfig) -> str:
+    """Bump the model one tier (simple→standard→complex). No-op at the top tier or when
+    the dynamic tiers aren't configured (``model_complex`` empty)."""
+    complex_m = cfg.model_complex
+    if not complex_m:
+        return current  # dynamic tiers not configured → nothing to escalate to
+    standard_m = cfg.model
+    simple_m = cfg.model_simple or standard_m
+    if current == complex_m:
+        return current
+    if current == simple_m and simple_m != standard_m:
+        return standard_m
+    return complex_m
+
+
 def _build_stop_inputs_for_model() -> list[dict[str, Any]]:
     return [
         {
@@ -263,6 +314,9 @@ class _TurnState:
     force_turn_end: bool = False
     consecutive_empty_continuations: int = 0
     silent_retry_count: int = 0
+    # Count of build attempts that reported ERROR/ALERT logs this turn. Drives model
+    # escalation (Fix 3) and the failure-budget early stop (Fix 5).
+    build_failures: int = 0
     _traces: list[ToolTrace] = field(default_factory=list)
 
 
@@ -716,6 +770,74 @@ class AgentRunner:
             loop_total_tokens_before = telemetry.get("total_tokens", 0)
             loop_reasoning_tokens_before = telemetry.get("reasoning_tokens", 0)
             loop_cached_input_tokens_before = telemetry.get("cached_input_tokens", 0)
+
+            # Spend safeguard: bail gracefully when this turn blows its token budget.
+            # The loop-count / wall-clock caps are too loose to bound a runaway turn, so
+            # cap cumulative tokens directly. ``0`` disables the cap (prior behavior).
+            # getattr: tests drive run_turn with minimal duck-typed configs.
+            max_turn_tokens = getattr(cfg, "max_turn_tokens", 0)
+            if (
+                max_turn_tokens
+                and telemetry.get("total_tokens", 0) >= max_turn_tokens
+            ):
+                await self._emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "thinking",
+                        "step_kind": "turn_stopped",
+                        "reason": "token_budget_exceeded",
+                        "loop": loops,
+                        "status_text": "Stopping: token budget reached",
+                        "detail_text": (
+                            f"{telemetry.get('total_tokens', 0):,}/"
+                            f"{max_turn_tokens:,} tokens"
+                        ),
+                    },
+                )
+                return self._stop(
+                    reason="token_budget_exceeded",
+                    text=_build_token_budget_stop_text(
+                        telemetry.get("total_tokens", 0),
+                        max_turn_tokens,
+                        loops,
+                        traces,
+                    ),
+                    traces=traces,
+                    last_response_id=last_response_id,
+                    skill_state=skill_state,
+                    telemetry=telemetry,
+                )
+
+            # Failure safeguard: stop grinding once builds keep failing this turn (after
+            # the escalation ladder has had its chance). ``0`` disables.
+            max_build_failures = getattr(cfg, "max_build_failures", 0)
+            if (
+                max_build_failures
+                and turn_state.build_failures >= max_build_failures
+            ):
+                await self._emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "thinking",
+                        "step_kind": "turn_stopped",
+                        "reason": "failure_budget_exceeded",
+                        "loop": loops,
+                        "status_text": "Stopping: repeated build failures",
+                        "detail_text": (
+                            f"{turn_state.build_failures} failed build attempts"
+                        ),
+                    },
+                )
+                return self._stop(
+                    reason="failure_budget_exceeded",
+                    text=_build_failure_budget_stop_text(
+                        turn_state.build_failures, loops, traces
+                    ),
+                    traces=traces,
+                    last_response_id=last_response_id,
+                    skill_state=skill_state,
+                    telemetry=telemetry,
+                )
 
             # No tool calls → check phase/checklist/steering, then done
             if not response.tool_calls:
@@ -1280,6 +1402,40 @@ class AgentRunner:
                             "circuit_breaker",
                             {"tool": call.name, "message": trip_msg},
                         )
+
+                # Build-failure tracking. A failing build is invisible to the
+                # tool-failure path above (build_run only queues), so detect it from the
+                # build_logs_search result and (a) escalate the model one tier once it
+                # repeats, (b) feed the failure-budget stop checked at the loop top.
+                if _build_attempt_failed(call.name, result_payload):
+                    turn_state.build_failures += 1
+                    if turn_state.build_failures >= 2:
+                        escalated = _escalate_model(effective_model, cfg)
+                        if escalated != effective_model:
+                            effective_model = escalated
+                            await self._emit_progress(
+                                progress_callback,
+                                {
+                                    "phase": "thinking",
+                                    "step_kind": "model_routed",
+                                    "model": effective_model,
+                                    "reason": "build_failure_escalation",
+                                    "loop": loops,
+                                    "status_text": (
+                                        "Escalating model after repeated build failures"
+                                    ),
+                                    "detail_text": effective_model,
+                                },
+                            )
+                            await self._emit_trace(
+                                active_trace,
+                                "model_escalated",
+                                {
+                                    "loop": loops,
+                                    "model": effective_model,
+                                    "build_failures": turn_state.build_failures,
+                                },
+                            )
 
                 tool_end_payload: dict[str, Any] = {
                     "phase": "tool_end",

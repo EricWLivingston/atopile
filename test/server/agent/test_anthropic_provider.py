@@ -9,16 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
+from typing import Any
 
 from atopile.server.agent._ee.provider_anthropic import (
     AnthropicProvider,
     _build_llm_response,
     _convert_messages_openai_to_anthropic,
     _convert_tool_def,
+    _messages_to_text,
     _normalize_to_openai_shape,
+    _repair_orphaned_tool_uses,
     _shrink_tool_outputs_in_payload,
 )
-
+from atopile.server.agent.config import AgentConfig
 
 # ── tool definition translation ───────────────────────────────────────
 
@@ -136,6 +140,101 @@ def test_convert_messages_with_tool_calls():
             "content": [{"type": "text", "text": "Use the TLV713."}],
         },
     ]
+
+
+def test_convert_messages_parallel_tool_results_lead_user_turn():
+    """Interleaved nudges between parallel tool results must not push a tool_result
+    behind a text block — Anthropic requires tool_results to lead the user turn.
+
+    Mirrors the parallel-``parts_install`` delta that produced a run-killing 400:
+    ``[fco1, user-nudge, fco2, user-nudge]`` was packed as
+    ``[tool_result1, text, tool_result2, text]``.
+    """
+    messages = [
+        {"type": "function_call_output", "call_id": "call_1", "output": "ok1"},
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "parts_install completed. 1"}],
+        },
+        {"type": "function_call_output", "call_id": "call_2", "output": "ok2"},
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "parts_install completed. 2"}],
+        },
+    ]
+    out = _convert_messages_openai_to_anthropic(messages)
+    # Single user turn, with both tool_results before any text block.
+    assert len(out) == 1
+    blocks = out[0]["content"]
+    types = [b["type"] for b in blocks]
+    assert types == ["tool_result", "tool_result", "text", "text"]
+    assert [b["tool_use_id"] for b in blocks[:2]] == ["call_1", "call_2"]
+
+
+def test_repair_orphaned_tool_uses_injects_synthetic_result():
+    """A tool_use with no matching tool_result in the next turn gets a synthetic one."""
+    conversation = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "parts", "input": {}},
+                {"type": "tool_use", "id": "tu_2", "name": "parts", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"},
+            ],
+        },
+    ]
+    _repair_orphaned_tool_uses(conversation)
+    results = {
+        b["tool_use_id"]: b["content"]
+        for b in conversation[1]["content"]
+        if b["type"] == "tool_result"
+    }
+    assert set(results) == {"tu_1", "tu_2"}
+    assert results["tu_2"] == "[no result captured]"
+    # Synthetic result leads the user turn.
+    assert conversation[1]["content"][0]["type"] == "tool_result"
+
+
+def test_repair_orphaned_tool_uses_creates_missing_user_turn():
+    """When the assistant tool_use turn is last, a user turn is created to hold it."""
+    conversation = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "rag_search", "input": {}},
+            ],
+        },
+    ]
+    _repair_orphaned_tool_uses(conversation)
+    assert len(conversation) == 2
+    assert conversation[1]["role"] == "user"
+    assert conversation[1]["content"][0]["tool_use_id"] == "tu_1"
+
+
+def test_repair_orphaned_tool_uses_noop_when_paired():
+    """Fully-paired conversations are left unchanged."""
+    conversation = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "x", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"},
+            ],
+        },
+    ]
+    before = [dict(m) for m in conversation]
+    _repair_orphaned_tool_uses(conversation)
+    assert conversation == before
 
 
 def test_convert_messages_malformed_arguments_default_to_empty():
@@ -286,3 +385,96 @@ def test_compaction_skips_short_histories(anthropic_config):
     short_history = [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
     result = asyncio.run(provider._compact_history(short_history, system="sys"))
     assert result is None
+
+
+# ── prompt caching (T1) ───────────────────────────────────────────────
+
+
+def _capturing_provider(make_anthropic_response, text_block):
+    """An AnthropicProvider whose client records the request payload."""
+    provider = AnthropicProvider(
+        config=AgentConfig(
+            provider="anthropic", base_url="", model="claude-sonnet-4-6",
+            api_key="k",
+        )
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def _create(**payload: Any) -> Any:
+        calls.append(payload)
+        return make_anthropic_response(content=[text_block("ok")])
+
+    provider._client = SimpleNamespace(messages=SimpleNamespace(create=_create))
+    return provider, calls
+
+
+def test_last_tool_def_gets_cache_control(make_anthropic_response, text_block):
+    provider, calls = _capturing_provider(make_anthropic_response, text_block)
+    tools = [
+        {"name": "a", "description": "x", "parameters": {"type": "object"}},
+        {"name": "b", "description": "y", "parameters": {"type": "object"}},
+    ]
+    asyncio.run(
+        provider.complete(
+            messages=[{"role": "user", "content": "hi"}],
+            instructions="sys",
+            tools=tools,
+            skill_state={},
+            project_path=".",
+        )
+    )
+    sent_tools = calls[0]["tools"]
+    # Only the final tool carries the cache breakpoint (Anthropic caches up to it).
+    assert sent_tools[-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in sent_tools[0]
+
+
+def test_no_tools_no_cache_control(make_anthropic_response, text_block):
+    provider, calls = _capturing_provider(make_anthropic_response, text_block)
+    asyncio.run(
+        provider.complete(
+            messages=[{"role": "user", "content": "hi"}],
+            instructions="sys",
+            tools=[],
+            skill_state={},
+            project_path=".",
+        )
+    )
+    assert calls[0]["tools"] == []  # nothing to mark, no crash
+
+
+# ── compaction summarizer input from message tail (T6) ────────────────
+
+
+def test_messages_to_text_renders_roles_and_blocks():
+    msgs = [
+        {"role": "user", "content": "design a divider"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "calling tool"},
+                {
+                    "type": "tool_use",
+                    "name": "pyspice_run",
+                    "input": {"analysis": "op"},
+                },
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "content": "Vout=3.3"}],
+        },
+    ]
+    out = _messages_to_text(msgs, max_chars=10_000)
+    assert "user: design a divider" in out
+    assert "tool_use pyspice_run" in out
+    assert "tool_result Vout=3.3" in out
+
+
+def test_messages_to_text_keeps_recent_tail_within_budget():
+    msgs = [{"role": "user", "content": f"msg {i} " + "x" * 100} for i in range(50)]
+    out = _messages_to_text(msgs, max_chars=300)
+    assert len(out) <= 300 + 120  # bounded (one line of slack)
+    # the most recent message survives; the oldest is dropped
+    assert "msg 49" in out
+    assert "msg 0 " not in out

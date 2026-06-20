@@ -10,8 +10,11 @@ degrades to a structured ``{"success": False, ...}`` payload so a run never cras
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 def _err(err_type: str, rationale: str) -> dict[str, Any]:
@@ -38,10 +41,18 @@ def _run(arguments: dict[str, Any]) -> dict[str, Any]:
             return _err(
                 "missing_netlist", "provide either 'netlist' text or 'netlist_path'"
             )
-        project_root = Path(arguments.get("project_path") or Path.cwd())
+        project_root = Path(arguments.get("project_path") or Path.cwd()).resolve()
         path = Path(raw_path)
         if not path.is_absolute():
             path = project_root / path
+        path = path.resolve()
+        # Containment guard: the agent supplies the path, so confine reads to the
+        # project tree — reject ``..`` escapes / absolute paths outside it.
+        if not path.is_relative_to(project_root):
+            return _err(
+                "invalid_path",
+                "netlist_path must stay within the project directory",
+            )
         if not path.exists():
             return _err("missing_netlist", f"netlist file not found: {path}")
         netlist = path.read_text()
@@ -67,4 +78,7 @@ async def run_pyspice(arguments: dict[str, Any]) -> dict[str, Any]:
     except OSError as e:  # libngspice not loadable
         return _err("dependency_missing", f"libngspice unavailable: {e}")
     except Exception as e:  # noqa: BLE001 - tool must not crash the run
-        return _err("unexpected_error", f"{type(e).__name__}: {e}")
+        # Surface only the exception type; the message body may leak paths/internals
+        # into the transcript. Full detail to the server log (CODE_AUDIT Q1).
+        log.exception("pyspice_run failed")
+        return _err("unexpected_error", type(e).__name__)

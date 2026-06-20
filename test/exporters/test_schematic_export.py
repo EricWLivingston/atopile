@@ -202,6 +202,47 @@ def test_extract_components_from_graph():
 
 
 # --------------------------------------------------------------------------------------
+# Schematic <-> PCB instance-path linkage (KiCad cross-probe)
+# --------------------------------------------------------------------------------------
+def test_stable_uuid_deterministic():
+    import uuid as _uuid
+
+    from faebryk.libs.kicad.identity import stable_uuid
+
+    # Stable across calls, distinct per key, and a valid UUID.
+    assert stable_uuid("filter.opamp.package") == stable_uuid("filter.opamp.package")
+    assert stable_uuid("a.b") != stable_uuid("a.c")
+    _uuid.UUID(stable_uuid("anything"))
+
+
+def test_compute_instance_paths_match_symbol_instances():
+    """Each component's computed instance path must equal its schematic symbol path.
+
+    This is the guarantee the PCB linkage relies on: the transformer stamps footprints
+    with ``compute_instance_paths`` output, and the schematic emits the same paths, so
+    KiCad cross-probes symbol <-> footprint.
+    """
+    app = _build_synthetic_app()
+    comps, nets = extract_components(app)
+
+    # Every component carries an atopile address (the footprint key).
+    assert all(c.address for c in comps)
+
+    paths = S.compute_instance_paths(comps, app, root_stem="syn")
+    # Deterministic across calls.
+    again = S.compute_instance_paths(comps, app, root_stem="syn")
+    assert {k: v.full_path for k, v in paths.items()} == {
+        k: v.full_path for k, v in again.items()
+    }
+
+    files, _ = S.render_hierarchical(comps, nets, app, root_stem="syn", search_dirs=[])
+    sym_inst = files["syn.kicad_sch"].split("(symbol_instances")[-1]
+    sch_paths = set(re.findall(r'\(path "(/[^"]+)"', sym_inst))
+    for comp in comps:
+        assert paths[comp.address].full_path in sch_paths
+
+
+# --------------------------------------------------------------------------------------
 # Real symbol regeneration
 # --------------------------------------------------------------------------------------
 def _load_first_real_symbol() -> SymbolDef:
@@ -218,6 +259,10 @@ def test_build_real_symbol_structure():
     assert sym.lib_id.startswith("atopile:")
     assert f'(symbol "{sym.lib_id}"' in sym.lib_symbol_text
     assert sym.pin_xy  # at least one pin with geometry
+    # Pin names must render *inside* the body (positive offset) so they don't overlap the
+    # pin numbers. The cached test symbol omits (pin_names …), exercising the default.
+    assert "(pin_names (offset 0))" not in sym.lib_symbol_text
+    assert "(pin_names (offset 0.508))" in sym.lib_symbol_text
 
 
 def _wrap_two_instances(sym: SymbolDef) -> str:
@@ -626,7 +671,8 @@ def test_render_sheet_tree_power_symbols_replace_labels():
     assert summary.power_symbols == 2  # VCC + GND pins
     assert summary.labels == 1  # only the signal pin is labelled
     assert doc.count("(global_label") == 1
-    assert "atopile:PWR_VCC" in doc and "atopile:GND_GND" in doc
+    # The ground net is already named "GND", so its symbol id is not doubled (no "GND_GND").
+    assert "atopile:PWR_VCC" in doc and "atopile:GND" in doc and "atopile:GND_GND" not in doc
     # exactly one PWR_FLAG driver per rail net
     assert doc.count('(reference "#FLG') == 2
 
@@ -647,10 +693,12 @@ def test_power_app_rails_connect_via_power_symbols(tmp_path: Path):
     out = tmp_path / "out"
     out.mkdir()
 
-    # Rails connect through the power symbols (by power-pin name).
+    # Rails connect through the power symbols (by power-pin name). The ground rail (lv) is
+    # auto-named "GND" by the net-naming pass; the hv rail has no solved voltage here so it
+    # keeps the generic "hv".
     got = _kicad_netlist_membership(tmp_path / "pwr.kicad_sch", out)
     assert got.get("hv") == {"R1.1", "R2.1"}
-    assert got.get("lv") == {"R1.2", "R2.2"}
+    assert got.get("GND") == {"R1.2", "R2.2"}
 
     # The PWR_FLAG drivers keep ERC error-free.
     root_path = tmp_path / "pwr.kicad_sch"
@@ -727,3 +775,40 @@ def test_export_schematic_cleans_stale_children(tmp_path: Path):
 
     assert out.exists()
     assert not stale.exists()  # leftover from a prior build is removed
+
+
+# --------------------------------------------------------------------------------------
+# Q4/Q5: symbol-parse warning + per-path real-symbol cache
+# --------------------------------------------------------------------------------------
+def test_real_symbol_parse_failure_warns(tmp_path, caplog):
+    # A file that isn't a valid .kicad_sym must fall back to None *and* warn the user
+    # (the component otherwise silently drops to a generic box) — CODE_AUDIT Q4.
+    from faebryk.exporters.schematic.kicad.real_symbol import real_symbol_from_file
+
+    bad = tmp_path / "broken.kicad_sym"
+    bad.write_text("this is not an s-expression symbol file")
+    with caplog.at_level("WARNING"):
+        assert real_symbol_from_file(bad) is None
+    assert any("generic box" in r.message for r in caplog.records)
+
+
+def test_symbol_registry_caches_real_symbol_by_path(monkeypatch, tmp_path):
+    # Two components backed by the same .kicad_sym must parse the file once (Q5).
+    sym_path = tmp_path / "part.kicad_sym"
+    sym = build_generic_symbol("atopile:CACHED", ["1", "2"])
+    calls = {"n": 0}
+
+    def fake_real(path):
+        calls["n"] += 1
+        return sym
+
+    monkeypatch.setattr(S, "_find_symbol_file", lambda module, dirs: sym_path)
+    monkeypatch.setattr(S, "real_symbol_from_file", fake_real)
+
+    reg = S._SymbolRegistry(search_dirs=[])
+    sentinel = object()
+    c1 = ComponentIR(ref="R1", value="", pins=[PinIR("1", "a")], module=sentinel)
+    c2 = ComponentIR(ref="R2", value="", pins=[PinIR("1", "a")], module=sentinel)
+    assert reg.resolve(c1) is sym
+    assert reg.resolve(c2) is sym
+    assert calls["n"] == 1  # parsed once, served from cache the second time

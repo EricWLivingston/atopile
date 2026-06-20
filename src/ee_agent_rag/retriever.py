@@ -20,6 +20,9 @@ from .config import (
 from .embed import OpenAIEmbedder
 from .store import CorpusStore
 
+# Bump to force-invalidate the on-disk rerank cache (CODE_AUDIT Q6).
+_RERANK_CACHE_VERSION = 1
+
 
 def reciprocal_rank_fusion(*ranked_lists: list[dict], k: int = RRF_K) -> list[dict]:
     """Merge ranked hit-lists by RRF. Each hit is a dict with an ``id`` key.
@@ -58,8 +61,14 @@ def _cohere_rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]
 
     documents = [c["content"] for c in candidates]
     top_n = min(top_k, len(candidates))
+    # The full document *text* is part of the key, so a re-ingest that changes a chunk's
+    # content already busts the cache. _RERANK_CACHE_VERSION is a manual escape hatch:
+    # bump it to force-invalidate every entry if the rerank semantics themselves change
+    # (CODE_AUDIT Q6).
     digest = hashlib.sha256(
-        json.dumps([RERANK_MODEL, query, top_n, documents]).encode()
+        json.dumps(
+            [_RERANK_CACHE_VERSION, RERANK_MODEL, query, top_n, documents]
+        ).encode()
     ).hexdigest()
     cache_path = RERANK_CACHE / f"{digest}.json"
 
@@ -136,7 +145,9 @@ def rag_search(
     for c in corpora:
         store = CorpusStore(c)
         dense = store.dense_search(qvec, k=top_k * DENSE_OVERSAMPLE, filter=filter)
-        sparse = store.sparse_search(query, k=SPARSE_K) if not filter else []
+        # Pass the filter through: BM25 applies it post-hoc so a filtered query keeps
+        # hybrid (dense+sparse) recall instead of silently degrading to dense-only.
+        sparse = store.sparse_search(query, k=SPARSE_K, filter=filter)
         all_candidates.extend(reciprocal_rank_fusion(dense, sparse))
 
     # Re-fuse across corpora by RRF score order, cap, then cross-corpus rerank.

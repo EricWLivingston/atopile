@@ -1,0 +1,73 @@
+#pragma experiment("BRIDGE_CONNECT")
+#pragma experiment("TRAITS")
+
+import ElectricPower
+import ElectricLogic
+import Capacitor
+import Resistor
+import can_bridge_by_name
+
+from "parts/Texas_Instruments_LP5907MFX_3_3_NOPB/Texas_Instruments_LP5907MFX_3_3_NOPB.ato" import Texas_Instruments_LP5907MFX_3_3_NOPB_package
+
+module Texas_Instruments_LP5907MFX_3_3_NOPB:
+    """
+    LP5907 250 mA ultra-low-noise LDO, fixed 3.3 V output.
+
+    Low-noise analog supply regulator (10 uVrms output noise, 82 dB PSRR @ 1 kHz).
+
+    Support circuitry per TI LP5907 datasheet (SNVS758) and the LDO application
+    note SLVA079 (input/output ceramic bypass for stability):
+      - 1 uF ceramic input capacitor (CIN)
+      - 1 uF ceramic output capacitor (COUT) for loop stability
+      - 10 nF noise-reduction capacitor on the EN node lowers output noise
+        (CNR/EN soft-start network) per the LP5907 datasheet.
+
+    Requirements:
+    - R-LDO1: Vin 4.5-5.5 V, Vout 3.3 V regulated, clean for analog loads
+    """
+
+    power_in = new ElectricPower
+    power_out = new ElectricPower
+    en = new ElectricLogic
+
+    package = new Texas_Instruments_LP5907MFX_3_3_NOPB_package
+
+    # ---- Power rails ----
+    power_in.hv ~ package.IN
+    power_in.lv ~ package.GND
+    power_out.hv ~ package.OUT
+    power_out.lv ~ package.GND
+
+    assert power_in.voltage within 4.5V to 5.5V
+    assert power_out.voltage within 3.3V +/- 2%
+
+    # ---- Enable ----
+    en.line ~ package.EN
+    en.reference ~ power_in
+
+    # EN pull-up so the regulator is enabled by default (tie EN high to VIN).
+    en_pullup = new Resistor
+    en_pullup.resistance = 100kohm +/- 5%
+    en_pullup.package = "0402"
+    package.EN ~> en_pullup ~> package.IN
+
+    # ---- Input / output bypass (cited: SLVA079 input/output ceramic bypass) ----
+    cin = new Capacitor
+    cin.capacitance = 1uF +/- 10%
+    cin.package = "0603"
+    cin.lcsc_id = "C106858"
+    power_in.hv ~> cin ~> power_in.lv
+
+    cout = new Capacitor
+    cout.capacitance = 1uF +/- 10%
+    cout.package = "0603"
+    cout.lcsc_id = "C106858"
+    power_out.hv ~> cout ~> power_out.lv
+
+    # ---- Noise-reduction cap on EN node (cited: LP5907 datasheet CNR/EN) ----
+    cnr = new Capacitor
+    cnr.capacitance = 10nF +/- 10%
+    cnr.package = "0402"
+    package.EN ~> cnr ~> package.GND
+
+    trait can_bridge_by_name<input_name="power_in", output_name="power_out">

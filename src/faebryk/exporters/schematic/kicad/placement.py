@@ -28,10 +28,13 @@ Lattice origins put every pin on KiCad's wiring grid — required for manual wir
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
 from faebryk.exporters.schematic.kicad.generic_symbol import SymbolDef
+
+logger = logging.getLogger(__name__)
 
 GRID_SNAP = 2.54
 CELL_MARGIN = 15.24  # per side; holds stub(5.08) + glyph(2.54) + label clearance
@@ -195,7 +198,51 @@ def place_components(
         x += cl.w
         row_h = max(row_h, cl.h)
 
+    _warn_if_cells_overlap(positions, items)
     return positions
+
+
+def _cell_box(
+    origin: tuple[float, float], it: _Item
+) -> tuple[float, float, float, float]:
+    """Schematic-space ``(left, top, right, bottom)`` of a component's cell (bbox
+    grown by ``CELL_MARGIN``). Symbol Y flips on instantiation, so ``dy_min`` is the
+    extent *above* the origin (smaller schematic y) and ``dy_max`` the extent below."""
+    x, y = origin
+    return (
+        x - it.dx_min - CELL_MARGIN,
+        y - it.dy_min - CELL_MARGIN,
+        x + it.dx_max + CELL_MARGIN,
+        y + it.dy_max + CELL_MARGIN,
+    )
+
+
+def _warn_if_cells_overlap(
+    positions: dict[str, tuple[float, float]], items: dict[str, _Item]
+) -> None:
+    """Verify in code the disjointness the module docstring asserts: overlapping
+    cells can let the emitter's pin stubs/glyphs from two components merge nets
+    geometrically. Cells are designed edge-tangent, so only a real interior overlap
+    (> eps) is flagged — warn rather than crash so a placement quirk never blocks a
+    build (CODE_AUDIT B7).
+    """
+    eps = 1e-6
+    boxes = {r: _cell_box(positions[r], items[r]) for r in positions if r in items}
+    refs = list(boxes)
+    for i, a in enumerate(refs):
+        ax0, ay0, ax1, ay1 = boxes[a]
+        for b in refs[i + 1:]:
+            bx0, by0, bx1, by1 = boxes[b]
+            if (
+                min(ax1, bx1) - max(ax0, bx0) > eps
+                and min(ay1, by1) - max(ay0, by0) > eps
+            ):
+                logger.warning(
+                    "schematic placement: cells for %s and %s overlap — pin "
+                    "stubs/labels may merge nets; check the rendered sheet.",
+                    a,
+                    b,
+                )
 
 
 def sheet_extent(

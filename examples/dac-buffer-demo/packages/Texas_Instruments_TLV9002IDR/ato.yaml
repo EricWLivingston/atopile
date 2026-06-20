@@ -1,0 +1,10 @@
+requires-atopile: ^0.14.0
+paths:
+  src: ./
+  layout: ./layouts
+builds:
+  default:
+    entry: Texas_Instruments_TLV9002IDR.ato:Texas_Instruments_TLV9002IDR
+package:
+  identifier: local/texas-instruments-tlv9002idr
+  version: 0.0.1

@@ -49,10 +49,15 @@ LLAMA_PARSE_BASE_URL = os.environ.get(
 )
 
 # --- Retrieval knobs --------------------------------------------------------------
-DENSE_OVERSAMPLE = 4  # dense pre-fetch = top_k * this
+# Cohere bills per reranked document and over-fetching adds latency to every agent
+# rag_search, so these are kept to the smallest values that still comfortably cover a
+# top_k=5 query (CODE_AUDIT T4). DENSE_OVERSAMPLE=3 -> 15 dense candidates; reranking 20
+# fused candidates. A full eval sweep (python -m ee_agent_rag.eval.runner) can push
+# these lower if recall@5 holds; raise them in the notebook if recall regresses.
+DENSE_OVERSAMPLE = 3  # dense pre-fetch = top_k * this (was 4)
 SPARSE_K = 20  # BM25 candidates
 RRF_K = 60  # reciprocal-rank-fusion constant
-RERANK_CANDIDATES = 30  # how many fused candidates to hand the reranker
+RERANK_CANDIDATES = 20  # how many fused candidates to hand the reranker (was 30)
 
 # --- Chunking caps (approx tokens) ------------------------------------------------
 DATASHEET_MAX_TOKENS = 3000

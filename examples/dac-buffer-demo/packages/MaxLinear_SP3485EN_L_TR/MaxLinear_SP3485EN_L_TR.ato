@@ -1,0 +1,68 @@
+#pragma experiment("BRIDGE_CONNECT")
+
+import ElectricPower
+import ElectricLogic
+import RS485HalfDuplex
+import Capacitor
+
+from "parts/MaxLinear_SP3485EN_L_TR/MaxLinear_SP3485EN_L_TR.ato" import MaxLinear_SP3485EN_L_TR_package
+
+module MaxLinear_SP3485EN_L_TR:
+    """
+    MaxLinear SP3485 half-duplex RS-485/RS-422 transceiver.
+
+    Single 3.3 V supply (SP3485 datasheet: "Operates from a single 3.3V
+    supply"). Standard 75176 pinout. Logic side exposed as ElectricLogic:
+    - di   : Driver input  (pin 4, DI)
+    - ro   : Receiver output (pin 1, RO)
+    - de   : Driver enable, active HIGH (pin 3, DE)
+    - nre  : Receiver enable, active LOW (pin 2, RE)
+    Bus side exposed as the stdlib RS485HalfDuplex interface (A = diff_pair.p,
+    B = diff_pair.n), mapped to A (pin 6) and B (pin 7).
+
+    Decoupling: 0.1 uF VCC bypass close to the device (standard RS-485
+    transceiver practice).
+
+    Requirements:
+    - R-485-1: 3.3 V powered half-duplex transceiver; logic + DE/nRE exposed,
+      A/B differential pair brought out on RS485HalfDuplex.
+    """
+
+    # ---- Public interfaces ----
+    power = new ElectricPower
+    assert power.voltage within 3.0V to 3.6V
+
+    di = new ElectricLogic     # driver input
+    ro = new ElectricLogic     # receiver output
+    de = new ElectricLogic     # driver enable (active HIGH)
+    nre = new ElectricLogic    # receiver enable (active LOW)
+
+    rs485 = new RS485HalfDuplex
+
+    package = new MaxLinear_SP3485EN_L_TR_package
+
+    # ---- Power ----
+    power.hv ~ package.VCC
+    power.lv ~ package.GND
+
+    # ---- VCC bypass: 0.1 uF close to device ----
+    bypass = new Capacitor
+    bypass.capacitance = 100nF +/- 10%
+    bypass.package = "0402"
+    power.hv ~> bypass ~> power.lv
+
+    # ---- Logic side ----
+    di.line ~ package.DI
+    ro.line ~ package.RO
+    de.line ~ package.DE
+    nre.line ~ package.nRE
+    di.reference ~ power
+    ro.reference ~ power
+    de.reference ~ power
+    nre.reference ~ power
+
+    # ---- Bus side (A = p, B = n) ----
+    rs485.diff_pair.p.line ~ package.A
+    rs485.diff_pair.n.line ~ package.B
+    rs485.diff_pair.p.reference ~ power
+    rs485.diff_pair.n.reference ~ power

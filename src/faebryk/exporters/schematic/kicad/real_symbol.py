@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 _FONT = "(effects (font (size 1.27 1.27)))"
 
+# KiCad's DEFAULT_PIN_NAME_OFFSET (20 mil). Pin names render *inside* the body at this
+# offset; an offset of 0 pushes them *outside* onto the pin numbers (overlap bug). Cached
+# .kicad_sym files often omit the (pin_names …) token, so we must supply KiCad's real
+# default rather than 0 when it is absent.
+_DEFAULT_PIN_NAME_OFFSET = 0.508
+
 
 def _stroke(stroke) -> str:
     width = getattr(stroke, "width", 0.0) or 0.0
@@ -108,7 +114,11 @@ def build_real_symbol(lib_id: str, sym_file) -> SymbolDef | None:
     header_bits: list[str] = []
     if top.pin_numbers is not None:
         header_bits.append("(pin_numbers hide)")
-    offset = top.pin_names.offset if top.pin_names is not None else 0
+    offset = (
+        top.pin_names.offset
+        if top.pin_names is not None
+        else _DEFAULT_PIN_NAME_OFFSET
+    )
     header_bits.append(f"(pin_names (offset {offset}))")
     header_bits.append("(in_bom yes) (on_board yes)")
 
@@ -189,12 +199,20 @@ def real_symbol_from_file(path: Path) -> SymbolDef | None:
     try:
         sym_file = kicad.loads(kicad.symbol.SymbolFile, path)
     except Exception as ex:  # noqa: BLE001 - any parse failure -> generic fallback
-        logger.debug("Could not load symbol %s: %s", path, ex)
+        # Warn (not debug): the component drops to a generic box, which is electrically
+        # complete but less readable — the user should know (CODE_AUDIT Q4).
+        logger.warning(
+            "Could not parse symbol %s (%s); using a generic box instead.", path, ex
+        )
         return None
     symbols = sym_file.kicad_sym.symbols
     if not symbols:
+        logger.warning("Symbol file %s has no symbols; using a generic box.", path)
         return None
     name = symbols[0].name
     if ":" in name:  # renaming would break the child-unit name prefix
+        logger.warning(
+            "Symbol %s name %r contains ':'; using a generic box.", path, name
+        )
         return None
     return build_real_symbol(f"atopile:{name}", sym_file)

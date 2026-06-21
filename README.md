@@ -7,121 +7,129 @@
 </h1>
 
 <p align="center">
-  <a href="https://pypi.org/project/atopile/"><img alt="PyPI" src="https://img.shields.io/pypi/v/atopile.svg"></a>
-  <a href="https://docs.atopile.io/"><img alt="Docs" src="https://img.shields.io/badge/docs-atopile.io-blue"></a>
-  <a href="https://packages.atopile.io/"><img alt="Packages" src="https://img.shields.io/badge/packages-registry-brightgreen"></a>
-  <a href="https://discord.gg/CRe5xaDBr3"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green"></a>
+  <b>EE Agent fork of atopile</b> — an AI electrical-engineering design agent built on top of the atopile compiler.
 </p>
-
-## Design circuit boards with code
-
-Write hardware like software. atopile is a language, compiler, and toolchain for electronics—declarative `.ato` files, deep validation, and layout that works natively with KiCad.
 
 <p align="center">
-  <img src="assets/tool.jpeg" alt="atopile editor with a project open" width="1152">
+  <a href="https://github.com/atopile/atopile">Upstream atopile</a> ·
+  <a href="https://docs.atopile.io/">atopile docs</a> ·
+  <a href="LICENSE">MIT License</a>
 </p>
 
-## Why atopile
+---
 
-- Reusable modules instead of starting from scratch every time
-- Capture intent with equations directly in your design
-- Automatic parametric picking of discrete components
+> **This is a fork.** It tracks [atopile/atopile](https://github.com/atopile/atopile) and adds
+> an EE design agent plus the infrastructure it needs (a dual-provider LLM runner, three custom
+> design tools, a KiCad schematic emitter, human-readable net naming, and parametric diode
+> picking). For the base language, compiler, and toolchain, see the
+> [upstream README](https://github.com/atopile/atopile/blob/main/README.md) and
+> [docs.atopile.io](https://docs.atopile.io/). Everything below is **what this fork adds.**
 
-## Install
+## What this fork adds
 
-The easiest way is via the editor extension—it installs and manages `ato` for you:
+atopile lets you describe electronics as code (`.ato`) and compiles them to a BOM, netlist, and
+KiCad layout. This fork wraps an **agent** around that compiler: it researches a design against an
+indexed knowledge base, authors `.ato`, simulates analog subcircuits, drives the build, and emits a
+human-readable KiCad schematic — switchable between OpenAI and Anthropic models, with per-turn
+model routing for cost control. The agent runs in the existing atopile VS Code extension sidebar.
 
-- VS Code/Cursor extension: https://marketplace.visualstudio.com/items?itemName=atopile.atopile
+This is an **early prototype**: the core agent loop, the three tools, and the schematic/net-naming
+pipeline are working and tested, but several pieces are stubs or single-vendor (see
+[Known limitations](#known-limitations--status)).
 
-Advanced setups and CLI installs: https://docs.atopile.io/atopile/guides/install
+## Features
 
-## Quickstart (2 minutes)
+### Dual-provider agent runner — `src/atopile/server/agent/_ee/`
+- **`AnthropicProvider`** (`provider_anthropic.py`) implements atopile's `LLMProvider` protocol
+  alongside the existing OpenAI provider. It emulates the OpenAI stateful Responses API on top of
+  Anthropic's stateless Messages API via an LRU transcript store, and repairs orphaned
+  `tool_use`/`tool_result` pairs (the failure class that froze multi-turn runs).
+- **Dynamic model routing** (`model_router.py`) — a per-turn complexity classifier routes calls to
+  Haiku / Sonnet / Opus tiers, with a content-based floor and mid-turn escalation on repeated build
+  failures. Off by default; opt-in, Anthropic-only.
+- **Runner safeguards** — per-turn token budget, build-failure detection (the async build queue
+  otherwise hides failures from the circuit breaker), and tightened loop/time caps.
 
-1. Install the extension (link above)
+### Custom agent tools — `_ee/tools_*.py` + framework-agnostic packages
+- **`rag_search`** — retrieval over a datasheet/app-note corpus: `src/ee_agent_rag/`
+  (Chroma · LlamaParse-REST · OpenAI embeddings · Cohere rerank, RRF fusion). Tuned to recall@5 ≈
+  0.98 on a 50-question eval; thin wrapper degrades to `{ok: false}` on any failure.
+- **`pyspice_run`** — simulates an agent-authored SPICE netlist: `src/ee_agent_spice/`
+  (PySpice + libngspice, bundled discrete models). Returns per-probe min/max/mean only;
+  persists full vectors to disk.
+- **`skills_list` / `skill_read`** (`tools_skills.py`) — on-demand skill discovery so the agent
+  pulls per-tool guidance just-in-time instead of always-loading it.
+- **`ipc_check`** — registered, schema'd graceful **stub** (body TBD).
 
-2. In the editor, run “atopile: Open Example” and pick one
+### KiCad schematic emitter — `src/faebryk/exporters/schematic/`
+atopile had no Python `.kicad_sch` writer; this adds one (emitting S-expression text directly,
+because `kicad.dumps` mis-writes schematics). Build step `generate_schematic` writes
+`<output>.kicad_sch`. Modes (`export_schematic(mode=…)`): **hierarchical** (default — one sheet per
+`.ato` module, global labels = a valid netlist), **wired** (provably short-free ladder routing), and
+**labels**. Real cached symbols are regenerated into the schematic's native grammar; rails render as
+KiCad power symbols. Sheet grouping is refined by connectivity (`schematic.py`:
+`_pull_in_by_connectivity`, `_flatten_small_leaves`) so parent-level passives land on the subcircuit
+they belong to.
 
-3. Press the ▶ in the ato menu bar to build, or run `ato build` from the terminal
+### Human-readable net naming — `src/faebryk/libs/net_naming.py`
+Voltage-aware power rails (`+5V` / `+3V3` / `+12V`, from the tightest-spec member), a single shared
+`GND` with a fragmentation warning, and an IC-pin fallback for unnamed nets — so the emitted
+schematic labels read like a human drew them.
 
-4. Open layout when ready
+### Parametric diode auto-picking — `src/faebryk/library/Diode.py`, `Pickable.py`
+Adds the `DIODES` query endpoint + `is_pickable_by_type` to `Diode`, fixing the silent "ghost
+component" drop where an un-pickable diode vanished from the BOM/netlist/PCB while its nets
+remained. (MOSFET/LED auto-pick is scoped but deliberately deferred.)
 
-Notes:
+### Agent run-log viewer — `src/ui-server/`, `src/vscode-atopile/`
+A new "Agent" mode in the extension's Logs tab streams the agent's own run log
+(`agent_events`), so planning, tool calls, and `run_failed` are visible live.
 
-- The ato menu bar is in the bottom-left of your VS Code/Cursor window
-- KiCad is optional to get started. Without it, you won’t open the PCB, but builds still run and update the `.kicad_pcb`. Install later when you’re ready for layout: https://docs.atopile.io/atopile/quickstart
+## Configuration
 
-## How it works
+The provider and agent behaviour are env-driven (read once at process start — **restart the backend
+/ reload the VS Code window after changing them**):
 
-- `ato` is a declarative language for electronics: modules, interfaces, units, tolerances, and assertions
-- The compiler solves constraints, picks parts, runs checks, and updates your KiCad layout
-- The extension adds language services and one‑click controls
-  
-Learn more: https://docs.atopile.io/atopile/essentials/1-the-ato-language
+| Variable | Purpose |
+|---|---|
+| `EE_AGENT_PROVIDER` | `openai` (default, upstream behaviour) or `anthropic` |
+| `ATOPILE_AGENT_ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY` | Anthropic credentials |
+| `EE_AGENT_DYNAMIC_MODEL` | `1` enables per-turn model routing (Anthropic only; off by default) |
+| `ATOPILE_AGENT_MODEL_COMPLEX` | complex-tier model (default Sonnet; set to `claude-opus-4-8` to opt into Opus) |
+| `ATOPILE_AGENT_MAX_TURN_TOKENS` / `ATOPILE_AGENT_MAX_BUILD_FAILURES` | per-turn spend / failure budgets |
+| `OPENAI_API_KEY` / `LLAMA_CLOUD_API_KEY` / `COHERE_API_KEY` | `rag_search` ingest + query (see `.env.example`) |
+| `EE_DATA_ROOT` | RAG corpus/index root (defaults to the source tree) |
+| `EE_SPICE_NGSPICE_LIB` / `EE_SPICE_TIMEOUT_S` | libngspice path override / sim wall-clock timeout |
 
-### Where atopile fits in
+`rag_search` needs a `brew`/pip RAG stack; `pyspice_run` needs `brew install ngspice` (libngspice 46).
 
-High-level steps:
+## Testing
 
-- Requirements — capture specs with units, tolerances, and assertions
-- Component selection — parametric picking, reuse proven modules
-- Design capture — `.ato` modules and interfaces compose your system
-- Layout — place and route in KiCad
-- Checks — run design checks locally or in CI
-- Build outputs — BOM, fabrication and assembly data, reports
-- PCB fab/assembly — send outputs to your manufacturer
+Run the suite with `ato dev test` (or `pytest -q`). The fork adds **18 test files / ~195 tests**:
 
-## Example Projects
+- `test/server/agent/` — Anthropic provider, model router, runner safeguards, tool plumbing
+- `test/exporters/` — schematic emitter + connectivity placement
+- `test/ee_agent_rag/` — RAG pipeline + table-fidelity
+- `test/ee_agent_spice/` — SPICE runner (+ a live, auto-skipped tier)
 
-- Open examples via the editor (“atopile: Open Example”) https://github.com/atopile/atopile/tree/main/examples
-- NONOS — Open-source smart speaker https://github.com/atopile/nonos
-- DSP - Open-source multi-channel DSP https://github.com/atopile/dsp
-- AI-Pin — Vibe-coded Humane Pin https://github.com/atopile/ai-pin
-- Hyperion — 300K nit display for raves https://github.com/atopile/hyperion
-- Cellsim - 18 channel battery cell simulator https://github.com/atopile/cellsim
-- ESPaper - ESP32 epaper display driver https://github.com/atopile/hivehaus/tree/master/src/products/espaper
+## Known limitations & status
 
-## Packages and parts
-
-- Browse and install modules from the registry: https://packages.atopile.io
-- Guide: https://docs.atopile.io/atopile/essentials/4-packages
-- Publish your own: https://docs.atopile.io/atopile/guides/publish
-
-## Compatibility
-
-- OS: macOS, Linux, Windows (WSL recommended)
-- Recommended editors: VS Code / Cursor
-- EDA: KiCad recommended for layout; not required to start
-
-## Contributing and development
-
-- Development setup: https://docs.atopile.io/atopile/guides/development
-- Editable install (for working on atopile itself): https://docs.atopile.io/atopile/guides/install#editable-installation-best-for-development
-- Run tests:
-
-```sh
-pytest -q
-```
-
-- Fast worktree setup (CoW-clone `.venv` + Zig cache/output, then path rewrite):
-
-```sh
-ato dev worktree <suffix>
-cd ../atopile_<suffix>
-source .venv/bin/activate
-ato --help
-```
-
-By default this command starts an interactive shell in the new worktree.
-Pass `--no-cd` to skip shell handoff.
-
-- Issues and feature requests: https://github.com/atopile/atopile/issues
-
-## Support
-
-- Discord “help” channel: https://discord.gg/CRe5xaDBr3
-- Commercial support: hi@atopile.io
+- **`ipc_check` is a stub** — registered and model-callable, but returns a placeholder; it depends on
+  a standards corpus (IPC-2221/2152) not yet ingested.
+- **Single-vendor auto-pick** — only diodes auto-pick; MOSFETs/LEDs/other actives remain manual.
+- **Silent-ghost UX** — an un-pickable, un-footprinted module still logs only `ATTENTION: …` and the
+  build reports success (`src/faebryk/libs/picker/picker.py:165`); diodes are fixed, other types are
+  not. Promoting that to a visible warning is a one-line policy change with upstream-visible impact.
+- **Schematic real-symbol lookup** misses parts whose cached directory name doesn't match the
+  sanitized manufacturer string — they fall back to a (electrically complete) generic box.
+- **Dynamic routing is Anthropic-only and per-turn** — because the agent runs a whole design as one
+  turn, the per-turn route effectively pins the whole run; the OpenAI path is unverified for mid-chain
+  model switches, so routing is forced off there. The per-turn token budget does **not** count cache
+  reads.
+- **RAG corpus is datasheets + app-notes only** — standards/textbook chunkers are pending.
+- **`kicad.dumps` for schematics is broken upstream** — worked around by emitting S-expression text;
+  a clean upstream fix is a contribution candidate.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT — same as upstream atopile. See `LICENSE`.

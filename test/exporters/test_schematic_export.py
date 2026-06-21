@@ -461,6 +461,98 @@ def test_build_sheet_tree_flat_without_ato_modules():
     assert len(root.walk()) == 1
 
 
+# --------------------------------------------------------------------------------------
+# Connectivity-aware sheet grouping (pull-in + flatten)
+# --------------------------------------------------------------------------------------
+def test_pull_in_moves_orphan_to_dominant_child():
+    """A parent-level passive wired only to a child's IC is pulled onto the child sheet."""
+    root = S.SheetIR(name="root", node_id="r")
+    child = S.SheetIR(
+        name="rs485",
+        node_id="b",
+        components=[
+            ComponentIR("U1", "", [PinIR("1", "A"), PinIR("2", "B"), PinIR("3", "GND")])
+        ],
+    )
+    root.children = [child]
+    # 120R termination declared at the parent level, touching only the dedicated A/B nets.
+    root.components = [ComponentIR("R9", "120", [PinIR("1", "A"), PinIR("2", "B")])]
+
+    S._pull_in_by_connectivity(root)
+
+    assert [c.ref for c in root.components] == []
+    assert {c.ref for c in child.components} == {"U1", "R9"}
+
+
+def test_pull_in_keeps_rail_only_component_on_parent():
+    """A component sharing only a high-degree rail with a child is NOT pulled in."""
+    root = S.SheetIR(name="root", node_id="r")
+    child = S.SheetIR(
+        name="c",
+        node_id="c",
+        components=[
+            ComponentIR(
+                "U1",
+                "",
+                [PinIR(str(i), "GND") for i in range(1, 4)] + [PinIR("4", "SIG")],
+            )
+        ],
+    )
+    root.children = [child]
+    root.components = [ComponentIR("C1", "", [PinIR("1", "GND"), PinIR("2", "VCC")])]
+
+    S._pull_in_by_connectivity(root)
+
+    assert {c.ref for c in root.components} == {"C1"}
+
+
+def test_pull_in_keeps_interconnect_on_ancestor():
+    """A series element bridging two child sheets stays on the common ancestor."""
+    root = S.SheetIR(name="root", node_id="r")
+    a = S.SheetIR(name="a", node_id="a", components=[ComponentIR("U1", "", [PinIR("1", "X")])])
+    b = S.SheetIR(name="b", node_id="b", components=[ComponentIR("U2", "", [PinIR("1", "Y")])])
+    root.children = [a, b]
+    root.components = [ComponentIR("R1", "", [PinIR("1", "X"), PinIR("2", "Y")])]
+
+    S._pull_in_by_connectivity(root)
+
+    assert {c.ref for c in root.components} == {"R1"}
+
+
+def test_flatten_merges_small_leaf_into_parent():
+    """A tiny leaf sub-module collapses into its (non-root) functional parent."""
+    root = S.SheetIR(name="root", node_id="r")
+    parent = S.SheetIR(
+        name="filter", node_id="f", components=[ComponentIR("R1", "", [PinIR("1", "N")])]
+    )
+    leaf = S.SheetIR(
+        name="opamp",
+        node_id="o",
+        components=[
+            ComponentIR("U1", "", [PinIR("1", "N")]),
+            ComponentIR("C1", "", [PinIR("1", "N")]),
+        ],
+    )
+    parent.children = [leaf]
+    root.children = [parent]
+
+    S._flatten_small_leaves(root)
+
+    assert parent.children == []
+    assert {c.ref for c in parent.components} == {"R1", "U1", "C1"}
+
+
+def test_flatten_keeps_top_level_module():
+    """A leaf module parented by the root keeps its own sheet (never flattened)."""
+    root = S.SheetIR(name="root", node_id="r")
+    leaf = S.SheetIR(name="dac", node_id="d", components=[ComponentIR("U1", "", [])])
+    root.children = [leaf]
+
+    S._flatten_small_leaves(root)
+
+    assert len(root.children) == 1
+
+
 def test_render_hierarchical_labels_every_pin(tmp_path: Path):
     app = _build_synthetic_app()
     comps, nets = extract_components(app)

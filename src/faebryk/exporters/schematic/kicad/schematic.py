@@ -364,10 +364,131 @@ def build_sheet_tree(components: list[ComponentIR], app: fabll.Node) -> SheetIR:
             sheet = existing
         sheet.components.append(comp)
 
+    # Refine the purely-structural grouping with connectivity (see the two helpers).
+    # Flatten FIRST: dissolving a tiny leaf wrapper (e.g. an op-amp package) into its
+    # functional parent removes it as a pull-in target, so the parent's own passives stay
+    # on the parent instead of being dragged down into the wrapper. Then pull parent-level
+    # orphans down onto the descendant sheet their nets are dominated by.
+    _flatten_small_leaves(root)
+    _pull_in_by_connectivity(root)
+
     # Deterministic order for stable output.
     for sheet in root.walk():
         sheet.children = natsorted(sheet.children, key=lambda s: (s.name, s.node_id))
     return root
+
+
+# Connectivity-grouping heuristics (tune here if a board groups oddly).
+PULL_IN_DOMINANCE = 0.5  # min fraction of a component's net-affinity that one descendant
+#                          sheet must hold to claim the component from an ancestor sheet.
+FLATTEN_MAX_COMPONENTS = 3  # a non-root leaf sheet this small is merged into its parent.
+
+
+def _net_degree(components: list[ComponentIR]) -> dict[str, int]:
+    """Pin count per net — the affinity denominator (a high-degree rail is discounted)."""
+    deg: dict[str, int] = {}
+    for c in components:
+        for p in c.pins:
+            if p.net:
+                deg[p.net] = deg.get(p.net, 0) + 1
+    return deg
+
+
+def _pull_in_by_connectivity(root: SheetIR) -> None:
+    """Move each component onto the descendant sheet its connectivity is dominated by.
+
+    The structural pass puts a component on the sheet of the ``.ato`` module it is
+    *declared* in, which strands passives declared at a parent level that really belong
+    to one child subcircuit (e.g. an RS-485 termination resistor declared in ``App`` but
+    wired only to the transceiver). For each component we score every **strict descendant**
+    of its current sheet by net affinity — ``Σ 1/degree(net)`` over the component's nets
+    that touch a component owned by that descendant (same weighting as
+    :func:`placement.place_components`, so shared rails like ``GND``/``+3V3`` barely
+    count) — and relocate it when one descendant holds at least ``PULL_IN_DOMINANCE`` of
+    its total affinity. A component spanning two subcircuits has no dominant descendant
+    and stays put. Only *downward* moves are allowed, so the hierarchy is never crossed.
+    """
+    all_components = [c for s in root.walk() for c in s.components]
+    degree = _net_degree(all_components)
+
+    # nets owned by each sheet (its own components only).
+    own_nets: dict[int, set[str]] = {
+        id(s): {p.net for c in s.components for p in c.pins if p.net} for s in root.walk()
+    }
+
+    def _descendants(sheet: SheetIR) -> list[SheetIR]:
+        out: list[SheetIR] = []
+        for ch in sheet.children:
+            out.append(ch)
+            out.extend(_descendants(ch))
+        return out
+
+    # depth per sheet, for tie-breaking toward the most specific sheet.
+    depth: dict[int, int] = {}
+
+    def _set_depth(sheet: SheetIR, d: int) -> None:
+        depth[id(sheet)] = d
+        for ch in sheet.children:
+            _set_depth(ch, d + 1)
+
+    _set_depth(root, 0)
+
+    for sheet in root.walk():
+        descendants = _descendants(sheet)
+        if not descendants:
+            continue
+        # Iterate a snapshot; we mutate sheet.components as we relocate.
+        for comp in list(sheet.components):
+            nets = {p.net for p in comp.pins if p.net}
+            total = sum(1.0 / max(degree.get(n, 1), 1) for n in nets)
+            if total <= 0:
+                continue
+            best: SheetIR | None = None
+            best_key: tuple[float, int, str] | None = None
+            for d in descendants:
+                shared = nets & own_nets[id(d)]
+                if not shared:
+                    continue
+                score = sum(1.0 / max(degree.get(n, 1), 1) for n in shared)
+                key = (score, depth[id(d)], d.name)
+                if best_key is None or key > best_key:
+                    best, best_key = d, key
+            # Strict: a 50/50 interconnect (best == remaining) stays on the ancestor.
+            if best is not None and best_key[0] > PULL_IN_DOMINANCE * total:
+                sheet.components.remove(comp)
+                best.components.append(comp)
+                own_nets[id(sheet)] = {
+                    p.net for c in sheet.components for p in c.pins if p.net
+                }
+                own_nets[id(best)].update(nets)
+
+
+def _flatten_small_leaves(root: SheetIR) -> None:
+    """Merge tiny leaf sub-module sheets into their parent (keep functional blocks whole).
+
+    A nested wrapper module (e.g. an op-amp *package* inside a filter module) otherwise
+    gets its own sheet, splitting one functional block in two. Post-order, a **leaf**
+    sheet with ``≤ FLATTEN_MAX_COMPONENTS`` components is absorbed into its parent — but
+    only when the parent is **not the root**, so top-level functional modules
+    (``buck``/``ldo``/``dac``/…) always keep their own sheet.
+    """
+
+    def _recurse(sheet: SheetIR, is_root: bool) -> None:
+        for ch in sheet.children:
+            _recurse(ch, False)
+        kept: list[SheetIR] = []
+        for ch in sheet.children:
+            if (
+                not is_root
+                and not ch.children
+                and len(ch.components) <= FLATTEN_MAX_COMPONENTS
+            ):
+                sheet.components.extend(ch.components)
+            else:
+                kept.append(ch)
+        sheet.children = kept
+
+    _recurse(root, True)
 
 
 @dataclass
